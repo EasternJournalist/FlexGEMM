@@ -16,42 +16,29 @@
 #define BLOCK_SIZE 256
 
 
+namespace flex_gemm {
+namespace spconv {
+
 /**
- * Build sparse submanifold convolution neighbor map with hashmap
- * 
- * @param hashmap_keys  [N] uint32/uint64 tensor containing the hashmap keys
- * @param hashmap_vals  [N] uint32 tensor containing the hashmap values as tensor indices
- * @param coords        [M, 4] int32 tensor containing the keys to be looked up
- * @param W             the number of width dimensions
- * @param H             the number of height dimensions
- * @param D             the number of depth dimensions
- * @param Kw            the number of width kernel dimensions
- * @param Kh            the number of height kernel dimensions
- * @param Kd            the number of depth kernel dimensions
- * @param Dw            the dialation of width
- * @param Dh            the dialation of height
- * @param Dd            the dialation of depth
- *  
- * @return              [M, Kw * Kh * Kd] uint32 tensor containing the submanifold convolution neighbor map
+ * Interpret the neighbor bitmask as a Gray-code word and sort elements by its
+ * decoded binary index. This induces a Gray-order linearization of the mask
+ * space, grouping similar neighbor patterns together, which reduces kernel
+ * specialization and active pattern diversity within a thread block.
+ *
+ * @param neighbor_map     [N, V] uint32 tensor containing the neighbor map
+ *
+ * @return                [N] neighbor mask (interpreted as Gray code)
+ *                        [N] indices sorted by Gray traversal order
  */
-torch::Tensor hashmap_build_submanifold_conv_neighbour_map_cuda(
-    torch::Tensor& hashmap_keys,
-    torch::Tensor& hashmap_vals,
-    const torch::Tensor& coords,
-    int W,
-    int H,
-    int D,
-    int Kw,
-    int Kh,
-    int Kd,
-    int Dw,
-    int Dh,
-    int Dd
+std::tuple<torch::Tensor, torch::Tensor> neighbor_map_post_process_for_masked_implicit_gemm_1_no_bwd(
+    const torch::Tensor& neighbor_map
 );
 
 
 /**
- * Convert neighbor map to gray and binary code
+ * Interpret the neighbor bitmask as a Gray-code word and sort elements by its
+ * decoded binary index. 
+ * Also prepare valid pairs for masked implicit gemm bachward pass
  * 
  * @param neighbor_map     [N, V] uint32 tensor containing the neighbor map
  * 
@@ -81,3 +68,6 @@ std::tuple<torch::Tensor, torch::Tensor> neighbor_map_post_process_for_masked_im
     const torch::Tensor& sorted_idx,
     int block_size
 );
+
+} // namespace spconv
+} // namespace flex_gemm
