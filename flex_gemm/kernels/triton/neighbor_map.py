@@ -459,7 +459,8 @@ def neighbor_map_post_process_for_masked_implicit_gemm_1(
         sorted_idx = torch.empty((N,), dtype=torch.int64, device=neighbor_map.device)
         valid_signal_i = torch.empty((0,), dtype=torch.int32, device=neighbor_map.device)
         valid_signal_o = torch.empty((0,), dtype=torch.int32, device=neighbor_map.device)
-        return gray_code, sorted_idx, valid_signal_i, valid_signal_o
+        valid_signal_seg = torch.zeros((V + 1,), dtype=torch.int32, device=neighbor_map.device)
+        return gray_code, sorted_idx, valid_signal_i, valid_signal_o, valid_signal_seg
 
     if neighbor_map.dtype not in (torch.int32, torch.uint32):
         raise ValueError("neighbor_map must be int32 or uint32")
@@ -492,7 +493,11 @@ def neighbor_map_post_process_for_masked_implicit_gemm_1(
     valid_signal_i = neighbor_map_T.reshape(-1).index_select(0, mask_flat_indices).to(torch.uint32)
     valid_signal_o = torch.remainder(mask_flat_indices.to(torch.int32), N).to(torch.uint32)
 
-    return gray_code, sorted_idx, valid_signal_i, valid_signal_o
+    valid_signal_seg = torch.zeros((V + 1,), dtype=torch.int32, device=neighbor_map.device)
+    per_kernel_counts = neighbor_mask_T.reshape(V, N).sum(dim=1).to(torch.int32)
+    torch.cumsum(per_kernel_counts, dim=0, out=valid_signal_seg[1:])
+
+    return gray_code, sorted_idx, valid_signal_i, valid_signal_o, valid_signal_seg
 
 
 @triton.jit

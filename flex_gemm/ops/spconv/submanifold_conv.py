@@ -45,12 +45,13 @@ class SubMConvNeighborCache:
             gray_code, sorted_idx, valid_signal_i, valid_signal_o, valid_signal_seg = \
                 kernels.cuda.neighbor_map_post_process_for_masked_implicit_gemm_1(neighbor_map)
         else:
-            gray_code, sorted_idx, valid_signal_i, valid_signal_o = \
+            gray_code, sorted_idx, valid_signal_i, valid_signal_o, valid_signal_seg = \
                 kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_1(neighbor_map)
         self['gray_code'] = gray_code
         self['sorted_idx'] = sorted_idx
         self['valid_signal_i'] = valid_signal_i
         self['valid_signal_o'] = valid_signal_o
+        self['valid_signal_seg'] = valid_signal_seg
 
     def neighbor_map_post_process_for_masked_implicit_gemm_2(self, block_size: int):
         if config.USE_CUDA_EXTENSION:
