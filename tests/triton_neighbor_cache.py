@@ -127,6 +127,9 @@ def test_triton_neighbor_cache_matches_cuda(algorithm) -> None:
         _assert_tensor_equal(
             cache_triton["valid_signal_o"], cache_cuda["valid_signal_o"]
         )
+        _assert_tensor_equal(
+            cache_triton["valid_signal_seg"], cache_cuda["valid_signal_seg"]
+        )
 
         block_size = 64
         _assert_tensor_equal(
