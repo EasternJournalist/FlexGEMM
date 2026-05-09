@@ -45,21 +45,21 @@ def _get_cuda_extension_config():
         raise ValueError(f"Unsupported BUILD_TARGET: {build_target}")
 
     if not is_hip:
-        cc_flag = ["--use_fast_math"]
+        cc_flag = ["--use_fast_math", "-allow-unsupported-compiler"]
     else:
         archs = os.getenv("GPU_ARCHS", "native").split(";")
         cc_flag = [f"--offload-arch={arch}" for arch in archs]
 
     if platform.system() == "Windows":
         extra_compile_args = {
-            "cxx": ["/O2", "/std:c++17", "/EHsc"],
-            "nvcc": ["-O3", "-std=c++17"] + cc_flag,
+            "cxx": ["/O2", "/std:c++17", "/EHsc", "/openmp", "/permissive-", "/Zc:__cplusplus"],
+            "nvcc": ["-O3", "-std=c++17", "-Xcompiler=/std:c++17", "-Xcompiler=/EHsc", "-Xcompiler=/permissive-", "-Xcompiler=/Zc:__cplusplus"] + cc_flag,
         }
     else:
         # Match PyTorch's CXX11 ABI setting
         cxx11_abi = "1" if torch.compiled_with_cxx11_abi() else "0"
         extra_compile_args = {
-            "cxx": ["-O3", "-std=c++17", f"-D_GLIBCXX_USE_CXX11_ABI={cxx11_abi}"],
+            "cxx": ["-O3", "-std=c++17", "-fopenmp", f"-D_GLIBCXX_USE_CXX11_ABI={cxx11_abi}"],
             "nvcc": ["-O3", "-std=c++17"] + cc_flag,
         }
 
@@ -69,10 +69,14 @@ def _get_cuda_extension_config():
             sources=[
                 # Hashmap functions
                 "flex_gemm/kernels/cuda/hash/hash.cu",
+                # Serialization functions
+                "flex_gemm/kernels/cuda/serialize/api.cu",
                 # Grid sample functions
                 "flex_gemm/kernels/cuda/grid_sample/grid_sample.cu",
                 # Convolution functions
-                "flex_gemm/kernels/cuda/spconv/neighbor_map.cu",
+                "flex_gemm/kernels/cuda/spconv/subm_neighbor_map.cu",
+                "flex_gemm/kernels/cuda/spconv/sparse_neighbor_map.cu",
+                "flex_gemm/kernels/cuda/spconv/migemm_neighmap_pp.cu",
                 # main
                 "flex_gemm/kernels/cuda/ext.cpp",
             ],

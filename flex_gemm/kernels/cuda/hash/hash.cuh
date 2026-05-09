@@ -1,3 +1,6 @@
+namespace flex_gemm {
+namespace hash {
+
 // 32 bit Murmur3 hash
 __forceinline__ __device__ size_t hash(uint32_t k, size_t N) {
     k ^= k >> 16;
@@ -17,6 +20,45 @@ __forceinline__ __device__ size_t hash(uint64_t k, size_t N) {
     k *= 0xc4ceb9fe1a85ec53ULL;
     k ^= k >> 33;
     return k % N;
+}
+
+
+template<typename K>
+__forceinline__ __device__ void linear_probing_insert(
+    K* hashmap_keys,
+    const K key,
+    const size_t N
+) {
+    size_t slot = hash(key, N);
+    while (true) {
+        K prev = atomicCAS(&hashmap_keys[slot], std::numeric_limits<K>::max(), key);
+        if (prev == std::numeric_limits<K>::max() || prev == key) {
+            return;
+        }
+        slot = slot + 1;
+        if (slot >= N) slot = 0;
+    }
+}
+
+
+template<>
+__forceinline__ __device__ void linear_probing_insert(
+    uint64_t* hashmap_keys,
+    const uint64_t key,
+    const size_t N
+) {
+    size_t slot = hash(key, N);
+    while (true) {
+        uint64_t prev = atomicCAS(
+            reinterpret_cast<unsigned long long*>(&hashmap_keys[slot]),
+            static_cast<unsigned long long>(std::numeric_limits<uint64_t>::max()),
+            static_cast<unsigned long long>(key)
+        );
+        if (prev == std::numeric_limits<uint64_t>::max() || prev == key) {
+            return;
+        }
+        slot = (slot + 1) % N;
+    }
 }
 
 
@@ -85,3 +127,6 @@ __forceinline__ __device__ V linear_probing_lookup(
         if (slot >= N) slot = 0;
     }
 }
+
+} // namespace hash
+} // namespace flex_gemm

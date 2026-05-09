@@ -6,8 +6,11 @@
 #include "hash.cuh"
 
 
+namespace flex_gemm {
+namespace hash {
+
 template<typename K, typename V>
-static __global__ void hashmap_insert_cuda_kernel(
+static __global__ void hashmap_insert_kernel(
     const size_t N,
     const size_t M,
     K* __restrict__ hashmap_keys,
@@ -26,13 +29,13 @@ static __global__ void hashmap_insert_cuda_kernel(
 
 
 template<typename K, typename V>
-static void dispatch_hashmap_insert_cuda(
+static void dispatch_hashmap_insert(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& keys,
     const torch::Tensor& values
 ) {
-    hashmap_insert_cuda_kernel<<<
+    hashmap_insert_kernel<<<
         (keys.size(0) + BLOCK_SIZE - 1) / BLOCK_SIZE,
         BLOCK_SIZE
     >>>(
@@ -54,7 +57,7 @@ static void dispatch_hashmap_insert_cuda(
  * @param keys              [M] uint32/uint64 tensor containing the keys to be inserted
  * @param values            [M] uint32/uint64 tensor containing the values to be inserted
  */
-void hashmap_insert_cuda(
+void hashmap_insert(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& keys,
@@ -64,22 +67,22 @@ void hashmap_insert_cuda(
     if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt32) {
         TORCH_CHECK(keys.dtype() == torch::kUInt32, "Keys must be uint32");
         TORCH_CHECK(values.dtype() == torch::kUInt32, "Values must be uint32");
-        dispatch_hashmap_insert_cuda<uint32_t, uint32_t>(hashmap_keys, hashmap_values, keys, values);
+        dispatch_hashmap_insert<uint32_t, uint32_t>(hashmap_keys, hashmap_values, keys, values);
     }
     else if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt64) {
         TORCH_CHECK(keys.dtype() == torch::kUInt32, "Keys must be uint32");
         TORCH_CHECK(values.dtype() == torch::kUInt64, "Values must be uint64");
-        dispatch_hashmap_insert_cuda<uint32_t, uint64_t>(hashmap_keys, hashmap_values, keys, values);
+        dispatch_hashmap_insert<uint32_t, uint64_t>(hashmap_keys, hashmap_values, keys, values);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt32) {
         TORCH_CHECK(keys.dtype() == torch::kUInt64, "Keys must be uint64");
         TORCH_CHECK(values.dtype() == torch::kUInt32, "Values must be uint32");
-        dispatch_hashmap_insert_cuda<uint64_t, uint32_t>(hashmap_keys, hashmap_values, keys, values);
+        dispatch_hashmap_insert<uint64_t, uint32_t>(hashmap_keys, hashmap_values, keys, values);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt64) {
         TORCH_CHECK(keys.dtype() == torch::kUInt64, "Keys must be uint64");
         TORCH_CHECK(values.dtype() == torch::kUInt64, "Values must be uint64");
-        dispatch_hashmap_insert_cuda<uint64_t, uint64_t>(hashmap_keys, hashmap_values, keys, values);
+        dispatch_hashmap_insert<uint64_t, uint64_t>(hashmap_keys, hashmap_values, keys, values);
     }
     else {
         TORCH_CHECK(false, "Unsupported data type");
@@ -88,7 +91,7 @@ void hashmap_insert_cuda(
 
 
 template<typename K, typename V>
-static __global__ void hashmap_lookup_cuda_kernel(
+static __global__ void hashmap_lookup_kernel(
     const size_t N,
     const size_t M,
     const K * __restrict__ hashmap_keys,
@@ -105,13 +108,13 @@ static __global__ void hashmap_lookup_cuda_kernel(
 
 
 template<typename K, typename V>
-static void dispatch_hashmap_lookup_cuda(
+static void dispatch_hashmap_lookup(
     const torch::Tensor& hashmap_keys,
     const torch::Tensor& hashmap_values,
     const torch::Tensor& keys,
     torch::Tensor& values
 ) {
-    hashmap_lookup_cuda_kernel<<<
+    hashmap_lookup_kernel<<<
         (keys.size(0) + BLOCK_SIZE - 1) / BLOCK_SIZE,
         BLOCK_SIZE
     >>>(
@@ -133,7 +136,7 @@ static void dispatch_hashmap_lookup_cuda(
  * @param keys              [M] uint32/uint64 tensor containing the keys to be looked up
  * @return                  [M] uint32/uint64 tensor containing the values of the keys
  */
-torch::Tensor hashmap_lookup_cuda(
+torch::Tensor hashmap_lookup(
     const torch::Tensor& hashmap_keys,
     const torch::Tensor& hashmap_values,
     const torch::Tensor& keys
@@ -145,22 +148,22 @@ torch::Tensor hashmap_lookup_cuda(
     if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt32) {
         TORCH_CHECK(keys.dtype() == torch::kUInt32, "Keys must be uint32");
         TORCH_CHECK(output.dtype() == torch::kUInt32, "Output must be uint32");
-        dispatch_hashmap_lookup_cuda<uint32_t, uint32_t>(hashmap_keys, hashmap_values, keys, output);
+        dispatch_hashmap_lookup<uint32_t, uint32_t>(hashmap_keys, hashmap_values, keys, output);
     }
     else if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt64) {
         TORCH_CHECK(keys.dtype() == torch::kUInt32, "Keys must be uint32");
         TORCH_CHECK(output.dtype() == torch::kUInt64, "Output must be uint64");
-        dispatch_hashmap_lookup_cuda<uint32_t, uint64_t>(hashmap_keys, hashmap_values, keys, output);
+        dispatch_hashmap_lookup<uint32_t, uint64_t>(hashmap_keys, hashmap_values, keys, output);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt32) {
         TORCH_CHECK(keys.dtype() == torch::kUInt64, "Keys must be uint64");
         TORCH_CHECK(output.dtype() == torch::kUInt32, "Output must be uint32");
-        dispatch_hashmap_lookup_cuda<uint64_t, uint32_t>(hashmap_keys, hashmap_values, keys, output);
+        dispatch_hashmap_lookup<uint64_t, uint32_t>(hashmap_keys, hashmap_values, keys, output);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt64) {
         TORCH_CHECK(keys.dtype() == torch::kUInt64, "Keys must be uint64");
         TORCH_CHECK(output.dtype() == torch::kUInt64, "Output must be uint64");
-        dispatch_hashmap_lookup_cuda<uint64_t, uint64_t>(hashmap_keys, hashmap_values, keys, output);
+        dispatch_hashmap_lookup<uint64_t, uint64_t>(hashmap_keys, hashmap_values, keys, output);
     }
     else {
         TORCH_CHECK(false, "Unsupported data type");
@@ -171,7 +174,7 @@ torch::Tensor hashmap_lookup_cuda(
 
 
 template<typename K, typename V>
-static __global__ void hashmap_insert_3d_cuda_kernel(
+static __global__ void hashmap_insert_3d_kernel(
     const size_t N,
     const size_t M,
     const int W,
@@ -198,14 +201,14 @@ static __global__ void hashmap_insert_3d_cuda_kernel(
 
 
 template<typename K, typename V>
-static void dispatch_hashmap_insert_3d_cuda(
+static void dispatch_hashmap_insert_3d(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
     const torch::Tensor& values,
     int W, int H, int D
 ) {
-    hashmap_insert_3d_cuda_kernel<<<
+    hashmap_insert_3d_kernel<<<
         (coords.size(0) + BLOCK_SIZE - 1) / BLOCK_SIZE,
         BLOCK_SIZE
     >>>(
@@ -231,7 +234,7 @@ static void dispatch_hashmap_insert_3d_cuda(
  * @param H                 the number of height dimensions
  * @param D                 the number of depth dimensions
  */
-void hashmap_insert_3d_cuda(
+void hashmap_insert_3d(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
@@ -245,19 +248,19 @@ void hashmap_insert_3d_cuda(
     // Dispatch to 32-bit or 64-bit kernel
     if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt32) {
         TORCH_CHECK(values.dtype() == torch::kUInt32, "Values must be uint32");
-        dispatch_hashmap_insert_3d_cuda<uint32_t, uint32_t>(hashmap_keys, hashmap_values, coords, values, W, H, D);
+        dispatch_hashmap_insert_3d<uint32_t, uint32_t>(hashmap_keys, hashmap_values, coords, values, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt64) {
         TORCH_CHECK(values.dtype() == torch::kUInt64, "Values must be uint64");
-        dispatch_hashmap_insert_3d_cuda<uint32_t, uint64_t>(hashmap_keys, hashmap_values, coords, values, W, H, D);
+        dispatch_hashmap_insert_3d<uint32_t, uint64_t>(hashmap_keys, hashmap_values, coords, values, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt32) {
         TORCH_CHECK(values.dtype() == torch::kUInt32, "Values must be uint32");
-        dispatch_hashmap_insert_3d_cuda<uint64_t, uint32_t>(hashmap_keys, hashmap_values, coords, values, W, H, D);
+        dispatch_hashmap_insert_3d<uint64_t, uint32_t>(hashmap_keys, hashmap_values, coords, values, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt64) {
         TORCH_CHECK(values.dtype() == torch::kUInt64, "Values must be uint64");
-        dispatch_hashmap_insert_3d_cuda<uint64_t, uint64_t>(hashmap_keys, hashmap_values, coords, values, W, H, D);
+        dispatch_hashmap_insert_3d<uint64_t, uint64_t>(hashmap_keys, hashmap_values, coords, values, W, H, D);
     }
     else {
         TORCH_CHECK(false, "Unsupported data type");
@@ -266,7 +269,7 @@ void hashmap_insert_3d_cuda(
 
 
 template<typename K, typename V>
-static __global__ void hashmap_lookup_3d_cuda_kernel(
+static __global__ void hashmap_lookup_3d_kernel(
     const size_t N,
     const size_t M,
     const int W,
@@ -296,14 +299,14 @@ static __global__ void hashmap_lookup_3d_cuda_kernel(
 
 
 template<typename K, typename V>
-static void dispatch_hashmap_lookup_3d_cuda(
+static void dispatch_hashmap_lookup_3d(
     const torch::Tensor& hashmap_keys,
     const torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
     torch::Tensor& values,
     int W, int H, int D
 ) {
-    hashmap_lookup_3d_cuda_kernel<<<
+    hashmap_lookup_3d_kernel<<<
         (coords.size(0) + BLOCK_SIZE - 1) / BLOCK_SIZE,
         BLOCK_SIZE
     >>>(
@@ -330,7 +333,7 @@ static void dispatch_hashmap_lookup_3d_cuda(
  * 
  * @return                  [M] uint32/uint64 tensor containing the values of the keys
  */
-torch::Tensor hashmap_lookup_3d_cuda(
+torch::Tensor hashmap_lookup_3d(
     const torch::Tensor& hashmap_keys,
     const torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
@@ -343,16 +346,16 @@ torch::Tensor hashmap_lookup_3d_cuda(
 
     // Dispatch to 32-bit or 64-bit kernel
     if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt32) {
-        dispatch_hashmap_lookup_3d_cuda<uint32_t, uint32_t>(hashmap_keys, hashmap_values, coords, output, W, H, D);
+        dispatch_hashmap_lookup_3d<uint32_t, uint32_t>(hashmap_keys, hashmap_values, coords, output, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt64) {
-        dispatch_hashmap_lookup_3d_cuda<uint32_t, uint64_t>(hashmap_keys, hashmap_values, coords, output, W, H, D);
+        dispatch_hashmap_lookup_3d<uint32_t, uint64_t>(hashmap_keys, hashmap_values, coords, output, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt32) {
-        dispatch_hashmap_lookup_3d_cuda<uint64_t, uint32_t>(hashmap_keys, hashmap_values, coords, output, W, H, D);
+        dispatch_hashmap_lookup_3d<uint64_t, uint32_t>(hashmap_keys, hashmap_values, coords, output, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt64) {
-        dispatch_hashmap_lookup_3d_cuda<uint64_t, uint64_t>(hashmap_keys, hashmap_values, coords, output, W, H, D);
+        dispatch_hashmap_lookup_3d<uint64_t, uint64_t>(hashmap_keys, hashmap_values, coords, output, W, H, D);
     }
     else {
         TORCH_CHECK(false, "Unsupported data type");
@@ -363,7 +366,7 @@ torch::Tensor hashmap_lookup_3d_cuda(
 
 
 template<typename K, typename V>
-static __global__ void hashmap_insert_3d_idx_as_val_cuda_kernel(
+static __global__ void hashmap_insert_3d_idx_as_val_kernel(
     const size_t N,
     const size_t M,
     const int W,
@@ -389,13 +392,13 @@ static __global__ void hashmap_insert_3d_idx_as_val_cuda_kernel(
 
 
 template<typename K, typename V>
-static void dispatch_hashmap_insert_3d_idx_as_val_cuda(
+static void dispatch_hashmap_insert_3d_idx_as_val(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
     int W, int H, int D
 ) {
-    hashmap_insert_3d_idx_as_val_cuda_kernel<<<
+    hashmap_insert_3d_idx_as_val_kernel<<<
         (coords.size(0) + BLOCK_SIZE - 1) / BLOCK_SIZE,
         BLOCK_SIZE
     >>>(
@@ -419,7 +422,7 @@ static void dispatch_hashmap_insert_3d_idx_as_val_cuda(
  * @param H                 the number of height dimensions
  * @param D                 the number of depth dimensions
  */
-void hashmap_insert_3d_idx_as_val_cuda(
+void hashmap_insert_3d_idx_as_val(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
@@ -429,18 +432,21 @@ void hashmap_insert_3d_idx_as_val_cuda(
 ) {
     // Dispatch to 32-bit or 64-bit kernel
     if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt32) {
-        dispatch_hashmap_insert_3d_idx_as_val_cuda<uint32_t, uint32_t>(hashmap_keys, hashmap_values, coords, W, H, D);
+        dispatch_hashmap_insert_3d_idx_as_val<uint32_t, uint32_t>(hashmap_keys, hashmap_values, coords, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt32 && hashmap_values.dtype() == torch::kUInt64) {
-        dispatch_hashmap_insert_3d_idx_as_val_cuda<uint32_t, uint64_t>(hashmap_keys, hashmap_values, coords, W, H, D);
+        dispatch_hashmap_insert_3d_idx_as_val<uint32_t, uint64_t>(hashmap_keys, hashmap_values, coords, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt32) {
-        dispatch_hashmap_insert_3d_idx_as_val_cuda<uint64_t, uint32_t>(hashmap_keys, hashmap_values, coords, W, H, D);
+        dispatch_hashmap_insert_3d_idx_as_val<uint64_t, uint32_t>(hashmap_keys, hashmap_values, coords, W, H, D);
     }
     else if (hashmap_keys.dtype() == torch::kUInt64 && hashmap_values.dtype() == torch::kUInt64) {
-        dispatch_hashmap_insert_3d_idx_as_val_cuda<uint64_t, uint64_t>(hashmap_keys, hashmap_values, coords, W, H, D);
+        dispatch_hashmap_insert_3d_idx_as_val<uint64_t, uint64_t>(hashmap_keys, hashmap_values, coords, W, H, D);
     }
     else {
         TORCH_CHECK(false, "Unsupported data type");
     }
 }
+
+} // namespace hash
+} // namespace flex_gemm

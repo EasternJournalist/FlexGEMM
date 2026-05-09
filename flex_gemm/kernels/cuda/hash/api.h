@@ -16,6 +16,9 @@
 #define BLOCK_SIZE 256
 
 
+namespace flex_gemm {
+namespace hash {
+
 /**
  * Insert keys into the hashmap
  * 
@@ -24,7 +27,7 @@
  * @param keys              [M] uint32/uint64 tensor containing the keys to be inserted
  * @param values            [M] uint32/uint64 tensor containing the values to be inserted
  */
-void hashmap_insert_cuda(
+void hashmap_insert(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& keys,
@@ -40,7 +43,7 @@ void hashmap_insert_cuda(
  * @param keys              [M] uint32/uint64 tensor containing the keys to be looked up
  * @return                  [M] uint32/uint64 tensor containing the values of the keys
  */
-torch::Tensor hashmap_lookup_cuda(
+torch::Tensor hashmap_lookup(
     const torch::Tensor& hashmap_keys,
     const torch::Tensor& hashmap_values,
     const torch::Tensor& keys
@@ -58,7 +61,7 @@ torch::Tensor hashmap_lookup_cuda(
  * @param H                 the number of height dimensions
  * @param D                 the number of depth dimensions
  */
-void hashmap_insert_3d_cuda(
+void hashmap_insert_3d(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
@@ -81,7 +84,7 @@ void hashmap_insert_3d_cuda(
  * 
  * @return                  [M] uint32/uint64 tensor containing the values of the keys
  */
-torch::Tensor hashmap_lookup_3d_cuda(
+torch::Tensor hashmap_lookup_3d(
     const torch::Tensor& hashmap_keys,
     const torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
@@ -101,7 +104,7 @@ torch::Tensor hashmap_lookup_3d_cuda(
  * @param H         the number of height dimensions
  * @param D         the number of depth dimensions
  */
-void hashmap_insert_3d_idx_as_val_cuda(
+void hashmap_insert_3d_idx_as_val(
     torch::Tensor& hashmap_keys,
     torch::Tensor& hashmap_values,
     const torch::Tensor& coords,
@@ -109,3 +112,6 @@ void hashmap_insert_3d_idx_as_val_cuda(
     int H,
     int D
 );
+
+} // namespace hash
+} // namespace flex_gemm

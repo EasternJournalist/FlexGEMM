@@ -9,17 +9,15 @@ from . import config
 from .sparse_submanifold_conv_fwd_masked_implicit_gemm import sparse_submanifold_conv_fwd_masked_implicit_gemm_kernel
 
 
-heuristics = {
-    'valid_kernel': lambda args: args['valid_kernel'](args['B1']),
-    'valid_kernel_seg': lambda args: args['valid_kernel_seg'](args['B1']),
-}
-
-
 @triton_autotune(
     configs=config.autotune_config,
     key=['LOGN', 'Ci', 'Co', 'V', 'SPLITK', 'allow_tf32'],
 )
-@triton.heuristics(heuristics)
+@triton.heuristics({
+    'valid_kernel': lambda args: args['valid_kernel'](args['B1']),
+    'valid_kernel_seg': lambda args: args['valid_kernel_seg'](args['B1']),
+    'HAS_BIAS': lambda args: args['bias'] is not None,
+})
 @triton.jit
 def sparse_submanifold_conv_fwd_masked_implicit_gemm_splitk_kernel(
     input,
@@ -34,6 +32,7 @@ def sparse_submanifold_conv_fwd_masked_implicit_gemm_splitk_kernel(
     B1: tl.constexpr,   # Block size for N dimension
     B2: tl.constexpr,   # Block size for Co dimension
     BK: tl.constexpr,   # Block size for K dimension (V * Ci)
+    HAS_BIAS: tl.constexpr,  # Whether bias is present
     SPLITK: tl.constexpr,  # Split K dimension into multiple sub-dimensions
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
     # Huristic parameters
@@ -94,14 +93,15 @@ def sparse_submanifold_conv_fwd_masked_implicit_gemm_splitk_kernel(
                              input_precision='tf32' if allow_tf32 else 'ieee')                      # (B1, B2)
             
     # add bias
-    if bias is not None and block_id_k == 0:
-        bias_block = tl.load(bias + offset_co)
-        accumulator += bias_block[None, :]
+    if HAS_BIAS:
+        if block_id_k == 0:
+            bias_block = tl.load(bias + offset_co)
+            accumulator += bias_block[None, :]
                 
     # Write back the block of the output matrix with masks.
     out_offset_n = offset_sorted_n
     out_offset_co = block_id_co * B2 + tl.arange(0, B2)
-    out_ptr = output + block_id_k * N * Co + (out_offset_n[:, None] * Co + out_offset_co[None, :])
+    out_ptr = output + block_id_k * N * Co + (out_offset_n[:, None].to(tl.int64) * Co + out_offset_co[None, :])
     out_mask = n_mask[:, None] & (out_offset_co[None, :] < Co)
     tl.store(out_ptr, accumulator, mask=out_mask)
 
