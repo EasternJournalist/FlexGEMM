@@ -5,7 +5,7 @@ from torch import Tensor
 from torch.autograd import Function
 from .. import spconv
 from ... import config
-from ..utils import make_conv_neighbor_offsets, init_hashmap, lookup_pytorch
+from ..utils import make_conv_kernel_delta, init_hashmap, lookup_pytorch
 from ... import kernels
 
 
@@ -387,7 +387,7 @@ def _compute_neighbor_cache_kernel_dilation(
 
     if config._USE_PYTORCH_FOR_TEST:
         # Debug only
-        offsets = make_conv_neighbor_offsets(kernel_size, dilation, batch_dims=coords.shape[1] - len(kernel_size), dtype=torch.int32, device=coords.device)
+        offsets = make_conv_kernel_delta(kernel_size, dilation, batch_dims=coords.shape[1] - len(kernel_size), dtype=torch.int32, device=coords.device)
         neighbor_coords = coords[:, None, :] + offsets[None, :, :]          # [N, V, D]
         neighbor_map = lookup_pytorch(coords, neighbor_coords).to(torch.int32)
 

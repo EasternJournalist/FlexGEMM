@@ -213,6 +213,69 @@ def _hashmap_lookup_kernel_32bit(
     tl.store(results_ptr + offs, found_idx, mask=mask)
 
 
+@triton.jit
+def _hashmap_unique_kernel_32bit(
+    hashmap_ptr: tl.pointer_type,
+    hashmap_size: int,
+    keys_ptr: tl.const,
+    results_ptr: tl.pointer_type,
+    n_keys: int,
+    D: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Fused build + self-lookup kernel for unique.
+
+    For each key, probe the hashmap. On CAS success the key is inserted and
+    its own index is the canonical one. On CAS failure, compare the existing
+    slot's stored key against ours (tag first, then full key); if it matches
+    record the existing key's index, otherwise advance to the next slot.
+    """
+    tl.static_assert(D * keys_ptr.dtype.element_ty.itemsize % 4 == 0, "keys byte width must be divisible by 4")
+    keys_ptr_32 = tl.cast(keys_ptr, tl.pointer_type(tl.int32))
+    D_32: tl.constexpr = D * keys_ptr.dtype.element_ty.itemsize // 4
+
+    pid = tl.program_id(0)
+    idx = pid * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = idx < n_keys
+
+    SLOT_BIT_MASK = tl.cast(hashmap_size - 1, tl.int32)
+    TAG_BIT_MASK = (~SLOT_BIT_MASK) & 0x7FFF_FFFF
+
+    # Compute hash and per-lane stored value.
+    key_vec = _vec_load(keys_ptr_32 + idx * D_32, mask=mask, D=D_32)
+    hash_val = _vec_hash_32bit(key_vec, D=D_32)
+    my_tag = hash_val & TAG_BIT_MASK
+    store_val = my_tag | idx
+
+    found_idx = tl.where(mask, idx, -1)
+    active = mask
+    target_slot = hash_val & SLOT_BIT_MASK
+    while tl.sum(active) > 0:
+        # Try to claim the slot. Inactive lanes use an expected value (-2)
+        # that never matches so the CAS is a no-op for them.
+        prev = tl.atomic_cas(hashmap_ptr + target_slot, tl.where(active, -1, -2), store_val)
+
+        # CAS succeeded: prev == -1, our key now owns this slot. found_idx
+        # is already pre-populated with our own idx for active lanes.
+        inserted = active & (prev == -1)
+        active = active & ~inserted
+
+        # CAS failed: slot occupied by some prior key. Check if it is ours.
+        prev_tag = prev & TAG_BIT_MASK
+        prev_idx = prev & SLOT_BIT_MASK
+        tag_match = active & (prev_tag == my_tag)
+        existing_key = _vec_load(keys_ptr_32 + prev_idx * D_32, mask=tag_match, D=D_32)
+        full_match = tag_match & (tl.min(existing_key == key_vec, axis=-1) > 0)
+        found_idx = tl.where(full_match, prev_idx, found_idx)
+        active = active & ~full_match
+
+        # Advance to the next slot for lanes that still need to probe.
+        target_slot += tl.where(active, 1, 0)
+        target_slot &= SLOT_BIT_MASK
+
+    tl.store(results_ptr + idx, found_idx, mask=mask)
+
+
 def hashmap_build_triton(keys: Tensor) -> Tensor:
     """
     Build a hash map from the given keys using Triton.
@@ -361,3 +424,82 @@ def hashmap_build_lookup_triton(keys: Tensor, queries: Tensor) -> Tensor:
 
     return results
 
+
+def hashmap_unique(
+    keys: Tensor, 
+    return_index: bool = False,
+    return_inverse: bool = False, 
+) -> Tensor | tuple[Tensor, ...]:
+    """
+    Hashmap-based unique operation to find unique keys and optionally return inverse indices.
+
+    NOTE: this function is like `torch.unique` but much faster at the cost of non-deterministic order of the unique keys. 
+    The result order is not even consistent for the same input due to the race condition in hashmap.
+    
+    Args:
+        keys (Tensor): A tensor of shape `(n_keys, *key_dims)` representing the keys.
+        return_inverse (bool): Whether to return the inverse indices.
+        return_counts (bool): Whether to return the counts of each unique key.
+
+    Returns:
+        unique_keys (Tensor): A tensor of shape `(n_unique_keys, *key_dims)`
+        unique_index (Tensor, optional): A tensor of shape `(n_unique_keys,)` containing the index of one occurrence of each unique key in the original keys. Only returned if `return_index` is True.
+        unique_inverse (Tensor, optional): A tensor of shape `(n_keys,)` containing the indices of the original keys in the unique keys. Only returned if `return_inverse` is True.
+    """
+    # Fused build + self-lookup: each key probes the hashmap; on collision
+    # we compare keys instead of skipping, so duplicates resolve to a single
+    # canonical index in O(1) probes regardless of duplicate count.
+    n_keys = keys.shape[0]
+    if n_keys == 0:
+        empty_idx = torch.empty((0,), dtype=torch.int64, device=keys.device)
+        unique_keys = keys
+        returns = (unique_keys,)
+        if return_index:
+            returns += (empty_idx,)
+        if return_inverse:
+            returns += (empty_idx,)
+        if len(returns) == 1:
+            return returns[0]
+        return returns
+
+    hashmap_size = triton.next_power_of_2(n_keys * 2)
+
+    keys_bytes = keys.flatten(1).contiguous().view(torch.uint8)
+    D_32 = triton.next_power_of_2(triton.cdiv(keys_bytes.shape[1], 4))
+    keys_i32 = pad_to_size_along_dim(keys_bytes, dim=1, size=D_32 * 4, value=0, side='right').view(torch.int32)
+
+    hashmap = torch.full((hashmap_size,), -1, dtype=torch.int32, device=keys.device)
+    indices = torch.empty((n_keys,), dtype=torch.int32, device=keys.device)
+
+    BLOCK_SIZE = 64
+    grid = (triton.cdiv(n_keys, BLOCK_SIZE),)
+    _hashmap_unique_kernel_32bit[grid](
+        hashmap_ptr=hashmap,
+        hashmap_size=hashmap_size,
+        keys_ptr=keys_i32,
+        results_ptr=indices,
+        n_keys=n_keys,
+        D=D_32,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+
+    is_canonical = indices == torch.arange(n_keys, device=keys.device, dtype=indices.dtype)
+    unique_indices = is_canonical.nonzero(as_tuple=True)[0]
+    num_uniques = unique_indices.shape[0]
+    unique_keys = keys.index_select(0, unique_indices)
+
+    returns = (unique_keys,)
+
+    if return_index:
+        returns += (unique_indices,)
+
+    if return_inverse:
+        inverse_dtype = torch.int64 if num_uniques >= 2 ** 31 else torch.int32
+        unique_inverse = torch.empty(n_keys, dtype=inverse_dtype, device=keys.device)
+        unique_inverse[unique_indices] = torch.arange(num_uniques, device=keys.device, dtype=inverse_dtype)
+        unique_inverse = unique_inverse[indices]
+        returns += (unique_inverse,)
+
+    if len(returns) == 1:
+        return returns[0]
+    return returns

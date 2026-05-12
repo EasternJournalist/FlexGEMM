@@ -146,7 +146,7 @@ def sparse_submanifold_conv_bwd_weight_implicit_gemm_kernel(
     grad_weight_ptr = grad_weight + (grad_weight_offset_co[:, None] * V * Ci + grad_weight_offset_vci[None, :])
     grad_weight_mask = (grad_weight_offset_co[:, None] < Co) & (grad_weight_offset_vci[None, :] < V * Ci)
     tl.store(grad_weight_ptr, c, mask=grad_weight_mask)
-    
+
 
 def sparse_submanifold_conv_bwd_implicit_gemm(
     grad_output: torch.Tensor,

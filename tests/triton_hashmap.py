@@ -53,7 +53,7 @@ def test_hashmap_build_triton_basic_properties(dtype: torch.dtype) -> None:
 def test_hashmap_lookup_triton_matches_reference(dtype: torch.dtype) -> None:
     device = torch.device("cuda")
     n_keys = 1024
-    key_dim = 4
+    key_dim = 8
     keys = _make_unique_keys(n_keys, dim=key_dim, device=device, dtype=dtype)
 
     # Half queries are present keys, half are guaranteed missing keys.
@@ -79,7 +79,7 @@ def test_hashmap_lookup_triton_matches_reference(dtype: torch.dtype) -> None:
 def test_hashmap_triton_speed_benchmark(dtype: torch.dtype) -> None:
     device = torch.device("cuda")
     n_keys = 1024 * 1024
-    key_dim = 8
+    key_dim = 16
 
     keys = _make_unique_keys(n_keys, dim=key_dim, device=device, dtype=dtype)
     n_queries = n_keys // 2

@@ -9,7 +9,7 @@ from flex_gemm.ops import spconv
 from flex_gemm import config
 from flex_gemm.ops.spconv.submanifold_conv import sparse_submanifold_conv
 from flex_gemm.ops.spconv.submanifold_conv import sparse_submanifold_conv3d
-from flex_gemm.ops.utils import make_conv_neighbor_offsets
+from flex_gemm.ops.utils import make_conv_kernel_delta
 from utils import sphere_coords
 
 
@@ -63,7 +63,7 @@ def test_triton_spconv_explicit_gemm_matches_torch_backend() -> None:
 
     kernel_size = (3, 1, 3, 1)
     dilation = (1, 1, 1, 1)
-    kernel_offsets = make_conv_neighbor_offsets(
+    kernel_offsets = make_conv_kernel_delta(
         kernel_size,
         dilation,
         batch_dims=1,

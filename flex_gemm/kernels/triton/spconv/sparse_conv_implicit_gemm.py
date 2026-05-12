@@ -7,6 +7,7 @@ from ....utils.autotuner import triton_autotune
 from . import config
 
 
+
 @triton_autotune(
     configs=config.autotune_config,
     key=['LOGN', 'LOGM', 'Ci', 'Co', 'V', 'allow_tf32'],
@@ -15,7 +16,7 @@ from . import config
     'HAS_BIAS': lambda args: args['bias'] is not None,
 })
 @triton.jit
-def sparse_conv_fwd_implicit_gemm_kernel(
+def sparse_conv_implicit_gemm_kernel(
     input,
     weight,
     bias,
@@ -74,8 +75,7 @@ def sparse_conv_fwd_implicit_gemm_kernel(
         input_block = tl.load(input_ptr, mask=neigh_mask[:, None] & k_mask[None, :], other=0.0)
         weight_block = tl.load(weight_ptr, mask=k_mask[:, None], other=0.0)
         # Accumulate along the K dimension.
-        accumulator = tl.dot(input_block, weight_block, accumulator,
-                             input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
+        accumulator = tl.dot(input_block, weight_block, accumulator, input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
     c = accumulator.to(input.type.element_ty)
             
     # add bias
@@ -106,7 +106,8 @@ def sparse_conv_bwd_weight_implicit_gemm_kernel(
     neighbor,
     grad_weight,
     # Tensor dimensions
-    M, LOGN, LOGM, Ci, Co, V: tl.constexpr,
+    M: int, LOGN: int, LOGM: int, Ci: int, Co: int, 
+    V: tl.constexpr,
     # Meta-parameters
     B1: tl.constexpr,   # Block size for Co dimension
     B2: tl.constexpr,   # Block size for V * Ci dimension
@@ -149,8 +150,7 @@ def sparse_conv_bwd_weight_implicit_gemm_kernel(
         grad_output_block = tl.load(grad_output_ptr, mask=mask[None, :], other=0.0)
         input_block = tl.load(input_ptr, mask=input_offset_n[:, :, None] != 0xffffffff, other=0.0).reshape(BK, BV * BCi)
         # Accumulate along the K dimension.
-        accumulator = tl.dot(grad_output_block, input_block, accumulator,
-                             input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
+        accumulator = tl.dot(grad_output_block, input_block, accumulator, input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
         # Advance pointers.
         grad_output_ptr += BK * Co
         neighbor_ptr += BK * V
@@ -168,76 +168,78 @@ def sparse_conv_fwd_implicit_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    neighbor: torch.Tensor,
+    fwd_neighbor_map: torch.Tensor,
 ) -> torch.Tensor:
     assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
-    assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
-    N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
+    assert fwd_neighbor_map.is_contiguous(), "Matrix fwd_neighbor_map must be contiguous"
+    N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
     LOGN = int(math.log2(N))
     LOGM = int(math.log2(M))
     # Allocate output matrix output.
     output = torch.empty((M, Co), device=input.device, dtype=input.dtype)
     # Launch the kernel.
     grid = lambda META: (triton.cdiv(Co, META['B2']) * triton.cdiv(M, META['B1']),)
-    sparse_conv_fwd_implicit_gemm_kernel[grid](
-        input, weight, bias, neighbor, output,
+    sparse_conv_implicit_gemm_kernel[grid](
+        input, weight, bias, fwd_neighbor_map, output,
         M, LOGN, LOGM, Ci, Co, V,
         allow_tf32=config.allow_tf32,
     )
     return output
+    
 
-
-def sparse_conv_bwd_implicit_gemm(
+def sparse_conv_bwd_input_implicit_gemm(
     grad_output: torch.Tensor,
-    input: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor,
-    neighbor: torch.Tensor,
-    neighbor_bwd: torch.Tensor,
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
+    bwd_neighbor_map: torch.Tensor,
+) -> torch.Tensor:
     assert grad_output.is_contiguous(), "Matrix grad_output must be contiguous"
-    assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
-    assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
-    assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
-    assert neighbor_bwd.is_contiguous(), "Matrix neighbor_bwd must be contiguous"
-    N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
+    assert bwd_neighbor_map.is_contiguous(), "Matrix bwd_neighbor_map must be contiguous"
+
+    Co, V, Ci = weight.shape
+    M = grad_output.shape[0]
+    N = bwd_neighbor_map.shape[0]
     LOGN = int(math.log2(N))
     LOGM = int(math.log2(M))
-    
-    grad_input, grad_weight, grad_bias = None, None, None
-    
-    # Grad for input
-    if input.requires_grad:
-        # Allocate output matrix output.
-        grad_input = torch.empty((N, Ci), device=input.device, dtype=input.dtype)
-        # Launch the kernel.
-        grid = lambda META: (triton.cdiv(Ci, META['B2']) * triton.cdiv(N, META['B1']),)
-        weight_bwd = weight if config.USE_ON_THE_FLY_WEIGHT_TRANSPOSE else weight.transpose(0, 2).contiguous()
-        sparse_conv_fwd_implicit_gemm_kernel[grid](
-            grad_output, weight_bwd, None, neighbor_bwd, grad_input,
-            N, LOGM, LOGN, Co, Ci, V,
-            allow_tf32=config.allow_tf32,
-            TRANSPOSE_WEIGHT=config.USE_ON_THE_FLY_WEIGHT_TRANSPOSE,
-        )
-        
-    # Grad for weight
-    if weight.requires_grad:
-        # Allocate output matrix output.
-        grad_weight = torch.empty((Co, V, Ci), device=weight.device, dtype=weight.dtype)
-        # Launch the kernel.
-        grid = lambda META: (triton.cdiv(Co, META['B1']), triton.cdiv(V * Ci, META['BV'] * META['BCi']))
-        sparse_conv_bwd_weight_implicit_gemm_kernel[grid](
-            grad_output, input, neighbor, grad_weight,
-            M, LOGN, LOGM, Ci, Co, V,
-            allow_tf32=config.allow_tf32,
-        )
-        
-    # Grad for bias
-    if bias is not None and bias.requires_grad:
-        grad_bias = grad_output.sum(0)
 
-    return grad_input, grad_weight, grad_bias
+    grad_input = torch.empty((N, Ci), device=grad_output.device, dtype=grad_output.dtype)
+    grid = lambda META: (triton.cdiv(Ci, META['B2']) * triton.cdiv(N, META['B1']),)
+
+    sparse_conv_implicit_gemm_kernel[grid](
+        grad_output, weight, None, bwd_neighbor_map, grad_input,
+        N, LOGM, LOGN, Co, Ci, V,
+        allow_tf32=config.allow_tf32,
+        TRANSPOSE_WEIGHT=True,
+    )
+    return grad_input
+        
+
+def sparse_conv_bwd_weight_implicit_gemm(
+    grad_output: torch.Tensor,
+    input: torch.Tensor,
+    fwd_neighbor_map: torch.Tensor,
+) -> torch.Tensor:
+    assert grad_output.is_contiguous(), "Matrix grad_output must be contiguous"
+    assert input.is_contiguous(), "Matrix input must be contiguous"
+    assert fwd_neighbor_map.is_contiguous(), "Matrix fwd_neighbor_map must be contiguous"
+
+    Co = grad_output.shape[1]
+    Ci = input.shape[1]
+    V = fwd_neighbor_map.shape[1]
+    M = grad_output.shape[0]
+    N = input.shape[0]
+    LOGN = int(math.log2(N))
+    LOGM = int(math.log2(M))
+    # Allocate output matrix output.
+    grad_weight = torch.empty((Co, V, Ci), device=grad_output.device, dtype=grad_output.dtype)
+    # Launch the kernel.
+    grid = lambda META: (triton.cdiv(Co, META['B1']), triton.cdiv(V * Ci, META['BV'] * META['BCi']))
+    sparse_conv_bwd_weight_implicit_gemm_kernel[grid](
+        grad_output, input, fwd_neighbor_map, grad_weight,
+        M, LOGN, LOGM, Ci, Co, V,
+        allow_tf32=config.allow_tf32,
+    )
+    return grad_weight
 

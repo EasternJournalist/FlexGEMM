@@ -23,7 +23,7 @@ def init_hashmap(spatial_size, hashmap_size, device, with_values=True):
     return hashmap_keys
 
 
-def make_conv_neighbor_offsets(kernel_size: tuple[int, ...], dilation: tuple[int, ...], batch_dims: int = 0, dtype=torch.int32, device: torch.device = None) -> Tensor:
+def make_conv_kernel_delta(kernel_size: tuple[int, ...], dilation: tuple[int, ...], batch_dims: int = 0, dtype=torch.int32, device: torch.device = None) -> Tensor:
     spatial_ranges = [
         range(-(k // 2) * l, (k // 2 + 1) * l, l)
         for k, l in zip(kernel_size, dilation)

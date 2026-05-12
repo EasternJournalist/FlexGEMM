@@ -8,6 +8,7 @@ import torch
 import triton
 import time
 import inspect
+import functools
 from filelock import FileLock
 
 from .. import config as pkg_config
@@ -313,7 +314,9 @@ def autotune(
     verbose=False
 ):
     def decorator(kernel):
-        return PersistentCacheAutoTuner(kernel, configs, key, config_fn, key_fn, warmup, runs, verbose)
+        return functools.wraps(kernel)(
+            PersistentCacheAutoTuner(kernel, configs, key, config_fn, key_fn, warmup, runs, verbose)
+        )
     return decorator
 
 

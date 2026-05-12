@@ -5,7 +5,7 @@ import triton
 import triton.language as tl
 from ....utils.autotuner import triton_autotune
 from . import config
-from .sparse_conv_implicit_gemm import sparse_conv_fwd_implicit_gemm_kernel
+from .sparse_conv_implicit_gemm import sparse_conv_implicit_gemm_kernel
 
 
 @triton_autotune(
@@ -18,7 +18,7 @@ from .sparse_conv_implicit_gemm import sparse_conv_fwd_implicit_gemm_kernel
     'HAS_BIAS': lambda args: args['bias'] is not None,
 })
 @triton.jit
-def sparse_conv_fwd_masked_implicit_gemm_kernel(
+def sparse_conv_masked_implicit_gemm_kernel(
     input,
     weight,
     bias,
@@ -189,100 +189,89 @@ def sparse_conv_fwd_masked_implicit_gemm(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    neighbor: torch.Tensor,
-    sorted_idx: torch.Tensor,
-    valid_kernel: Callable[[int], torch.Tensor],
-    valid_kernel_seg: Callable[[int], torch.Tensor],
+    fwd_neighbor_map: torch.Tensor,
+    fwd_sorted_idx: torch.Tensor,
+    fwd_valid_kernel: Callable[[int], torch.Tensor],
+    fwd_valid_kernel_seg: Callable[[int], torch.Tensor],
 ) -> torch.Tensor:
     assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
-    assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
-    N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
+    assert fwd_neighbor_map.is_contiguous(), "Matrix neighbor must be contiguous"
+    N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
     LOGN = int(math.log2(N))
     LOGM = int(math.log2(M))
     # Allocate output matrix output.
     output = torch.empty((M, Co), device=input.device, dtype=input.dtype)
     # Launch the kernel.
     grid = lambda META: (triton.cdiv(Co, META['B2']) * triton.cdiv(M, META['B1']),)
-    sparse_conv_fwd_masked_implicit_gemm_kernel[grid](
-        input, weight, bias, neighbor, sorted_idx, output,
+    sparse_conv_masked_implicit_gemm_kernel[grid](
+        input, weight, bias, fwd_neighbor_map, fwd_sorted_idx, output,
         M, LOGN, LOGM, Ci, Co, V,
-        valid_kernel=valid_kernel,
-        valid_kernel_seg=valid_kernel_seg,
+        valid_kernel=fwd_valid_kernel,
+        valid_kernel_seg=fwd_valid_kernel_seg,
         allow_tf32=config.allow_tf32,
     )
     return output
 
 
-def sparse_conv_bwd_masked_implicit_gemm(
+def sparse_conv_bwd_input_masked_implicit_gemm(
+    grad_output: torch.Tensor,
+    weight: torch.Tensor,
+    bwd_neighbor_map: torch.Tensor,
+    bwd_sorted_idx: Optional[torch.Tensor],
+    bwd_valid_kernel: Callable[[int], torch.Tensor],
+    bwd_valid_kernel_seg: Callable[[int], torch.Tensor],
+) -> torch.Tensor:
+    Co, V, Ci = weight.shape
+    M = grad_output.shape[0]
+    N = bwd_neighbor_map.shape[0]
+
+    grad_input = torch.empty((N, Ci), device=grad_output.device, dtype=grad_output.dtype)
+    grid = lambda META: (triton.cdiv(Ci, META['B2']) * triton.cdiv(N, META['B1']),)
+    if bwd_sorted_idx is None:
+        sparse_conv_implicit_gemm_kernel[grid](
+            grad_output, weight, None, bwd_neighbor_map, grad_input,
+            N, int(math.log2(M)), int(math.log2(N)), Co, Ci, V,
+            allow_tf32=config.allow_tf32,
+            TRANSPOSE_WEIGHT=True,
+        )
+    else:
+        sparse_conv_masked_implicit_gemm_kernel[grid](
+            grad_output, weight, None, bwd_neighbor_map, bwd_sorted_idx, grad_input,
+            N, int(math.log2(M)), int(math.log2(N)), Co, Ci, V,
+            valid_kernel=bwd_valid_kernel,
+            valid_kernel_seg=bwd_valid_kernel_seg,
+            allow_tf32=config.allow_tf32,
+            TRANSPOSE_WEIGHT=True,
+        )
+    return grad_input
+
+
+def sparse_conv_bwd_weight_masked_implicit_gemm(
     grad_output: torch.Tensor,
     input: torch.Tensor,
-    weight: torch.Tensor,
-    bias: torch.Tensor,
-    neighbor: torch.Tensor,
-    neighbor_bwd: torch.Tensor,
-    valid_signal_i: torch.Tensor,
-    valid_signal_o: torch.Tensor,
-    valid_signal_seg: torch.Tensor,
-    sorted_idx_bwd: Optional[torch.Tensor],
-    valid_kernel_bwd: Callable[[int], torch.Tensor],
-    valid_kernel_bwd_seg: Callable[[int], torch.Tensor],
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    assert grad_output.is_contiguous(), "Matrix grad_output must be contiguous"
-    assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
-    assert input.is_contiguous(), "Matrix input must be contiguous"
-    assert weight.is_contiguous(), "Matrix weight must be contiguous"
-    assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
-    assert neighbor_bwd.is_contiguous(), "Matrix neighbor_bwd must be contiguous"
-    N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
+    fwd_valid_signal_i: torch.Tensor,
+    fwd_valid_signal_o: torch.Tensor,
+    fwd_valid_signal_seg: torch.Tensor,
+) -> torch.Tensor:
+    Co = grad_output.shape[1]
+    Ci = input.shape[1]
+    V = fwd_valid_signal_seg.shape[0] - 1
+    M = grad_output.shape[0]
+    N = input.shape[0]
     LOGN = int(math.log2(N))
     LOGM = int(math.log2(M))
     
-    grad_input, grad_weight, grad_bias = None, None, None
-    
-    # Grad for input
-    if input.requires_grad:
-        # Allocate output matrix output.
-        grad_input = torch.empty((N, Ci), device=input.device, dtype=input.dtype)
-        # Launch the kernel.
-        grid = lambda META: (triton.cdiv(Ci, META['B2']) * triton.cdiv(N, META['B1']),)
-        weight_bwd = weight if config.USE_ON_THE_FLY_WEIGHT_TRANSPOSE else weight.transpose(0, 2).contiguous()
-        if sorted_idx_bwd is None:
-            sparse_conv_fwd_implicit_gemm_kernel[grid](
-                grad_output, weight_bwd, None, neighbor_bwd, grad_input,
-                N, LOGM, LOGN, Co, Ci, V,
-                allow_tf32=config.allow_tf32,
-                TRANSPOSE_WEIGHT=config.USE_ON_THE_FLY_WEIGHT_TRANSPOSE,
-            )
-        else:
-            sparse_conv_fwd_masked_implicit_gemm_kernel[grid](
-                grad_output, weight_bwd, None, neighbor_bwd, sorted_idx_bwd, grad_input,
-                N, LOGM, LOGN, Co, Ci, V,
-                valid_kernel=valid_kernel_bwd,
-                valid_kernel_seg=valid_kernel_bwd_seg,
-                allow_tf32=config.allow_tf32,
-                TRANSPOSE_WEIGHT=config.USE_ON_THE_FLY_WEIGHT_TRANSPOSE,
-            )
-        
-    # Grad for weight
-    if weight.requires_grad:
-        # Allocate output matrix output.
-        grad_weight = torch.empty((Co, V, Ci), device=weight.device, dtype=weight.dtype)
-        # Launch the kernel.
-        grid = lambda META: (triton.cdiv(Co, META['B1']) * triton.cdiv(Ci, META['B2']) * V,)
-        sparse_conv_bwd_weight_masked_implicit_gemm_kernel[grid](
-            grad_output, input,
-            valid_signal_i,
-            valid_signal_o,
-            valid_signal_seg,
-            grad_weight,
-            M, LOGN, LOGM, Ci, Co, V,
-            allow_tf32=config.allow_tf32,
-        )
-        
-    # Grad for bias
-    if bias is not None and bias.requires_grad:
-        grad_bias = grad_output.sum(0)
-
-    return grad_input, grad_weight, grad_bias
+    grad_weight = torch.empty((Co, V, Ci), device=grad_output.device, dtype=grad_output.dtype)
+    grid = lambda META: (triton.cdiv(Co, META['B1']) * triton.cdiv(Ci, META['B2']) * V,)
+    sparse_conv_bwd_weight_masked_implicit_gemm_kernel[grid](
+        grad_output, input,
+        fwd_valid_signal_i,
+        fwd_valid_signal_o,
+        fwd_valid_signal_seg,
+        grad_weight,
+        M, LOGN, LOGM, Ci, Co, V,
+        allow_tf32=config.allow_tf32,
+    )
+    return grad_weight

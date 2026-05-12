@@ -8,7 +8,7 @@ from ....utils.autotuner import triton_autotune, autotune
 from . import config
 from .sparse_conv_implicit_gemm_splitk import sparse_conv_fwd_implicit_gemm_splitk
 from .sparse_conv_masked_implicit_gemm import (
-    sparse_conv_fwd_masked_implicit_gemm_kernel,
+    sparse_conv_masked_implicit_gemm_kernel,
     sparse_conv_bwd_weight_masked_implicit_gemm_kernel,
 )
 
@@ -225,29 +225,29 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk(
     input: torch.Tensor,
     weight: torch.Tensor,
     bias: torch.Tensor,
-    neighbor: torch.Tensor,
-    sorted_idx: torch.Tensor,
-    valid_kernel: Callable[[int], torch.Tensor],
-    valid_kernel_seg: Callable[[int], torch.Tensor],
+    fwd_neighbor_map: torch.Tensor,
+    fwd_sorted_idx: torch.Tensor,
+    fwd_valid_kernel: Callable[[int], torch.Tensor],
+    fwd_valid_kernel_seg: Callable[[int], torch.Tensor],
     SPLITK: int = 1,
     TRANSPOSE_WEIGHT: bool = False,
 ) -> torch.Tensor:
     assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
-    assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
-    N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
+    assert fwd_neighbor_map.is_contiguous(), "Matrix neighbor must be contiguous"
+    N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
     LOGN = int(math.log2(N))
     LOGM = int(math.log2(M))
     # Launch the kernel.
     if SPLITK == 1:
         output = torch.empty((M, Co), device=input.device, dtype=input.dtype)
         grid = lambda META: (triton.cdiv(Co, META['B2']) * triton.cdiv(M, META['B1']),)
-        sparse_conv_fwd_masked_implicit_gemm_kernel[grid](
-            input, weight, bias, neighbor, sorted_idx, output,
+        sparse_conv_masked_implicit_gemm_kernel[grid](
+            input, weight, bias, fwd_neighbor_map, fwd_sorted_idx, output,
             M, LOGN, LOGM, Ci, Co, V,
-            valid_kernel=valid_kernel,
-            valid_kernel_seg=valid_kernel_seg,
+            valid_kernel=fwd_valid_kernel,
+            valid_kernel_seg=fwd_valid_kernel_seg,
             allow_tf32=config.allow_tf32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
         )
@@ -256,10 +256,10 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk(
         output = torch.empty((SPLITK, M, Co), device=input.device, dtype=torch.float32)
         grid = lambda META: (triton.cdiv(Co, META['B2']) * triton.cdiv(M, META['B1']), SPLITK)
         sparse_conv_fwd_masked_implicit_gemm_splitk_kernel[grid](
-            input, weight, bias, neighbor, sorted_idx, output,
+            input, weight, bias, fwd_neighbor_map, fwd_sorted_idx, output,
             M, LOGN, LOGM, Ci, Co, V,
-            valid_kernel=valid_kernel,
-            valid_kernel_seg=valid_kernel_seg,
+            valid_kernel=fwd_valid_kernel,
+            valid_kernel_seg=fwd_valid_kernel_seg,
             SPLITK=SPLITK,
             allow_tf32=config.allow_tf32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
@@ -294,12 +294,12 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk_keys(grad_output, input, 
 def sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
     grad_output: torch.Tensor,
     input: torch.Tensor,
-    valid_signal_i: torch.Tensor,
-    valid_signal_o: torch.Tensor,
-    valid_signal_seg: torch.Tensor,
+    fwd_valid_signal_i: torch.Tensor,
+    fwd_valid_signal_o: torch.Tensor,
+    fwd_valid_signal_seg: torch.Tensor,
     SPLITK: int = 1,
 ) -> torch.Tensor:
-    N, M, Ci, Co, V = input.shape[0], grad_output.shape[0], input.shape[1], grad_output.shape[1], valid_signal_seg.shape[0] - 1
+    N, M, Ci, Co, V = input.shape[0], grad_output.shape[0], input.shape[1], grad_output.shape[1], fwd_valid_signal_seg.shape[0] - 1
     LOGN = int(math.log2(N))
     LOGM = int(math.log2(M))
     
@@ -309,9 +309,9 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
         grid = lambda META: (triton.cdiv(Co, META['B1']) * triton.cdiv(Ci, META['B2']) * V,)
         sparse_conv_bwd_weight_masked_implicit_gemm_kernel[grid](
             grad_output, input,
-            valid_signal_i,
-            valid_signal_o,
-            valid_signal_seg,
+            fwd_valid_signal_i,
+            fwd_valid_signal_o,
+            fwd_valid_signal_seg,
             grad_weight,
             M, LOGN, LOGM, Ci, Co, V,
             allow_tf32=config.allow_tf32,
@@ -322,9 +322,9 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
         grid = lambda META: (triton.cdiv(Co, META['B1']) * triton.cdiv(Ci, META['B2']) * V, SPLITK)
         sparse_conv_bwd_weight_masked_implicit_gemm_splitk_kernel[grid](
             grad_output, input,
-            valid_signal_i,
-            valid_signal_o,
-            valid_signal_seg,
+            fwd_valid_signal_i,
+            fwd_valid_signal_o,
+            fwd_valid_signal_seg,
             grad_weight,
             M, LOGN, LOGM, Ci, Co, V,
             SPLITK=SPLITK,
@@ -333,56 +333,23 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
         return grad_weight.sum(0).to(input.dtype)
     
 
-def sparse_conv_bwd_masked_implicit_gemm_splitk(
+def sparse_conv_bwd_input_masked_implicit_gemm_splitk(
     grad_output: torch.Tensor,
-    input: torch.Tensor,
     weight: torch.Tensor,
-    bias: torch.Tensor,
-    neighbor: torch.Tensor,
-    neighbor_bwd: torch.Tensor,
-    valid_signal_i: torch.Tensor,
-    valid_signal_o: torch.Tensor,
-    valid_signal_seg: torch.Tensor,
-    sorted_idx_bwd: Optional[torch.Tensor],
-    valid_kernel_bwd: Callable[[int], torch.Tensor],
-    valid_kernel_bwd_seg: Callable[[int], torch.Tensor],
-) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-    assert grad_output.is_contiguous(), "Matrix grad_output must be contiguous"
-    assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
-    assert input.is_contiguous(), "Matrix input must be contiguous"
-    assert weight.is_contiguous(), "Matrix weight must be contiguous"
-    assert neighbor.is_contiguous(), "Matrix neighbor must be contiguous"
-    assert neighbor_bwd.is_contiguous(), "Matrix neighbor_bwd must be contiguous"
-    
-    grad_input, grad_weight, grad_bias = None, None, None
-    
-    # Grad for input
-    if input.requires_grad:
-        weight_bwd = weight if config.USE_ON_THE_FLY_WEIGHT_TRANSPOSE else weight.transpose(0, 2).contiguous()
-        if sorted_idx_bwd is None:
-            grad_input = sparse_conv_fwd_implicit_gemm_splitk(
-                grad_output, weight_bwd, None, neighbor_bwd,
-                TRANSPOSE_WEIGHT=config.USE_ON_THE_FLY_WEIGHT_TRANSPOSE
-            )
-        else:
-            grad_input = sparse_conv_fwd_masked_implicit_gemm_splitk(
-                grad_output, weight_bwd, None, neighbor_bwd, sorted_idx_bwd,
-                valid_kernel_bwd, valid_kernel_bwd_seg,
-                TRANSPOSE_WEIGHT=config.USE_ON_THE_FLY_WEIGHT_TRANSPOSE
-            )
-            
-    # Grad for weight
-    if weight.requires_grad:
-        grad_weight = sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
-            grad_output,
-            input,
-            valid_signal_i,
-            valid_signal_o,
-            valid_signal_seg,
+    bwd_neighbor_map: torch.Tensor,
+    bwd_sorted_idx: Optional[torch.Tensor],
+    bwd_valid_kernel: Callable[[int], torch.Tensor],
+    bwd_valid_kernel_seg: Callable[[int], torch.Tensor],
+) -> torch.Tensor:
+    if bwd_sorted_idx is None:
+        grad_input = sparse_conv_fwd_implicit_gemm_splitk(
+            grad_output, weight, None, bwd_neighbor_map,
+            TRANSPOSE_WEIGHT=True
         )
-        
-    # Grad for bias
-    if bias is not None and bias.requires_grad:
-        grad_bias = grad_output.sum(0)
-
-    return grad_input, grad_weight, grad_bias
+    else:
+        grad_input = sparse_conv_fwd_masked_implicit_gemm_splitk(
+            grad_output, weight, None, bwd_neighbor_map, bwd_sorted_idx,
+            bwd_valid_kernel, bwd_valid_kernel_seg,
+            TRANSPOSE_WEIGHT=True
+        )
+    return grad_input
