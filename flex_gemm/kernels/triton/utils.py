@@ -46,9 +46,12 @@ def get_autotune_config(
 
 
 def _lengths_to_offsets(lengths: torch.Tensor) -> torch.Tensor:
-    offsets = torch.empty((lengths.shape[0] + 1,), dtype=lengths.dtype, device=lengths.device)
-    offsets[0] = 0
-    torch.cumsum(lengths, dim=0, out=offsets[1:])
+    """Convert per-segment lengths to a (M+1,) offsets array starting at 0.
+
+    Output dtype matches ``lengths.dtype``.
+    """
+    offsets = torch.cat((torch.zeros(1, dtype=lengths.dtype, device=lengths.device), lengths))
+    offsets.cumsum_(dim=0)
     return offsets
 
 

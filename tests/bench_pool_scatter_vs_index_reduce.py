@@ -1,12 +1,13 @@
-"""Benchmark: segment-based scatter pool vs torch.index_reduce.
+"""Benchmark: segment-based scatter pool vs torch.index_reduce vs ideal reshape+reduce.
 
-Both compute, for each output m:
-    out[m] = reduce({ feats[i] : i s.t. indices[i] == m })
+Each of the M output indices appears *exactly* V times in `indices`, so the
+gathered tensor after index_select has shape (M*V, C) and can be reshaped to
+(M, V, C) for a plain .sum/.mean/.max — the ideal performance upper bound for
+the segment-based approach when segment lengths are uniform.
 
-Approach A (this repo): scatter_count -> build_segments_from_indices_triton ->
-                        index_select(feats, seg_indices) -> segment_reduce
-Approach B: torch.Tensor.index_reduce_ (in-place; requires include_self=False
-            for pure segment-reduce semantics, plus an initial fill for max/min).
+Approach A  (segment):       build_segments_from_indices_triton -> index_select -> segment_reduce
+Approach B  (ideal):         build_segments_from_indices_triton -> index_select -> reshape -> reduce
+Approach C  (scatter_reduce):torch.scatter_reduce (functional)
 
 Run:  PYTHONPATH=. python tests/bench_pool_scatter_vs_index_reduce.py
 """
@@ -14,7 +15,10 @@ Run:  PYTHONPATH=. python tests/bench_pool_scatter_vs_index_reduce.py
 import time
 import torch
 
-from flex_gemm.kernels.triton.pool import build_segments_from_indices_triton
+from flex_gemm.kernels.triton.pool import (
+    build_segments_from_indices_triton,
+    index_segment_reduce_triton,
+)
 
 
 def bench(fn, iters=50, warmup=10):
@@ -28,85 +32,135 @@ def bench(fn, iters=50, warmup=10):
     return (time.perf_counter() - t0) * 1000 / iters  # ms / iter
 
 
-def approach_segment(feats, indices, M, reduce):
-    seg_indices, seg_offsets = build_segments_from_indices_triton(indices, M)
+def make_uniform_indices(M, V, device):
+    """Each index 0..M-1 appears exactly V times, in random order."""
+    idx = torch.arange(M, device=device, dtype=torch.int32).repeat(V)
+    perm = torch.randperm(idx.shape[0], device=device)
+    return idx[perm]
+
+@torch.compile(dynamic=True)
+def index_selected_segment_reduce(feats: torch.Tensor, seg_indices: torch.Tensor, seg_offsets: torch.Tensor, reduce: str):
     gathered = feats.index_select(0, seg_indices)
     return torch.segment_reduce(gathered, reduce, offsets=seg_offsets, axis=0)
 
-
-def approach_index_reduce(feats, indices, M, reduce):
-    # Map our reduce -> torch.index_reduce reduce name + initial fill
-    torch_reduce, init = {
-        "mean": ("mean", 0.0),
-        "sum":  None,            # index_reduce doesn't support "sum"; use index_add_ instead
-        "prod": ("prod", 1.0),
-        "max":  ("amax", float("-inf")),
-        "min":  ("amin", float("+inf")),
-    }[reduce]
-
-    out = feats.new_full((M, feats.shape[1]), init)
-    out.index_reduce_(0, indices.to(torch.int64), feats, torch_reduce, include_self=False)
-    return out
+def approach_segment(feats, indices, M, reduce):
+    seg_indices, seg_offsets = build_segments_from_indices_triton(indices, M)
+    return index_selected_segment_reduce(feats, seg_indices, seg_offsets, reduce)
 
 
-def approach_index_add(feats, indices, M):
-    out = feats.new_zeros((M, feats.shape[1]))
-    out.index_add_(0, indices.to(torch.int64), feats)
-    return out
+def approach_reshape(feats, indices, M, V, reduce):
+    """Ideal upper bound: uniform segment length V allows reshape instead of segment_reduce."""
+    seg_indices, _seg_offsets = build_segments_from_indices_triton(indices, M)
+    gathered = feats.index_select(0, seg_indices)          # (M*V, C)
+    C = feats.shape[1]
+    g = gathered.reshape(M, V, C)
+    if reduce == "sum":
+        return g.sum(dim=1)
+    elif reduce == "mean":
+        return g.mean(dim=1)
+    elif reduce == "max":
+        return g.max(dim=1).values
+    else:
+        raise ValueError(reduce)
+
+
+def approach_scatter_reduce(feats, indices, M, reduce):
+    scatter_reduce_name = {"sum": "sum", "mean": "mean", "max": "amax"}[reduce]
+    idx = indices.to(torch.int64).unsqueeze(1).expand_as(feats)
+    out = feats.new_zeros(M, feats.shape[1])
+    return torch.scatter_reduce(out, 0, idx, feats, reduce=scatter_reduce_name, include_self=False)
+
+
+def approach_no_gather(feats, M, V, reduce):
+    """True ideal: reshape without any gather/select. Skip index_select overhead entirely."""
+    C = feats.shape[1]
+    g = feats.reshape(M, V, C)  # Assume feats is already in perfect order
+    if reduce == "sum":
+        return g.sum(dim=1)
+    elif reduce == "mean":
+        return g.mean(dim=1)
+    elif reduce == "max":
+        return g.max(dim=1).values
+    else:
+        raise ValueError(reduce)
 
 
 def main():
     torch.manual_seed(0)
     device = "cuda"
 
-    # Vary N (inputs), M (outputs), C (channels).
+    # configs: (M, V, C)  —  N = M * V total inputs, each output sees exactly V inputs.
     configs = [
-        # (N,        M,        C)
-        (1 << 14,   1 << 12,    16),
-        (1 << 16,   1 << 14,    16),
-        (1 << 18,   1 << 16,    16),
-        (1 << 16,   1 << 14,    64),
-        (1 << 16,   1 << 14,   256),
-        (1 << 20,   1 << 16,    64),
-        # Small N, very large C — channel-bound regime.
-        (1 << 12,   1 << 10,   1024),
-        (1 << 12,   1 << 10,   4096),
-        (1 << 14,   1 << 12,   1024),
-        (1 << 14,   1 << 12,   4096),
+        # (M,        V,   C)
+        (1 << 12,    4,   16),
+        (1 << 14,    4,   16),
+        (1 << 14,    4,   64),
+        (1 << 14,    4,  256),
+        (1 << 16,    4,   64),
+        (1 << 18,    4,  256),
+        # Larger V
+        (1 << 12,   8,   64),
+        (1 << 12,   16,  256),
+        (1 << 14,   16,   64),
+        # Channel-bound
+        (1 << 10,    4, 1024),
+        (1 << 10,    4, 4096),
+        (1 << 12,    4, 1024),
+        (1 << 12,   16, 1024),
     ]
 
-    print(f"{'N':>9} {'M':>9} {'C':>5} {'reduce':>6} | "
-          f"{'segment ms':>11} {'index_reduce ms':>15} {'speedup':>8} | "
-          f"{'max err':>10}")
-    print("-" * 100)
+    print(f"{'N':>9} {'M':>9} {'V':>4} {'C':>5} {'reduce':>6} | "
+          f"{'build_seg':>9} {'gather+red':>10} {'fused tri':>9} {'no_gather':>9} | {'seg total':>9} {'fused tot':>9} {'scatter':>9} | "
+          f"{'err (seg - scat)':>9} {'err (fused - scat)':>9}")
+    print("-" * 160)
 
-    for N, M, C in configs:
+    for M, V, C in configs:
+        N = M * V
         feats = torch.randn(N, C, device=device)
-        indices = torch.randint(0, M, (N,), device=device, dtype=torch.int32)
+        # Shuffle feats rows so physical layout is fully decoupled from any
+        # latent order in `indices` — guarantees the gather inside the fused
+        # kernel exercises scattered-read latency, not L2 prefetcher luck.
+        feats = feats[torch.randperm(N, device=device)].contiguous()
+        indices = make_uniform_indices(M, V, device)
 
         for reduce in ["sum", "mean", "max"]:
-            # Correctness sanity
-            out_a = approach_segment(feats, indices, M, reduce)
-            if reduce == "sum":
-                out_b = approach_index_add(feats, indices, M)
-                fn_b = lambda: approach_index_add(feats, indices, M)
-            else:
-                out_b = approach_index_reduce(feats, indices, M, reduce)
-                fn_b = lambda r=reduce: approach_index_reduce(feats, indices, M, r)
+            # --- correctness ---
+            out_seg       = approach_segment(feats, indices, M, reduce)
+            out_no_gather = approach_no_gather(feats, M, V, reduce)
+            out_scat      = approach_scatter_reduce(feats, indices, M, reduce)
 
-            # Empty outputs in approach_b can have init values (e.g. -inf for max);
-            # segment_reduce produces undefined results on those rows too, so only
-            # compare rows that received at least one input.
-            counts = torch.zeros(M, device=device, dtype=torch.int64)
-            counts.index_add_(0, indices.to(torch.int64), torch.ones_like(indices, dtype=torch.int64))
-            valid = counts > 0
-            err = (out_a[valid] - out_b[valid]).abs().max().item()
+            err  = (out_seg  - out_scat).abs().max().item()
 
-            t_a = bench(lambda r=reduce: approach_segment(feats, indices, M, r))
-            t_b = bench(fn_b)
-            print(f"{N:>9} {M:>9} {C:>5} {reduce:>6} | "
-                  f"{t_a:>11.4f} {t_b:>15.4f} {t_b/t_a:>7.2f}x | "
-                  f"{err:>10.2e}")
+            # --- timing: break approach_segment into two stages ---
+            # Stage 1: build_segments
+            t_build = bench(lambda: build_segments_from_indices_triton(indices, M))
+
+            # Precompute outputs of earlier stages for isolating later-stage cost.
+            seg_indices, seg_offsets = build_segments_from_indices_triton(indices, M)
+
+            # Stage 2a: torch.compile fused gather+reduce
+            t_gather_red = bench(
+                lambda r=reduce: index_selected_segment_reduce(feats, seg_indices, seg_offsets, r)
+            )
+
+            # Stage 2b: hand-written fused Triton kernel
+            out_fused = index_segment_reduce_triton(feats, seg_indices, seg_offsets, reduce)
+            err_fused = (out_fused - out_scat).abs().max().item()
+            t_fused = bench(
+                lambda r=reduce: index_segment_reduce_triton(feats, seg_indices, seg_offsets, r)
+            )
+
+            t_seg_total   = t_build + t_gather_red
+            t_fused_total = t_build + t_fused
+
+            # Reference timings
+            t_no_gather = bench(lambda r=reduce: approach_no_gather(feats, M, V, r))
+            t_scat      = bench(lambda r=reduce: approach_scatter_reduce(feats, indices, M, r))
+
+            print(f"{N:>9} {M:>9} {V:>4} {C:>5} {reduce:>6} | "
+                  f"{t_build:>9.4f} {t_gather_red:>10.4f} {t_fused:>9.4f} {t_no_gather:>9.4f} | "
+                  f"{t_seg_total:>9.4f} {t_fused_total:>9.4f} {t_scat:>9.4f} | "
+                  f"{err:>9.2e} {err_fused:>9.2e}")
 
 
 if __name__ == "__main__":
