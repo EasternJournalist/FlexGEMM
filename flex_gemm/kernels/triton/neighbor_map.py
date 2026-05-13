@@ -20,9 +20,13 @@ from .utils import segment_take, _lengths_to_offsets
 __all__ = [
     "build_neighbor_map_from_kernel_delta_triton",
     "build_neighbor_map_from_kernel_size_dilation_triton",
-    "neighbor_map_post_process_for_masked_implicit_gemm_1",
-    "neighbor_map_post_process_for_masked_implicit_gemm_2",
-    "neighbor_map_post_process_for_masked_implicit_gemm_3",
+    "transpose_neighbor_map_triton",
+    "get_conv_output_coords_kernel_size_dilation_triton",
+    "get_conv_output_coords_kernel_delta_torch",
+    "get_conv_output_coords_kernel_delta_triton",
+    "neighbor_map_gray_code_sort",
+    "neighbor_map_valid_signal",
+    "neighbor_map_valid_kernel",
 ]
 
 
@@ -94,7 +98,7 @@ def _hashmap_prepare_offs_masks_inline(
 
 # ===== Arbitrary neighbor offsets ======
 @triton.jit
-def _hashmap_build_neighbor_map_from_kernel_delta_kernel(
+def _hashmap_build_neighbor_map_from_kernel_delta_triton_kernel(
     hashmap_ptr: tl.tensor,
     hashmap_size: int,
     coords_in_ptr: tl.const,
@@ -171,7 +175,7 @@ def _make_conv_delta_4d_inline(
 
 
 @triton.jit
-def _hashmap_build_neighbor_map_kernel_size_dilation_4d_kernel(
+def _hashmap_build_neighbor_map_kernel_size_dilation_4d_triton_kernel(
     hashmap_ptr: tl.tensor,
     hashmap_size: int,
     coords_in_ptr: tl.const,
@@ -197,14 +201,14 @@ def _hashmap_build_neighbor_map_kernel_size_dilation_4d_kernel(
     )
 
     # Make constexpr neighbor deltas.
-    kernel_size_vec = _make_4d_vec_inline(K0, K1, K2, K3, dtype=dtype)
-    kernel_dilation_vec = _make_4d_vec_inline(KD0, KD1, KD2, KD3, dtype=dtype)
+    delta_dtype = tl.int16 if INT16_DELTA else tl.int32
+    kernel_size_vec = _make_4d_vec_inline(K0, K1, K2, K3, dtype=delta_dtype)
+    kernel_dilation_vec = _make_4d_vec_inline(KD0, KD1, KD2, KD3, dtype=delta_dtype)
     delta_vec = _make_conv_delta_inline(
         offs_V, 
-        K0, K1, K2, K3,
         kernel_size_vec=kernel_size_vec,
         kernel_dilation_vec=kernel_dilation_vec,
-        dtype=tl.int16 if INT16_DELTA else tl.int32
+        dtype=delta_dtype
     ) # (BLOCK_V, D)
     
     if coord_stride_offset_ptr is not None:
@@ -250,7 +254,7 @@ def _make_conv_delta_inline(
 
 
 @triton.jit
-def _hashmap_build_neighbor_map_kernel_size_dilation_kernel(
+def _hashmap_build_neighbor_map_kernel_size_dilation_triton_kernel(
     hashmap_ptr: tl.pointer_type,
     hashmap_size: tl.constexpr,
     coords_in_ptr: tl.pointer_type,
@@ -402,7 +406,7 @@ def build_neighbor_map_from_kernel_size_dilation_triton(
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(V, BLOCK_V))
     
     if D == 4 and all(k <= 5 for k in kernel_size_D):
-        _hashmap_build_neighbor_map_kernel_size_dilation_4d_kernel[grid](
+        _hashmap_build_neighbor_map_kernel_size_dilation_4d_triton_kernel[grid](
             hashmap_ptr=hashmap,
             hashmap_size=hashmap.shape[0],
             coords_in_ptr=input_coords,
@@ -419,7 +423,7 @@ def build_neighbor_map_from_kernel_size_dilation_triton(
         )
     else:
         kernel_size_dilation_tensor = torch.tensor(list(kernel_size_D) + list(kernel_dilation_D), dtype=torch.int16 if INT16_DELTA else torch.int32, device=device)
-        _hashmap_build_neighbor_map_kernel_size_dilation_kernel[grid](
+        _hashmap_build_neighbor_map_kernel_size_dilation_triton_kernel[grid](
             hashmap_ptr=hashmap,
             hashmap_size=hashmap.shape[0],
             coords_in_ptr=input_coords,
@@ -507,7 +511,7 @@ def build_neighbor_map_from_kernel_delta_triton(
         BLOCK_M = 256 // BLOCK_V 
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(V, BLOCK_V))
 
-    _hashmap_build_neighbor_map_from_kernel_delta_kernel[grid](
+    _hashmap_build_neighbor_map_from_kernel_delta_triton_kernel[grid](
         hashmap_ptr=hashmap,
         hashmap_size=hashmap.shape[0],
         coords_in_ptr=input_coords,
@@ -651,7 +655,7 @@ def transpose_neighbor_map_torch(
 # =======================================================================================
 
 
-def get_output_coords_kernel_size_dilation_torch(
+def get_conv_output_coords_kernel_size_dilation_torch(
     input_coords: torch.Tensor,
     kernel_size: tuple[int, ...],
     stride: tuple[int, ...] | None,
@@ -705,7 +709,7 @@ def get_output_coords_kernel_size_dilation_torch(
     return unique_out_coords, fwd_neighbor_map, bwd_neighbor_map
 
 
-# def get_output_coords_kernel_size_dilation_strided_torch(
+# def get_conv_output_coords_kernel_size_dilation_strided_torch(
 #     input_coords: torch.Tensor,
 #     kernel_size: tuple[int, ...],
 #     stride: tuple[int, ...] | None,
@@ -800,7 +804,7 @@ def get_output_coords_kernel_size_dilation_torch(
 
 
 @triton.jit
-def _get_output_coords_4d_kernel(
+def _get_conv_output_coords_4d_triton_kernel(
     coords_in_ptr,        # (N, D=4) int32 input coords
     out_candidates_ptr,   # (N * V, D=4) int32 output candidates buffer
     valid_mask_ptr,       # (N * V,) int8 valid mask
@@ -822,48 +826,42 @@ def _get_output_coords_4d_kernel(
 
     offs_D = tl.arange(0, D)
 
-    # Load input coords: (BLOCK_M, D) -> int32
+    # Load input coords: (BLOCK_M, D) in coord dtype
     coord_vec = _vec_load(coords_in_ptr + offs_M * D, mask_M, D).to(tl.int32)
+    coord_dtype = coord_vec.dtype
 
     # Compute deltas for each kernel position: (BLOCK_V, D)
-    kernel_size_vec    = _make_4d_vec_inline(K0, K1, K2, K3)
-    kernel_dilation_vec = _make_4d_vec_inline(KD0, KD1, KD2, KD3)
+    kernel_size_vec    = _make_4d_vec_inline(K0, K1, K2, K3, dtype=coord_dtype)
+    kernel_dilation_vec = _make_4d_vec_inline(KD0, KD1, KD2, KD3, dtype=coord_dtype)
     delta_vec = _make_conv_delta_inline(
         offs_V, kernel_size_vec, kernel_dilation_vec,
         dtype=tl.int16 if INT16_DELTA else tl.int32,
-    )
+    ).to(coord_dtype)
 
     if stride_offset_ptr is not None:
-        stride_vec = tl.load(stride_offset_ptr + offs_D).to(tl.int32)
-        offset_vec = tl.load(stride_offset_ptr + D + offs_D).to(tl.int32)
+        stride_vec = tl.load(stride_offset_ptr + offs_D)
+        offset_vec = tl.load(stride_offset_ptr + D + offs_D)
     else:
-        stride_vec = tl.full((D,), 1, dtype=tl.int32)
-        offset_vec = tl.zeros((D,), dtype=tl.int32)
+        stride_vec = tl.full((D,), 1, dtype=coord_dtype)
+        offset_vec = tl.zeros((D,), dtype=coord_dtype)
 
-    # Broadcast to (BLOCK_M, BLOCK_V, D)
-    coord_exp  = tl.broadcast_to(coord_vec[:, None, :],      (BLOCK_M, BLOCK_V, D))
-    delta_exp  = tl.broadcast_to(delta_vec[None, :, :],      (BLOCK_M, BLOCK_V, D))
-    offset_exp = tl.broadcast_to(offset_vec[None, None, :],  (BLOCK_M, BLOCK_V, D))
-    stride_exp = tl.broadcast_to(stride_vec[None, None, :],  (BLOCK_M, BLOCK_V, D))
-
-    # candidate_in = coord_in - offset - delta  (input-coord space)
-    # candidate_out = candidate_in // stride   (valid only when divisible)
-    candidate = coord_exp - offset_exp - delta_exp  # (BLOCK_M, BLOCK_V, D)
+    # candidate_in  = coord_in - offset - delta  (input-coord space)
+    # candidate_out = candidate_in // stride     (valid only when divisible)
+    # Implicit broadcast over (BLOCK_M, BLOCK_V, D).
+    candidate = coord_vec[:, None, :] - (delta_vec[None, :, :] + offset_vec[None, None, :])
 
     # Divisibility check: all D dims must be divisible by stride
-    valid_div = tl.sum((candidate % stride_exp == 0).to(tl.int32), axis=2) == D  # (BLOCK_M, BLOCK_V)
+    valid_div = tl.min(candidate % stride_vec[None, None, :] == 0, axis=2) > 0
 
     # Output-space candidate coords
-    candidate = candidate // stride_exp  # (BLOCK_M, BLOCK_V, D)
+    candidate = candidate // stride_vec[None, None, :]
 
     if boundary_ptr is not None:
-        boundary_min = tl.load(boundary_ptr + offs_D).to(tl.int32)
-        boundary_max = tl.load(boundary_ptr + D + offs_D).to(tl.int32)
-        bmin_exp = tl.broadcast_to(boundary_min[None, None, :], (BLOCK_M, BLOCK_V, D))
-        bmax_exp = tl.broadcast_to(boundary_max[None, None, :], (BLOCK_M, BLOCK_V, D))
+        boundary_min = tl.load(boundary_ptr + offs_D)
+        boundary_max = tl.load(boundary_ptr + D + offs_D)
         valid_bnd = (
-            (tl.sum((candidate >= bmin_exp).to(tl.int32), axis=2) == D) &
-            (tl.sum((candidate < bmax_exp).to(tl.int32), axis=2) == D)
+            (tl.min(candidate >= boundary_min[None, None, :], axis=2) > 0) &
+            (tl.min(candidate <  boundary_max[None, None, :], axis=2) > 0)
         )
         valid = valid_div & valid_bnd & mask_MV
     else:
@@ -881,7 +879,7 @@ def _get_output_coords_4d_kernel(
 
 
 @triton.jit
-def _get_output_coords_nd_kernel(
+def _get_conv_output_coords_nd_triton_kernel(
     coords_in_ptr,        # (N, D) int32 input coords
     out_candidates_ptr,   # (N * V, D) int32 output candidates buffer
     valid_mask_ptr,       # (N * V,) int8 valid mask
@@ -902,8 +900,9 @@ def _get_output_coords_nd_kernel(
 
     offs_D = tl.arange(0, D)
 
-    # Load input coords: (BLOCK_M, D) -> int32
+    # Load input coords: (BLOCK_M, D) in coord dtype
     coord_vec = _vec_load(coords_in_ptr + offs_M * D, mask_M, D).to(tl.int32)
+    coord_dtype = coord_vec.dtype
 
     # Load kernel_size and dilation and compute deltas: (BLOCK_V, D)
     kernel_size_vec    = tl.load(kernel_size_dilation_ptr + offs_D)
@@ -911,35 +910,28 @@ def _get_output_coords_nd_kernel(
     delta_vec = _make_conv_delta_inline(
         offs_V, kernel_size_vec, kernel_dilation_vec,
         dtype=tl.int16 if INT16_DELTA else tl.int32,
-    ).to(tl.int32)  # (BLOCK_V, D)
+    ).to(coord_dtype)  # (BLOCK_V, D)
 
     if stride_offset_ptr is not None:
-        stride_vec = tl.load(stride_offset_ptr + offs_D).to(tl.int32)
-        offset_vec = tl.load(stride_offset_ptr + D + offs_D).to(tl.int32)
+        stride_vec = tl.load(stride_offset_ptr + offs_D)
+        offset_vec = tl.load(stride_offset_ptr + D + offs_D)
     else:
-        stride_vec = tl.full((D,), 1, dtype=tl.int32)
-        offset_vec = tl.zeros((D,), dtype=tl.int32)
+        stride_vec = tl.full((D,), 1, dtype=coord_dtype)
+        offset_vec = tl.zeros((D,), dtype=coord_dtype)
 
-    # Broadcast to (BLOCK_M, BLOCK_V, D)
-    coord_exp  = tl.broadcast_to(coord_vec[:, None, :],      (BLOCK_M, BLOCK_V, D))
-    delta_exp  = tl.broadcast_to(delta_vec[None, :, :],      (BLOCK_M, BLOCK_V, D))
-    offset_exp = tl.broadcast_to(offset_vec[None, None, :],  (BLOCK_M, BLOCK_V, D))
-    stride_exp = tl.broadcast_to(stride_vec[None, None, :],  (BLOCK_M, BLOCK_V, D))
+    # Implicit broadcast over (BLOCK_M, BLOCK_V, D).
+    candidate = coord_vec[:, None, :] - (delta_vec[None, :, :] + offset_vec[None, None, :])
 
-    candidate = coord_exp - offset_exp - delta_exp  # (BLOCK_M, BLOCK_V, D)
+    valid_div = tl.min(candidate % stride_vec[None, None, :] == 0, axis=2) > 0
 
-    valid_div = tl.sum((candidate % stride_exp == 0).to(tl.int32), axis=2) == D  # (BLOCK_M, BLOCK_V)
-
-    candidate = candidate // stride_exp  # (BLOCK_M, BLOCK_V, D)
+    candidate = candidate // stride_vec[None, None, :]
 
     if boundary_ptr is not None:
-        boundary_min = tl.load(boundary_ptr + offs_D).to(tl.int32)
-        boundary_max = tl.load(boundary_ptr + D + offs_D).to(tl.int32)
-        bmin_exp = tl.broadcast_to(boundary_min[None, None, :], (BLOCK_M, BLOCK_V, D))
-        bmax_exp = tl.broadcast_to(boundary_max[None, None, :], (BLOCK_M, BLOCK_V, D))
+        boundary_min = tl.load(boundary_ptr + offs_D)
+        boundary_max = tl.load(boundary_ptr + D + offs_D)
         valid_bnd = (
-            (tl.sum((candidate >= bmin_exp).to(tl.int32), axis=2) == D) &
-            (tl.sum((candidate < bmax_exp).to(tl.int32), axis=2) == D)
+            (tl.min(candidate >= boundary_min[None, None, :], axis=2) > 0) &
+            (tl.min(candidate <  boundary_max[None, None, :], axis=2) > 0)
         )
         valid = valid_div & valid_bnd & mask_MV
     else:
@@ -955,14 +947,15 @@ def _get_output_coords_nd_kernel(
     tl.store(valid_mask_ptr + out_idx, valid.to(tl.int8), mask=mask_MV)
 
 
-def get_output_coords_kernel_size_dilation_triton(
+def get_conv_output_coords_kernel_size_dilation_triton(
     input_coords: Tensor,
     kernel_size: tuple[int, ...],
     stride: tuple[int, ...] | None = None,
     dilation: tuple[int, ...] | None = None,
     offset: tuple[int, ...] | None = None,
     boundary: tuple[tuple[int, int], ...] | None = None,
-) -> tuple[Tensor, Tensor, Tensor]:
+    return_neighbor_maps: bool = True,
+) -> tuple[Tensor, Tensor | None, Tensor | None]:
     """Compute output coords for strided sparse convolution using Triton GPU kernels.
 
     For each input coordinate ``coord_in`` and each kernel delta ``delta``:
@@ -982,13 +975,17 @@ def get_output_coords_kernel_size_dilation_triton(
         boundary: tuple of (min, max) pairs (length ≤ D) or None.
             When provided, output coords are filtered to ``boundary[d][0] <= x < boundary[d][1]``.
             When None, no boundary filtering is applied.
+        return_neighbor_maps: if False, skip building the fwd/bwd neighbor maps
+            (and the dedup-inverse needed for them). The two map slots in the
+            returned tuple will be ``None``. Useful for benchmarking the output-coord
+            stage in isolation.
 
     Returns:
         output_coords: (M, D) tensor — unique output coordinates.
-        fwd_neighbor_map: (M, V) int32 tensor — ``fwd[m, v] = n`` means input coord
-            ``n`` contributes to output coord ``m`` via kernel index ``v``.
-        bwd_neighbor_map: (N, V) int32 tensor — ``bwd[n, v] = m`` means input coord
-            ``n`` maps to output coord ``m`` via kernel index ``v``; -1 if none.
+        fwd_neighbor_map: (M, V) int32 tensor or ``None`` — ``fwd[m, v] = n`` means
+            input coord ``n`` contributes to output coord ``m`` via kernel index ``v``.
+        bwd_neighbor_map: (N, V) int32 tensor or ``None`` — ``bwd[n, v] = m`` means
+            input coord ``n`` maps to output coord ``m`` via kernel index ``v``; -1 if none.
     """
     assert input_coords.dtype in (torch.int8, torch.int16, torch.int32), (
         f"input_coords must be int8, int16 or int32, got {input_coords.dtype}."
@@ -1031,12 +1028,12 @@ def get_output_coords_kernel_size_dilation_triton(
     else:
         stride_offset_tensor = None
 
-    # boundary tensor: (2*D,) = bmin[D] ++ bmax[D], or None
+    # boundary tensor: (2*D,) = bmin[D] ++ bmax[D] in coord dtype, or None
     if boundary is not None:
         boundary_D = tuple(boundary) + ((0, 1),) * (D - orig_D)
         bmin = [b[0] for b in boundary_D]
         bmax = [b[1] for b in boundary_D]
-        boundary_tensor = torch.tensor(bmin + bmax, dtype=torch.int32, device=device)
+        boundary_tensor = torch.tensor(bmin + bmax, dtype=coord_dtype, device=device)
     else:
         boundary_tensor = None
 
@@ -1049,7 +1046,7 @@ def get_output_coords_kernel_size_dilation_triton(
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(V, BLOCK_V))
 
     if D == 4 and all(k <= 5 for k in kernel_size_D):
-        _get_output_coords_4d_kernel[grid](
+        _get_conv_output_coords_4d_triton_kernel[grid](
             coords_in_ptr=input_coords_padded,
             out_candidates_ptr=out_candidates,
             valid_mask_ptr=valid_mask,
@@ -1068,7 +1065,7 @@ def get_output_coords_kernel_size_dilation_triton(
             dtype=torch.int16,
             device=device,
         )
-        _get_output_coords_nd_kernel[grid](
+        _get_conv_output_coords_nd_triton_kernel[grid](
             coords_in_ptr=input_coords_padded,
             out_candidates_ptr=out_candidates,
             valid_mask_ptr=valid_mask,
@@ -1088,11 +1085,20 @@ def get_output_coords_kernel_size_dilation_triton(
     valid_candidates = out_candidates.index_select(0, valid_indices)    # (L, D) int32
 
     if valid_candidates.shape[0] == 0:
+        empty_coords = torch.empty((0, orig_D), dtype=coord_dtype, device=device)
+        if not return_neighbor_maps:
+            return empty_coords, None, None
         return (
-            torch.empty((0, orig_D), dtype=coord_dtype, device=device),
+            empty_coords,
             torch.full((0, V), -1, dtype=torch.int32, device=device),
             torch.full((N, V), -1, dtype=torch.int32, device=device),
         )
+
+    if not return_neighbor_maps:
+        # Skip the inverse-index dedup and fwd/bwd map construction.
+        unique_out_coords = hashmap_unique(valid_candidates, return_inverse=False)
+        unique_out_coords = unique_out_coords[:, :orig_D].to(coord_dtype).contiguous()
+        return unique_out_coords, None, None
 
     # Deduplicate output candidates -> unique output coords
     unique_out_coords, unique_inverse = hashmap_unique(valid_candidates, return_inverse=True)
@@ -1111,11 +1117,265 @@ def get_output_coords_kernel_size_dilation_triton(
 
     return unique_out_coords, fwd_nm, bwd_nm
 
+
+@triton.jit
+def _get_conv_output_coords_delta_triton_kernel(
+    coords_in_ptr,        # (N, D) coord-dtype input coords
+    out_candidates_ptr,   # (N * V, D) coord-dtype output candidates buffer
+    valid_mask_ptr,       # (N * V,) int8 valid mask
+    delta_ptr,                                  # (V, D) coord-dtype kernel deltas
+    stride_offset_ptr: tl.pointer_type | None,  # (2*D,) stride[D] ++ offset[D], or None
+    boundary_ptr: tl.pointer_type | None,        # (2*D,) bmin[D] ++ bmax[D], or None
+    N: int,
+    V: int,
+    D: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_V: tl.constexpr,
+):
+    pid_M = tl.program_id(0)
+    pid_V = tl.program_id(1)
+    offs_M, mask_M, offs_V, mask_V = _hashmap_prepare_offs_masks_inline(pid_M, pid_V, N, V, BLOCK_M, BLOCK_V)
+    mask_MV = mask_M[:, None] & mask_V[None, :]
+
+    offs_D = tl.arange(0, D)
+
+    # Load input coords: (BLOCK_M, D) in coord dtype
+    coord_vec = _vec_load(coords_in_ptr + offs_M * D, mask_M, D)
+    coord_dtype = coord_vec.dtype
+
+    # Load deltas for this V-block: (BLOCK_V, D) in coord dtype
+    delta_vec = tl.load(
+        delta_ptr + offs_V[:, None] * D + offs_D[None, :],
+        mask=mask_V[:, None],
+        other=0,
+    )
+
+    if stride_offset_ptr is not None:
+        stride_vec = tl.load(stride_offset_ptr + offs_D)
+        offset_vec = tl.load(stride_offset_ptr + D + offs_D)
+    else:
+        stride_vec = tl.full((D,), 1, dtype=coord_dtype)
+        offset_vec = tl.zeros((D,), dtype=coord_dtype)
+
+    # candidate_in  = coord_in - offset - delta
+    # candidate_out = candidate_in // stride  (valid only when divisible)
+    # Implicit broadcast over (BLOCK_M, BLOCK_V, D).
+    candidate = coord_vec[:, None, :] - (delta_vec[None, :, :] + offset_vec[None, None, :])
+
+    valid_div = tl.min(candidate % stride_vec[None, None, :] == 0, axis=2) > 0
+
+    candidate = candidate // stride_vec[None, None, :]
+
+    if boundary_ptr is not None:
+        boundary_min = tl.load(boundary_ptr + offs_D)
+        boundary_max = tl.load(boundary_ptr + D + offs_D)
+        valid_bnd = (
+            (tl.min(candidate >= boundary_min[None, None, :], axis=2) > 0) &
+            (tl.min(candidate <  boundary_max[None, None, :], axis=2) > 0)
+        )
+        valid = valid_div & valid_bnd & mask_MV
+    else:
+        valid = valid_div & mask_MV
+
+    out_idx = offs_M[:, None] * V + offs_V[None, :]  # (BLOCK_M, BLOCK_V)
+
+    tl.store(
+        out_candidates_ptr + out_idx[:, :, None] * D + offs_D[None, None, :],
+        candidate,
+        mask=mask_MV[:, :, None],
+    )
+    tl.store(valid_mask_ptr + out_idx, valid.to(tl.int8), mask=mask_MV)
+
+
+def get_conv_output_coords_kernel_delta_torch(
+    input_coords: Tensor,
+    delta: Tensor,
+    stride: tuple[int, ...] | None,
+    offset: tuple[int, ...] | None,
+    boundary: tuple[tuple[int, int], ...],
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Reference implementation of :func:`get_conv_output_coords_kernel_delta_triton`.
+
+    For each ``coord_in`` and each ``delta[v]``:
+        ``candidate_out = (coord_in - offset - delta[v]) // stride``
+    is valid when divisibility holds for every dim and the candidate lies in ``boundary``.
+
+    Returns: (output_coords, fwd_neighbor_map, bwd_neighbor_map).
+    """
+    N, orig_D = input_coords.shape
+    assert delta.dtype == input_coords.dtype, (
+        f"delta dtype {delta.dtype} must match input_coords dtype {input_coords.dtype}."
+    )
+    if delta.shape[1] < orig_D:
+        delta = pad_to_size_along_dim(delta, dim=1, size=orig_D, value=0, side='left')
+    assert delta.shape[1] == orig_D, (
+        f"delta has {delta.shape[1]} dims, but input_coords has {orig_D} dims."
+    )
+    stride = (1,) * (orig_D - len(stride)) + tuple(stride) if stride is not None else (1,) * orig_D
+    offset = (0,) * (orig_D - len(offset)) + tuple(offset) if offset is not None else (0,) * orig_D
+
+    device = input_coords.device
+    offset_tensor = torch.tensor(offset, dtype=input_coords.dtype, device=device)
+    stride_tensor = torch.tensor(stride, dtype=input_coords.dtype, device=device)
+
+    all_out_coords = (input_coords[:, None, :] - (delta + offset_tensor)).flatten(0, 1)  # (N * V, D)
+
+    valid_stride = torch.all(all_out_coords % stride_tensor == 0, dim=-1)
+    all_out_coords //= stride_tensor
+
+    boundary_min, boundary_max = torch.tensor(boundary, dtype=input_coords.dtype, device=device).unbind(dim=1)
+    valid_boundary = (all_out_coords >= boundary_min).all(dim=-1) & (all_out_coords < boundary_max).all(dim=-1)
+
+    argwhere_valid = torch.argwhere(valid_stride & valid_boundary).squeeze(1)
+
+    unique_out_coords, unique_inverse = torch.unique(
+        all_out_coords[argwhere_valid], return_inverse=True, dim=0,
+    )
+    M = unique_out_coords.shape[0]
+
+    bwd_neighbor_map = torch.full((all_out_coords.shape[0],), -1, dtype=torch.int32, device=device)
+    bwd_neighbor_map[argwhere_valid] = unique_inverse.to(torch.int32)
+    bwd_neighbor_map = bwd_neighbor_map.view(N, delta.shape[0])  # (N, V)
+
+    fwd_neighbor_map = transpose_neighbor_map_torch(bwd_neighbor_map, N=M)  # (M, V)
+
+    return unique_out_coords, fwd_neighbor_map, bwd_neighbor_map
+
+
+def get_conv_output_coords_kernel_delta_triton(
+    input_coords: Tensor,
+    delta: Tensor,
+    stride: tuple[int, ...] | None = None,
+    offset: tuple[int, ...] | None = None,
+    boundary: tuple[tuple[int, int], ...] | None = None,
+) -> tuple[Tensor, Tensor, Tensor]:
+    """Compute output coords for strided sparse convolution with arbitrary kernel deltas.
+
+    Like :func:`get_conv_output_coords_kernel_size_dilation_triton`, but the kernel is
+    specified by an explicit ``(V, D)`` tensor of neighbor offsets instead of
+    ``kernel_size`` / ``dilation``.
+
+    For each ``coord_in`` and each ``delta[v]``:
+        ``candidate_out = (coord_in - offset - delta[v]) // stride``
+    is valid when divisibility holds for every dim and the candidate lies in ``boundary``.
+
+    Args:
+        input_coords: (N, D) int8 / int16 / int32 tensor of input voxel coordinates.
+        delta: (V, D') tensor of the same dtype as ``input_coords``; the relative
+            kernel offsets. ``D'`` may be smaller than ``D``, in which case the
+            missing prefix dims are treated as batch dims (zero-padded on the left).
+        stride: tuple of ints (length ≤ D) or None (defaults to all-1).
+        offset: tuple of ints (length ≤ D) or None (defaults to all-0).
+        boundary: tuple of (min, max) pairs (length ≤ D) or None.
+
+    Returns:
+        output_coords: (M, D) tensor — unique output coordinates.
+        fwd_neighbor_map: (M, V) int32 tensor.
+        bwd_neighbor_map: (N, V) int32 tensor.
+    """
+    assert input_coords.dtype in (torch.int8, torch.int16, torch.int32), (
+        f"input_coords must be int8, int16 or int32, got {input_coords.dtype}."
+    )
+    assert delta.dtype == input_coords.dtype, (
+        f"delta dtype {delta.dtype} must match input_coords dtype {input_coords.dtype}."
+    )
+    N, orig_D = input_coords.shape
+    coord_dtype = input_coords.dtype
+    device = input_coords.device
+
+    if delta.shape[1] > orig_D:
+        raise ValueError(
+            f"delta cannot have more dims than input_coords. Got delta {delta.shape[1]} vs coords {orig_D}."
+        )
+    if delta.shape[1] < orig_D:
+        delta = pad_to_size_along_dim(delta, dim=1, size=orig_D, value=0, side='left')
+
+    # Normalize stride / offset / boundary to length orig_D
+    stride = (1,) * (orig_D - len(stride)) + tuple(stride) if stride is not None else (1,) * orig_D
+    offset = (0,) * (orig_D - len(offset)) + tuple(offset) if offset is not None else (0,) * orig_D
+    if boundary is not None:
+        boundary = ((0, 1),) * (orig_D - len(boundary)) + tuple(boundary)
+
+    # Pad spatial dim to next power of 2 (≥ 4), appending zeros on the right.
+    D = max(4, triton.next_power_of_2(orig_D))
+    input_coords_padded = pad_to_size_along_dim(input_coords, dim=1, size=D, value=0, side='right').contiguous()
+    delta_padded = pad_to_size_along_dim(delta, dim=1, size=D, value=0, side='right').contiguous()
+
+    V = delta.shape[0]
+    stride_D = tuple(stride) + (1,) * (D - orig_D)
+    offset_D = tuple(offset) + (0,) * (D - orig_D)
+
+    if N == 0 or V == 0:
+        empty_coords = torch.empty((0, orig_D), dtype=coord_dtype, device=device)
+        return (
+            empty_coords,
+            torch.full((0, V), -1, dtype=torch.int32, device=device),
+            torch.full((N, V), -1, dtype=torch.int32, device=device),
+        )
+
+    if any(s != 1 for s in stride_D) or any(o != 0 for o in offset_D):
+        stride_offset_tensor = torch.tensor(list(stride_D) + list(offset_D), dtype=coord_dtype, device=device)
+    else:
+        stride_offset_tensor = None
+
+    if boundary is not None:
+        boundary_D = tuple(boundary) + ((0, 1),) * (D - orig_D)
+        bmin = [b[0] for b in boundary_D]
+        bmax = [b[1] for b in boundary_D]
+        boundary_tensor = torch.tensor(bmin + bmax, dtype=coord_dtype, device=device)
+    else:
+        boundary_tensor = None
+
+    out_candidates = torch.empty((N * V, D), dtype=coord_dtype, device=device)
+    valid_mask     = torch.empty((N * V,),   dtype=torch.int8,  device=device)
+
+    BLOCK_V = min(32, triton.next_power_of_2(V))
+    BLOCK_M = max(1, 256 // BLOCK_V)
+    grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(V, BLOCK_V))
+
+    _get_conv_output_coords_delta_triton_kernel[grid](
+        coords_in_ptr=input_coords_padded,
+        out_candidates_ptr=out_candidates,
+        valid_mask_ptr=valid_mask,
+        delta_ptr=delta_padded,
+        stride_offset_ptr=stride_offset_tensor,
+        boundary_ptr=boundary_tensor,
+        N=N,
+        V=V,
+        D=D,
+        BLOCK_M=BLOCK_M,
+        BLOCK_V=BLOCK_V,
+    )
+
+    valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+    valid_candidates = out_candidates[valid_indices]
+
+    if valid_candidates.shape[0] == 0:
+        return (
+            torch.empty((0, orig_D), dtype=coord_dtype, device=device),
+            torch.full((0, V), -1, dtype=torch.int32, device=device),
+            torch.full((N, V), -1, dtype=torch.int32, device=device),
+        )
+
+    unique_out_coords, unique_inverse = hashmap_unique(valid_candidates, return_inverse=True)
+    M = unique_out_coords.shape[0]
+
+    bwd_nm_flat = torch.full((N * V,), -1, dtype=torch.int32, device=device)
+    bwd_nm_flat[valid_indices] = unique_inverse.to(torch.int32)
+    bwd_nm = bwd_nm_flat.view(N, V)
+
+    fwd_nm = transpose_neighbor_map_triton(bwd_nm, N=M)
+
+    unique_out_coords = unique_out_coords[:, :orig_D].to(coord_dtype).contiguous()
+
+    return unique_out_coords, fwd_nm, bwd_nm
+
+
 # ========================================================================================
 # ================= neighbor map post-processing for masked implicit GEMM ================
 # ========================================================================================
 @triton.jit
-def _mask_gray_binary_kernel(
+def _mask_gray_binary_triton_kernel(
     mask_ptr: tl.pointer_type,
     gray_ptr: tl.pointer_type,
     binary_ptr: tl.pointer_type,
@@ -1153,7 +1413,7 @@ def _mask_gray_binary_kernel(
     tl.store(binary_ptr + offs_n, binary, mask=mask_n)
 
 
-def neighbor_map_post_process_for_masked_implicit_gemm_1(
+def neighbor_map_gray_code_sort(
     neighbor_mask: Tensor,
 ) -> tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
     """
@@ -1181,7 +1441,7 @@ def neighbor_map_post_process_for_masked_implicit_gemm_1(
     BLOCK_N = 64
     BLOCK_V = 32
     grid = (triton.cdiv(N, BLOCK_N),)
-    _mask_gray_binary_kernel[grid](
+    _mask_gray_binary_triton_kernel[grid](
         mask_ptr=neighbor_mask,
         gray_ptr=gray_code,
         binary_ptr=binary_code,
@@ -1197,12 +1457,12 @@ def neighbor_map_post_process_for_masked_implicit_gemm_1(
     return gray_code, sorted_idx
 
 
-def neighbor_map_post_process_for_masked_implicit_gemm_2(
+def neighbor_map_valid_signal(
     neighbor_map: Tensor,
     neighbor_mask: Tensor
 ) -> tuple[Tensor, Tensor, Tensor]:
     """
-    Post-process the neighbor map for masked implicit GEMM.
+    Post-process the neighbor map for masked implicit GEMM. (Backward to weights)
 
     Returns:
         valid_signal_i: (L,) int32 tensor of input indices for valid signals.
@@ -1219,20 +1479,20 @@ def neighbor_map_post_process_for_masked_implicit_gemm_2(
     neighbor_map_T = neighbor_map.transpose(0, 1)
     neighbor_mask_T = neighbor_mask.transpose(0, 1)
 
-    mask_flat_indices = torch.argwhere(neighbor_mask_T.reshape(-1)).squeeze(1)
+    mask_flat_indices = neighbor_mask_T.reshape(-1).nonzero(as_tuple=True)[0]
 
     valid_signal_i = neighbor_map_T.reshape(-1).index_select(0, mask_flat_indices).to(torch.uint32)
     valid_signal_o = torch.remainder(mask_flat_indices.to(torch.int32), N).to(torch.uint32)
 
     valid_signal_seg = torch.zeros((V + 1,), dtype=torch.long, device=neighbor_map.device)
-    per_kernel_counts = neighbor_mask_T.reshape(V, N).sum(dim=1).to(torch.int32)
+    per_kernel_counts = neighbor_mask_T.reshape(V, N).to(torch.int32).sum(dim=1)
     torch.cumsum(per_kernel_counts, dim=0, out=valid_signal_seg[1:])
 
     return valid_signal_i, valid_signal_o, valid_signal_seg
 
 
 @triton.jit
-def _reduce_gray_code_kernel(
+def _reduce_gray_code_triton_kernel(
     gray_code_ptr: tl.const,
     sorted_idx_ptr: tl.const,
     reduced_code_ptr: tl.pointer_type,
@@ -1273,7 +1533,7 @@ def _scatter_reduced_code_kernel(
     tl.store(out_ptr + pos, bits, mask=do_store)
 
 
-def neighbor_map_post_process_for_masked_implicit_gemm_3(
+def neighbor_map_valid_kernel(
     gray_code: Tensor,
     sorted_idx: Tensor,
     block_size: int,
@@ -1304,7 +1564,7 @@ def neighbor_map_post_process_for_masked_implicit_gemm_3(
 
     reduced_code = torch.empty((num_blocks,), dtype=torch.long, device=gray_code.device)
     grid = (num_blocks,)
-    _reduce_gray_code_kernel[grid](
+    _reduce_gray_code_triton_kernel[grid](
         gray_code_ptr=gray_code,
         sorted_idx_ptr=sorted_idx,
         reduced_code_ptr=reduced_code,
@@ -1331,179 +1591,3 @@ def neighbor_map_post_process_for_masked_implicit_gemm_3(
 
     return valid_kernel_idx, valid_kernel_seg
 
-
-# =======================================================================================
-# =============================== self-test =============================================
-# =======================================================================================
-
-if __name__ == "__main__":
-    import sys
-
-    if not torch.cuda.is_available():
-        print("CUDA not available; skipping all tests.")
-        sys.exit(0)
-
-    def _sorted_coords(t: torch.Tensor) -> torch.Tensor:
-        """Return rows of t sorted lexicographically for comparison."""
-        if t.shape[0] == 0:
-            return t
-        idx = torch.zeros(t.shape[0], dtype=torch.long, device=t.device)
-        multiplier = 1
-        for d in reversed(range(t.shape[1])):
-            idx += t[:, d].to(torch.long) * multiplier
-            multiplier *= (t[:, d].max() - t[:, d].min() + 2).item()
-        return t[idx.argsort()]
-
-    def check_triton(
-        input_coords: torch.Tensor,
-        kernel_size: tuple,
-        stride: tuple,
-        dilation: tuple,
-        offset: tuple,
-        boundary: tuple | None,
-        tag: str,
-    ) -> bool:
-        assert input_coords.dtype in (torch.int16, torch.int32), (
-            f"coords must be int16 or int32, got {input_coords.dtype}"
-        )
-        # Dedupe input coords so per-column injectivity holds for fwd<->bwd transpose.
-        input_coords = torch.unique(input_coords, dim=0)
-        cu = input_coords.cuda()
-        # Reference: use provided boundary, or a very wide one when boundary=None
-        ref_boundary = boundary if boundary is not None else ((-32768, 32767),) * input_coords.shape[1]
-        ref_coords, ref_fwd, ref_bwd = get_output_coords_kernel_size_dilation_torch(
-            cu, kernel_size, stride=stride, offset=offset, dilation=dilation, boundary=ref_boundary
-        )
-        tri_coords, tri_fwd, tri_bwd = get_output_coords_kernel_size_dilation_triton(
-            cu, kernel_size, stride=stride, dilation=dilation, offset=offset, boundary=boundary
-        )
-
-        # 1. Compare unique output coords (order may differ between implementations)
-        ref_s = torch.unique(_sorted_coords(ref_coords.to(torch.int32)), dim=0)
-        tri_s = torch.unique(_sorted_coords(tri_coords.to(torch.int32)), dim=0)
-        coords_ok = ref_s.shape == tri_s.shape and (ref_s == tri_s).all()
-
-        # 2. Self-consistency: for every (m, v) where tri_fwd[m, v] = n >= 0,
-        #    we must have tri_bwd[n, v] == m. (Inputs are deduped, so the
-        #    inverse direction also holds.)
-        N_in = cu.shape[0]
-        valid_fwd = tri_fwd >= 0
-        m_idx, v_idx = valid_fwd.nonzero(as_tuple=True)
-        n_vals = tri_fwd[m_idx, v_idx].long()
-        maps_ok = (tri_bwd[n_vals, v_idx] == m_idx.to(torch.int32)).all().item()
-
-        # 3. Total valid-entry count in bwd should match reference
-        count_ok = (tri_bwd >= 0).sum().item() == (ref_bwd >= 0).sum().item()
-
-        ok = coords_ok and maps_ok and count_ok
-        flag = "OK  " if ok else "FAIL"
-        extra = f"  [coords={coords_ok} maps={maps_ok} count={count_ok}]" if not ok else ""
-        print(f"  {flag}  [{tag}]  ({ref_s.shape[0]} out coords, {(tri_bwd>=0).sum()} valid pairs){extra}")
-        if not ok and not coords_ok:
-            print(f"    ref : {ref_s.cpu().tolist()}")
-            print(f"    got : {tri_s.cpu().tolist()}")
-        return ok
-
-    print("Testing get_output_coords_kernel_size_dilation_triton (device=cuda):\n")
-    ok = True
-
-    # ── case 1: stride=1 ────────────────────────────────────────────────────
-    c = torch.randint(0, 10, (20, 3), dtype=torch.int32)
-    ok &= check_triton(c, (3, 3, 3), (1, 1, 1), (1, 1, 1), (0, 0, 0),
-                       ((0, 10),) * 3, "3D k=3 s=1 d=1 o=0")
-
-    # ── case 2: stride=2, dilation=1 ────────────────────────────────────────
-    c = torch.randint(0, 20, (40, 3), dtype=torch.int32)
-    ok &= check_triton(c, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0),
-                       ((0, 10),) * 3, "3D k=3 s=2 d=1 o=0")
-
-    # ── case 3: stride=2, dilation=2 ────────────────────────────────────────
-    c = torch.randint(0, 20, (30, 3), dtype=torch.int32)
-    ok &= check_triton(c, (3, 3, 3), (2, 2, 2), (2, 2, 2), (0, 0, 0),
-                       ((0, 10),) * 3, "3D k=3 s=2 d=2 o=0")
-
-    # ── case 4: non-zero offset ──────────────────────────────────────────────
-    c = torch.randint(0, 20, (30, 3), dtype=torch.int32)
-    ok &= check_triton(c, (3, 3, 3), (2, 2, 2), (1, 1, 1), (1, 1, 1),
-                       ((0, 10),) * 3, "3D k=3 s=2 d=1 o=1")
-
-    # ── case 5: asymmetric stride ────────────────────────────────────────────
-    c = torch.randint(0, 20, (40, 3), dtype=torch.int32)
-    ok &= check_triton(c, (3, 3, 3), (1, 2, 3), (1, 1, 1), (0, 0, 0),
-                       ((0, 10),) * 3, "3D k=3 s=(1,2,3) d=1 o=0")
-
-    # ── case 6: 4D (batch + 3 spatial) ──────────────────────────────────────
-    c = torch.randint(0, 4, (50, 4), dtype=torch.int32)
-    ok &= check_triton(c, (3, 3, 3), (1, 2, 2), (1, 1, 1), (0, 0, 0),
-                       ((0, 4),) * 4, "4D k=3 s=(1,2,2) d=1 o=0")
-
-    # ── case 7: kernel_size=1 (trivial) ─────────────────────────────────────
-    c = torch.randint(0, 10, (20, 3), dtype=torch.int32)
-    ok &= check_triton(c, (1, 1, 1), (2, 2, 2), (1, 1, 1), (0, 0, 0),
-                       ((0, 5),) * 3, "3D k=1 s=2 d=1 o=0")
-
-    # ── case 8: empty input ──────────────────────────────────────────────────
-    c = torch.zeros((0, 3), dtype=torch.int32)
-    ok &= check_triton(c, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0),
-                       ((0, 10),) * 3, "empty input")
-
-    # ── case 9: boundary=None (no filtering) ────────────────────────────────
-    c = torch.randint(0, 10, (30, 3), dtype=torch.int32)
-    ok &= check_triton(c, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0),
-                       None, "no boundary")
-
-    # ── case 10: int16 coords ────────────────────────────────────────────────
-    c = torch.randint(0, 10, (20, 3), dtype=torch.int16)
-    ok &= check_triton(c, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0),
-                       ((0, 5),) * 3, "3D k=3 s=2 int16 coords")
-
-    print()
-    print("All tests passed." if ok else "Some tests FAILED.")
-    if not ok:
-        sys.exit(1)
-
-    # ===========================================================================
-    # Performance benchmark (torch reference vs triton)
-    # ===========================================================================
-    import time
-
-    def bench(fn, *args, warmup: int = 3, repeat: int = 10, **kwargs) -> float:
-        for _ in range(warmup):
-            fn(*args, **kwargs)
-        t0 = time.perf_counter()
-        for _ in range(repeat):
-            fn(*args, **kwargs)
-        return (time.perf_counter() - t0) / repeat * 1e3  # ms
-
-    print()
-    print("=" * 70)
-    print(f"{'Case':<40}  {'torch (ms)':>10}  {'triton (ms)':>11}  {'speedup':>8}")
-    print("=" * 70)
-
-    bench_cases = [
-        # (N,    D,  kernel_size,  stride,    dilation,   offset,    R,   tag)
-        (1000000, 3, (3, 3, 3), (1, 1, 1), (1, 1, 1), (0, 0, 0), 150, ""),
-        (1000000, 3, (3, 3, 3), (1, 1, 1), (2, 2, 2), (0, 0, 0), 150, ""),
-        (1000000, 3, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0), 150, ""),
-        (1000000, 3, (5, 5, 5), (2, 2, 2), (1, 1, 1), (0, 0, 0), 150, ""),
-        (5000000, 3, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0), 150, ""),
-        (1000000, 4, (3, 3, 3), (1, 2, 2), (1, 1, 1), (0, 0, 0), 150, ""),
-    ]
-
-    for N, D, ks, st, dl, off, R, tag in bench_cases:
-        coords = torch.randint(0, R, (N, D), dtype=torch.int16, device='cuda')
-        coords = torch.unique(coords, dim=0)  # dedupe to ensure fair comparison
-        N = coords.shape[0]
-        boundary = tuple((0, R) for _ in range(D))
-
-        t_ref = bench(
-            get_output_coords_kernel_size_dilation_torch,
-            coords, ks, stride=st, offset=off, dilation=dl, boundary=boundary,
-        )
-        t_tri = bench(
-            get_output_coords_kernel_size_dilation_triton,
-            coords, ks, stride=st, dilation=dl, offset=off, boundary=boundary,
-        )
-        M = len(get_output_coords_kernel_size_dilation_torch(coords, ks, stride=st, offset=off, dilation=dl, boundary=boundary)[0])
-        speedup = t_ref / t_tri
-        print(f"N={N:<6} M={M:<6} {tag:<40}  {t_ref:>10.2f}  {t_tri:>11.2f}  {speedup:>7.2f}x")

@@ -46,7 +46,10 @@ def get_autotune_config(
 
 
 def _lengths_to_offsets(lengths: torch.Tensor) -> torch.Tensor:
-    return torch.cat([torch.zeros(1, dtype=lengths.dtype, device=lengths.device), torch.cumsum(lengths, dim=0)])
+    offsets = torch.empty((lengths.shape[0] + 1,), dtype=lengths.dtype, device=lengths.device)
+    offsets[0] = 0
+    torch.cumsum(lengths, dim=0, out=offsets[1:])
+    return offsets
 
 
 def segment_take(data: Tensor, *, offsets: Tensor | None, lengths: Tensor | None, taking: Tensor, dim: int = 0) -> Tuple[Tensor, Tensor]:

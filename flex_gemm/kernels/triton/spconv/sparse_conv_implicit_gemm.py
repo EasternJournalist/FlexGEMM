@@ -31,7 +31,8 @@ def sparse_conv_implicit_gemm_kernel(
     HAS_BIAS: tl.constexpr,  # Whether bias is present
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
     # Specialize
-    TRANSPOSE_WEIGHT: tl.constexpr = False,  # Whether to transpose the weight matrix
+    TRANSPOSE_WEIGHT: tl.constexpr = False,  # Whether to transpose the weight matrix from (Co, V, Ci) to (Ci, V, Co)
+    FLIP_WEIGHT: tl.constexpr = False,  # Whether to flip the weight matrix along the V dimension (for symmetric-kernel submanifold bwd_input)
 ):
     """
     Indice convolution forward kernel using implicit GEMM.
@@ -62,10 +63,11 @@ def sparse_conv_implicit_gemm_kernel(
         v = k // num_k
         bk = k % num_k
         # Calculate pointers to weight matrix.
+        weight_v = V - 1 - v if FLIP_WEIGHT else v
         if not TRANSPOSE_WEIGHT:
-            weight_ptr = weight + (offset_co[None, :] * V * Ci) + (v * Ci) + (bk * BK + offset_k[:, None])      # (BK, B2)
+            weight_ptr = weight + (offset_co[None, :] * V * Ci) + (weight_v * Ci) + (bk * BK + offset_k[:, None])      # (BK, B2)
         else:
-            weight_ptr = weight + (offset_co[None, :]) + (v * Co) + ((bk * BK + offset_k[:, None]) * V * Co)    # (BK, B2)
+            weight_ptr = weight + (offset_co[None, :]) + (weight_v * Co) + ((bk * BK + offset_k[:, None]) * V * Co)    # (BK, B2)
         # Calculate pointers to input matrix.
         neighbor_offset = tl.load(neighbor + offset_m * V + v)                                # (B1,)
         input_ptr = input + bk * BK + (neighbor_offset[:, None].to(tl.int64) * Ci + offset_k[None, :])     # (B1, BK)
@@ -192,15 +194,34 @@ def sparse_conv_fwd_implicit_gemm(
 def sparse_conv_bwd_input_implicit_gemm(
     grad_output: torch.Tensor,
     weight: torch.Tensor,
-    bwd_neighbor_map: torch.Tensor,
+    *,
+    symmetric: bool,
+    fwd_neighbor_map: Optional[torch.Tensor] = None,
+    bwd_neighbor_map: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    """
+    Backward to input for sparse convolution using implicit GEMM.
+
+    Cache arguments are keyword-only. When ``symmetric=True`` (input/output
+    coordinates coincide and the kernel offsets are centrally symmetric), pass
+    ``fwd_neighbor_map`` and the weight matrix is internally flipped along the V
+    dimension, so the forward cache is reused. Otherwise, pass ``bwd_neighbor_map``.
+    """
+    if symmetric:
+        assert fwd_neighbor_map is not None and bwd_neighbor_map is None, \
+            "symmetric=True requires fwd_neighbor_map and forbids bwd_neighbor_map"
+        neighbor_map = fwd_neighbor_map
+    else:
+        assert bwd_neighbor_map is not None and fwd_neighbor_map is None, \
+            "symmetric=False requires bwd_neighbor_map and forbids fwd_neighbor_map"
+        neighbor_map = bwd_neighbor_map
     assert grad_output.is_contiguous(), "Matrix grad_output must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
-    assert bwd_neighbor_map.is_contiguous(), "Matrix bwd_neighbor_map must be contiguous"
+    assert neighbor_map.is_contiguous(), "neighbor_map must be contiguous"
 
     Co, V, Ci = weight.shape
     M = grad_output.shape[0]
-    N = bwd_neighbor_map.shape[0]
+    N = neighbor_map.shape[0]
     LOGN = int(math.log2(N))
     LOGM = int(math.log2(M))
 
@@ -208,10 +229,11 @@ def sparse_conv_bwd_input_implicit_gemm(
     grid = lambda META: (triton.cdiv(Ci, META['B2']) * triton.cdiv(N, META['B1']),)
 
     sparse_conv_implicit_gemm_kernel[grid](
-        grad_output, weight, None, bwd_neighbor_map, grad_input,
+        grad_output, weight, None, neighbor_map, grad_input,
         N, LOGM, LOGN, Co, Ci, V,
         allow_tf32=config.allow_tf32,
         TRANSPOSE_WEIGHT=True,
+        FLIP_WEIGHT=symmetric,
     )
     return grad_input
         

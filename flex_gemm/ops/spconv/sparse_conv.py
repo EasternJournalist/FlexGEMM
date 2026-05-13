@@ -1,680 +1,370 @@
-from typing import *
-import itertools
-from abc import abstractmethod
-
 import torch
 from torch import Tensor
-from torch.autograd import Function
-from .. import spconv
+from typing import *
+
 from ... import config
-from ..utils import make_conv_kernel_delta, init_hashmap, lookup_pytorch
 from ... import kernels
+from ..utils import make_conv_kernel_delta, init_hashmap, lookup_pytorch
+from .. import spconv
+from .neighbor_cache import SparseConvNeighborCache
+from .functions import _select_function
 
 
 __all__ = [
-    "sparse_submanifold_conv3d",
-    "sparse_submanifold_conv",
-    "sparse_submanifold_conv_any_offset",
+    'sparse_conv',
+    'sparse_conv_any',
 ]
 
 
-class SparseConvNeighborCache:
-    def build_fwd_neighbor_map(self):
-        raise NotImplementedError
-
-    def build_bwd_neighbor_map(self):
-        raise NotImplementedError
-
-    def __getitem__(self, key):
-        return getattr(self, key)
-    
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
-    
-    def __contains__(self, key):
-        return hasattr(self, key)
-
-    def _fwd_post_process_for_masked_implicit_gemm_1(self):
-        self['_fwd_gray_code'], self['_fwd_sorted_idx'] = \
-            kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_1(self.fwd_neighbor_mask)
-
-    def _fwd_post_process_for_masked_implicit_gemm_2(self):
-        self['_fwd_valid_signal_i'], self['_fwd_valid_signal_o'], self['_fwd_valid_signal_seg'] = \
-            kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_2(self.fwd_neighbor_map, self.fwd_neighbor_mask)
-            
-    def _fwd_post_process_for_masked_implicit_gemm_3(self, block_size: int):
-        self[f'_fwd_valid_kernel_{block_size}'], self[f'_fwd_valid_kernel_seg_{block_size}'] = \
-            kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_3(self['_fwd_gray_code'], self['_fwd_sorted_idx'], block_size)
-
-    @property
-    def fwd_neighbor_map(self) -> Tensor:
-        if '_fwd_neighbor_map' not in self:
-            self['_fwd_neighbor_map'] = self.build_fwd_neighbor_map()
-        return self['_fwd_neighbor_map']
-
-    @property
-    def fwd_neighbor_mask(self) -> Tensor:
-        if '_fwd_neighbor_mask' not in self:
-            self['_fwd_neighbor_mask'] = self.fwd_neighbor_map.view(dtype=torch.int32) != -1
-        return self['_fwd_neighbor_mask']
-
-    @property
-    def fwd_gray_code(self) -> Tensor:
-        if '_fwd_gray_code' not in self:
-            self._fwd_post_process_for_masked_implicit_gemm_1()
-        return self['_fwd_gray_code']
-
-    @property
-    def fwd_sorted_idx(self) -> Tensor:
-        if '_fwd_sorted_idx' not in self:
-            self._fwd_post_process_for_masked_implicit_gemm_1()
-        return self['_fwd_sorted_idx']
-
-    @property
-    def fwd_valid_signal_i(self) -> Tensor:
-        if '_fwd_valid_signal_i' not in self:
-            self._fwd_post_process_for_masked_implicit_gemm_2()
-        return self['_fwd_valid_signal_i']
-
-    @property
-    def fwd_valid_signal_o(self) -> Tensor:
-        if '_fwd_valid_signal_o' not in self:
-            self._fwd_post_process_for_masked_implicit_gemm_2()
-        return self['_fwd_valid_signal_o']
-
-    @property
-    def fwd_valid_signal_seg(self) -> Tensor:
-        if '_fwd_valid_signal_seg' not in self:
-            self._fwd_post_process_for_masked_implicit_gemm_2()
-        return self['_fwd_valid_signal_seg']
-
-    def fwd_valid_kernel_callback(self, block_size: int) -> Tensor:
-        if f'_fwd_valid_kernel_{block_size}' not in self or f'_fwd_valid_kernel_seg_{block_size}' not in self:
-            self._fwd_post_process_for_masked_implicit_gemm_3(block_size)
-        return self[f'_fwd_valid_kernel_{block_size}']
-    
-    def fwd_valid_kernel_seg_callback(self, block_size: int) -> Tensor:
-        if f'_fwd_valid_kernel_{block_size}' not in self or f'_fwd_valid_kernel_seg_{block_size}' not in self:
-            self._fwd_post_process_for_masked_implicit_gemm_3(block_size)
-        return self[f'_fwd_valid_kernel_seg_{block_size}']
-
-    def _bwd_post_process_for_masked_implicit_gemm_1(self):
-        self['_bwd_gray_code'], self['_bwd_sorted_idx'] = \
-            kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_1(self.bwd_neighbor_mask)
-
-    def _bwd_post_process_for_masked_implicit_gemm_2(self):
-        # V = self.bwd_neighbor_map.shape[1] 
-        # assert V <= 32, "Currently, the max kernel volume is 32 because kernel mask is encoded as uint32"
-        # TODO: Warning should be moved to algorithm dispatch.
-        self['_bwd_valid_signal_i'], self['_bwd_valid_signal_o'], self['_bwd_valid_signal_seg'] = \
-            kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_2(self.bwd_neighbor_map, self.bwd_neighbor_mask)
-            
-    def _bwd_post_process_for_masked_implicit_gemm_3(self, block_size: int):
-        self[f'_bwd_valid_kernel_{block_size}'], self[f'_bwd_valid_kernel_seg_{block_size}'] = \
-            kernels.triton.neighbor_map_post_process_for_masked_implicit_gemm_3(self.bwd_gray_code, self.bwd_sorted_idx, block_size)
-
-    @property
-    def bwd_neighbor_map(self) -> Tensor:
-        if '_bwd_neighbor_map' not in self:
-            self['_bwd_neighbor_map'] = self.build_bwd_neighbor_map()
-        return self['_bwd_neighbor_map']
-
-    @property
-    def bwd_neighbor_mask(self) -> Tensor:
-        if '_bwd_neighbor_mask' not in self:
-            self['_bwd_neighbor_mask'] = self.bwd_neighbor_map.view(dtype=torch.int32) != -1
-        return self['_bwd_neighbor_mask']
-
-    @property
-    def bwd_gray_code(self) -> Tensor:
-        if '_bwd_gray_code' not in self:
-            self._bwd_post_process_for_masked_implicit_gemm_1()
-        return self['_bwd_gray_code']
-
-    @property
-    def bwd_sorted_idx(self) -> Tensor:
-        if '_bwd_sorted_idx' not in self:
-            self._bwd_post_process_for_masked_implicit_gemm_1()
-        return self['_bwd_sorted_idx']
-
-    @property
-    def bwd_valid_signal_i(self) -> Tensor:
-        if '_bwd_valid_signal_i' not in self:
-            self._bwd_post_process_for_masked_implicit_gemm_2()
-        return self['_bwd_valid_signal_i']
-
-    @property
-    def bwd_valid_signal_o(self) -> Tensor:
-        if '_bwd_valid_signal_o' not in self:
-            self._bwd_post_process_for_masked_implicit_gemm_2()
-        return self['_bwd_valid_signal_o']
-
-    def bwd_valid_kernel_callback(self, block_size: int) -> Tensor:
-        if f'_bwd_valid_kernel_{block_size}' not in self or f'_bwd_valid_kernel_seg_{block_size}' not in self:
-            self._bwd_post_process_for_masked_implicit_gemm_3(block_size)
-        return self[f'_bwd_valid_kernel_{block_size}']
-    
-    def bwd_valid_kernel_seg_callback(self, block_size: int) -> Tensor:
-        if f'_bwd_valid_kernel_{block_size}' not in self or f'_bwd_valid_kernel_seg_{block_size}' not in self:
-            self._bwd_post_process_for_masked_implicit_gemm_3(block_size)
-        return self[f'_bwd_valid_kernel_seg_{block_size}']
-    
-
-
-class SymmetricSparseConvNeighborCache(SparseConvNeighborCache):
-    def build_bwd_neighbor_map(self):
-        return self.fwd_neighbor_map.flip(1)
-
-    # TODO: other methods can be implemented to avoid redundant computation, e.g., bwd_neighbor_mask, bwd_gray_code, etc.
-
-
-class SparseConvExplicitGemmFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        input: Tensor,
-        neighbor_cache: SparseConvNeighborCache,
-        weight: Tensor,
-        bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SparseConvNeighborCache]:
-        assert input.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
-
-        neighbor_map = neighbor_cache['neighbor_map']
-        N = input.shape[0]
-        im2col = input.index_select(0, neighbor_map.view(-1).view(dtype=torch.int32).clamp_min(0))\
-                        .masked_fill((neighbor_map == -1).view(-1, 1), 0).view(N, V * Ci)
-
-        weight_mat = weight.view(Co, V * Ci).transpose(0, 1)
-        if bias is not None:
-            output = torch.addmm(bias, im2col, weight_mat)
-        else:
-            output = torch.mm(im2col, weight_mat)
-
-        ctx.save_for_backward(input, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor, _):
-        input, weight, bias = ctx.saved_tensors
-        neighbor_cache = ctx.neighbor_cache
-        neighbor_map = neighbor_cache['neighbor_map']
-        N = input.shape[0]
-        Co, V, Ci = weight.shape
-
-        if input.requires_grad:
-            im2col = torch.zeros((N * V, Co), device=input.device, dtype=input.dtype)
-            inv_neighbor_map = torch.flip(neighbor_map, [1])
-            mask = inv_neighbor_map.view(-1) != -1
-            im2col[mask] = grad_output[inv_neighbor_map.view(-1).long()[mask]]
-            im2col = im2col.view(N, V * Co)
-            grad_input = torch.mm(im2col, weight.view(Co, V, Ci).transpose(0, 1).reshape(V * Co, Ci))
-        else:
-            grad_input = None
-
-        if weight.requires_grad:
-            im2col = torch.zeros((N * V, Ci), device=weight.device, dtype=weight.dtype)
-            mask = neighbor_map.view(-1) != -1
-            im2col[mask] = input[neighbor_map.view(-1).long()[mask]]
-            im2col = im2col.view(N, V * Ci)
-            grad_weight = torch.mm(im2col.t(), grad_output.view(N, -1)).view(V, Ci, Co).permute(2, 0, 1).contiguous()
-        else:
-            grad_weight = None
-
-        if bias is not None and bias.requires_grad:
-            grad_bias = grad_output.sum(dim=0)
-        else:
-            grad_bias = None
-
-        return grad_input, None, grad_weight, grad_bias
-
-
-class SparseConvImplicitGemmFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        input: Tensor,
-        neighbor_cache: SparseConvNeighborCache,
-        weight: Tensor,
-        bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SparseConvNeighborCache]:
-        assert input.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
-
-        output  = kernels.triton.sparse_conv_fwd_implicit_gemm(
-            input,
-            weight,
-            bias,
-            neighbor_cache.fwd_neighbor_map
-        )
-
-        ctx.save_for_backward(input, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor, _):
-        input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
-
-        grad_output = grad_output.contiguous()
-        if input.requires_grad:
-            grad_input = kernels.triton.sparse_conv_bwd_input_implicit_gemm(
-                grad_output,
-                weight,
-                neighbor_cache.bwd_neighbor_map
-            )
-        if weight.requires_grad:
-            grad_weight = kernels.triton.sparse_conv_bwd_weight_implicit_gemm(
-                grad_output, 
-                input, 
-                neighbor_cache.fwd_neighbor_map
-            )
-        if bias is not None and bias.requires_grad:
-            grad_bias = grad_output.sum(dim=0)
-        return grad_input, None, grad_weight, grad_bias
-
-
-class SparseConvImplicitGemmSplitKFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        feats: Tensor,
-        neighbor_cache: SparseConvNeighborCache,
-        weight: Tensor,
-        bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SparseConvNeighborCache]:
-        assert feats.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert feats.shape[-1] == Ci, f"Input channels ({feats.shape[-1]}) should match weight channels ({Ci})"
-
-        output = kernels.triton.sparse_conv_fwd_implicit_gemm_splitk(
-            feats,
-            weight,
-            bias,
-            neighbor_cache.fwd_neighbor_map
-        )
-
-        ctx.save_for_backward(feats, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: Tensor, _):
-        input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
-
-        grad_output = grad_output.contiguous()
-        if input.requires_grad:
-            grad_input = kernels.triton.sparse_conv_bwd_input_implicit_gemm_splitk(
-                grad_output,
-                weight,
-                neighbor_cache.bwd_neighbor_map
-            )
-        if weight.requires_grad:
-            grad_weight = kernels.triton.sparse_conv_bwd_weight_implicit_gemm_splitk(
-                grad_output,
-                input,
-                neighbor_cache.fwd_neighbor_map
-            )
-        if bias is not None and bias.requires_grad:
-            grad_bias = grad_output.sum(dim=0)
-        return grad_input, None, grad_weight, grad_bias
-
-
-class SparseConvMaskedImplicitGemmFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        input: torch.Tensor,
-        neighbor_cache: SparseConvNeighborCache,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, SparseConvNeighborCache]:
-        assert input.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
-
-        output = kernels.triton.sparse_conv_fwd_masked_implicit_gemm(
-            input,
-            weight,
-            bias,
-            neighbor_cache.fwd_neighbor_map,
-            neighbor_cache.fwd_sorted_idx,
-            neighbor_cache.fwd_valid_kernel_callback,
-            neighbor_cache.fwd_valid_kernel_seg_callback,
-        )
-
-        ctx.save_for_backward(input, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor, _):
-        input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
-
-        grad_output = grad_output.contiguous()
-        if input.requires_grad:
-            grad_input = kernels.triton.sparse_conv_bwd_input_masked_implicit_gemm(
-                grad_output,
-                weight,
-                neighbor_cache.bwd_neighbor_map,
-                neighbor_cache.bwd_sorted_idx,
-                neighbor_cache.bwd_valid_kernel_callback,
-                neighbor_cache.bwd_valid_kernel_seg_callback,
-            )
-        if weight.requires_grad:
-            grad_weight = kernels.triton.sparse_conv_bwd_weight_masked_implicit_gemm(
-                grad_output,
-                input,
-                neighbor_cache.fwd_valid_signal_i,
-                neighbor_cache.fwd_valid_signal_o,
-                neighbor_cache.fwd_valid_signal_seg,
-            )
-        if bias is not None and bias.requires_grad:
-            grad_bias = grad_output.sum(dim=0)
-        return grad_input, None, grad_weight, grad_bias
-
-
-class SparseConvMaskedImplicitGemmSplitKFunction(Function):
-    @staticmethod
-    def forward(
-        ctx,
-        input: torch.Tensor,
-        neighbor_cache: SparseConvNeighborCache,
-        weight: torch.Tensor,
-        bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, SparseConvNeighborCache]:
-        assert input.is_contiguous(), "Input features should be contiguous"
-        Co, V, Ci = weight.shape
-        assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
-
-        output = kernels.triton.sparse_conv_fwd_masked_implicit_gemm_splitk(
-            input,
-            weight,
-            bias,
-            neighbor_cache.fwd_neighbor_map,
-            neighbor_cache.fwd_sorted_idx,
-            neighbor_cache.fwd_valid_kernel_callback,
-            neighbor_cache.fwd_valid_kernel_seg_callback,
-        )
-
-        ctx.save_for_backward(input, weight, bias)
-        ctx.neighbor_cache = neighbor_cache
-        return output, neighbor_cache
-
-    @staticmethod
-    def backward(ctx, grad_output: torch.Tensor, _):
-        input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
-
-        grad_output = grad_output.contiguous()
-        if input.requires_grad:
-            grad_input = kernels.triton.sparse_conv_bwd_input_masked_implicit_gemm_splitk(
-                grad_output,
-                weight,
-                neighbor_cache.bwd_neighbor_map,
-                neighbor_cache.bwd_sorted_idx,
-                neighbor_cache.bwd_valid_kernel_callback,
-                neighbor_cache.bwd_valid_kernel_seg_callback,
-            )
-        if weight.requires_grad:
-            grad_weight = kernels.triton.sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
-                grad_output,
-                input,
-                neighbor_cache.fwd_valid_signal_i,
-                neighbor_cache.fwd_valid_signal_o,
-                neighbor_cache.fwd_valid_signal_seg,
-            )
-        if bias is not None and bias.requires_grad:
-            grad_bias = grad_output.sum(dim=0)
-        return grad_input, None, grad_weight, grad_bias
-
-
-class SparseSubMConvNeighborCache(SparseConvNeighborCache):
-    def __init__(
-        self,
-        coords: Tensor,
-        kernel: Tensor,
-    ) -> SparseConvNeighborCache:
-        coords = coords.contiguous()
-        kernel = kernel.contiguous()
-
-        if kernel.shape[1] < coords.shape[1]:
-            # add batch dims to neighbor offsets if not already included
-            batch_dims = coords.shape[1] - offsets.shape[1]
-            offsets = torch.cat([
-                torch.zeros((offsets.shape[0], batch_dims), dtype=offsets.dtype, device=offsets.device),
-                offsets
-            ], dim=1)
-
-        # Compute neighbor map
-        if config._USE_PYTORCH_FOR_TEST:
-            neighbor_coords = coords[:, None, :] + offsets[None, :, :]          # [N, V, 4]
-            neighbor_map = lookup_pytorch(coords, neighbor_coords).to(torch.int32)
-        else:
-            neighbor_map = kernels.triton.build_neighbor_map_from_offsets_triton(
-                coords,
-                offsets,
-            )
-            
-        return SparseConvNeighborCache(neighbor_map)
-
-
-class SparseSubMConvKernelSizeDilationNeighborCache(SparseConvNeighborCache):
-    def __init__(self, coords: Tensor, shape: Optional[torch.Size], kernel_size: tuple[int, ...], dilation: tuple[int, ...]):
-        self.coords = coords
-        self.shape = shape
-        self.kernel_size = kernel_size
-        self.dilation = dilation
-
-    def build_fwd_neighbor_map(self) -> SparseConvNeighborCache:
-        coords = self.coords
-        shape = self.shape
-        kernel_size = self.kernel_size
-        dilation = self.dilation
-
-        assert coords.is_contiguous(), "Coords should be contiguous"
-        assert len(kernel_size) == len(dilation), "Kernel size and dilation should have the same length"
-
-        # CUDA extension is specially optimized for 3D convolution with int32 coords.
-        use_cuda_extension = config.USE_CUDA_EXTENSION \
-            and coords.shape[1] == 4 \
-            and coords.dtype == torch.int32 \
-            and shape is not None \
-            and kernel_size == (3, 3, 3)
-
-        if config._USE_PYTORCH_FOR_TEST:
-            # Debug only
-            offsets = make_conv_kernel_delta(kernel_size, dilation, batch_dims=coords.shape[1] - len(kernel_size), dtype=torch.int32, device=coords.device)
-            neighbor_coords = coords[:, None, :] + offsets[None, :, :]          # [N, V, D]
-            neighbor_map = lookup_pytorch(coords, neighbor_coords).to(torch.int32)
-
-        elif use_cuda_extension:
-            # Use the CUDA extension if possible
-            N, C, W, H, D = shape
-            hashmap_keys, hashmap_vals = init_hashmap(shape, int(spconv.HASHMAP_RATIO * coords.shape[0]), coords.device)
-            neighbor_map = kernels.cuda.hashmap_build_submanifold_conv_neighbour_map_cuda(
-                hashmap_keys, hashmap_vals, coords,
-                W, H, D,
-                kernel_size[0], kernel_size[1], kernel_size[2],
-                dilation[0], dilation[1], dilation[2],
-            )
-
-        else:
-            # Triton kernels for neighbor map construction. 
-            neighbor_map = kernels.triton.build_neighbor_map_from_kernel_dilation_triton(
-                coords,
-                kernel_size=kernel_size,
-                dilation=dilation,
-            )
-                
-        return neighbor_map
-
-
-def _select_SparseConv_function(algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] | None = None) -> Type[Function]:
-    if algorithm is None:
-        # Default to the global config algorithm if not specified.
-        algorithm = spconv.ALGORITHM
-        
-    if algorithm == "explicit_gemm":
-        return SparseConvExplicitGemmFunction
-    if algorithm == "implicit_gemm":
-        return SparseConvImplicitGemmFunction
-    if algorithm == "implicit_gemm_splitk":
-        return SparseConvImplicitGemmSplitKFunction
-    if algorithm == "masked_implicit_gemm":
-        return SparseConvMaskedImplicitGemmFunction
-    if algorithm == "masked_implicit_gemm_splitk":
-        return SparseConvMaskedImplicitGemmSplitKFunction
-    raise ValueError(f"Invalid algorithm {algorithm}")
-
-
-def sparse_submanifold_conv(
-    feats: Tensor,
-    coords: Tensor,
-    shape: Optional[torch.Size],
-    weight: Tensor,
-    bias: Optional[Tensor] = None,
-    neighbor_cache: Optional[SparseConvNeighborCache] = None,
-    dilation: int | tuple[int, int, int] = 1,
-    algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] = None,
-) -> Tuple[Tensor, SparseConvNeighborCache]:
+def _compute_sparse_conv_output_shape(
+    input_shape: torch.Size,
+    kernel_size: tuple[int, ...],
+    stride: tuple[int, ...],
+    padding: tuple[int, ...],
+    dilation: tuple[int, ...],
+) -> torch.Size:
+    """Compute the output (N, C, *spatial) shape for a strided sparse convolution.
+
+    Uses the same formula as :func:`torch.nn.functional.conv*`:
+        ``Wo = (W + 2 * P - D * (K - 1) - 1) // S + 1``
     """
-    Sparse submanifold convolution.
-
-    Args:
-        feats (Tensor): [N, C] tensor of input features.
-        coords (Tensor): [N, B + D] tensor of input coordinates.
-            Each row represents a coordinate, where the first B dimensions are batch indices, and the last D dimensions are spatial coordinates.
-        shape (Optional[torch.Size]): shape of the input tensor in NCWHD order. Only required when using CUDA extension.
-        weight (Tensor): [Co, K1, ..., KD, Ci] tensor of weights.
-        bias (Optional[Tensor]): [Co] tensor of biases.
-        neighbor_cache (Optional[SparseConv3dNeighborCache]): neighbor cache for forward.
-            if None, will be computed in forward.
-        dilation (Tuple[int, int, int]): dilation rate.
-        algorithm (Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"]): algorithm to use for convolution.
-
-    Returns:
-        Tuple[Tensor, SparseConv3dNeighborCache]:
-            - output (Tensor): [N, Co] tensor of output features.
-            - neighbor_cache (SparseConv3dNeighborCache): neighbor cache for backward or future reuse of shared structures.
-    """
-    if isinstance(dilation, int):
-        dilation = (dilation,) * (weight.ndim - 2)
-    if neighbor_cache is None:
-        neighbor_cache = _compute_neighbor_cache_kernel_dilation(coords, shape, weight.shape[1:-1], dilation)
-    
-    SparseConvFunc = _select_SparseConv_function(algorithm)
-    output, neighbor_cache = SparseConvFunc.apply(feats, neighbor_cache, weight.flatten(1, -2), bias)
-    return output, neighbor_cache
+    N, C, *spatial = input_shape
+    out_spatial = tuple(
+        (w + 2 * p - d * (k - 1) - 1) // s + 1
+        for w, k, s, p, d in zip(spatial, kernel_size, stride, padding, dilation)
+    )
+    return torch.Size([N, C, *out_spatial])
 
 
-def sparse_submanifold_conv3d(
-    feats: Tensor,
+def _compute_sparse_conv_any_output_shape(
+    input_shape: torch.Size,
+    stride: tuple[int, ...],
+) -> torch.Size:
+    """Compute the output shape for ``sparse_conv_any_kernel`` as ``input_shape // stride``."""
+    N, C, *spatial = input_shape
+    out_spatial = tuple(w // s for w, s in zip(spatial, stride))
+    return torch.Size([N, C, *out_spatial])
+
+
+def _boundary_for_sparse_conv(
     coords: Tensor,
     shape: torch.Size,
-    weight: Tensor,
-    bias: Optional[Tensor] = None,
-    neighbor_cache: Optional[SparseConvNeighborCache] = None,
-    dilation: int | tuple[int, int, int] = (1, 1, 1),
-    algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] = None,
-) -> tuple[Tensor, SparseConvNeighborCache]:
+    output_shape: torch.Size,
+    D_spatial: int,
+) -> tuple[tuple[int, int], ...]:
+    """Build the per-dim ``[min, max)`` boundary used by Triton's output-coord builders.
+
+    Restricts the leftmost batch dim to ``[0, N)``, any additional batch dims to
+    ``[0, 1)``, and each spatial dim ``d`` to ``[0, output_shape[2 + d])``.
     """
-    Sparse submanifold convolution for 3D input.
-
-    Args:
-        feats (Tensor): [N, C] tensor of input features.
-        coords (Tensor): [N, 4] tensor of input coordinates.
-        shape (torch.Size): shape of the input tensor in NCWHD order.
-        weight (Tensor): [Co, Kw, Kh, Kd, Ci] tensor of weights.
-        bias (Optional[Tensor]): [Co] tensor of biases.
-        neighbor_cache (Optional[SparseConv3dNeighborCache]): neighbor cache for forward.
-            if None, will be computed in forward.
-        dilation (Tuple[int, int, int]): dilation rate.
-        algorithm (Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"]): algorithm to use for convolution.
-
-    Returns:
-        Tuple[Tensor, SparseConv3dNeighborCache]:
-            - output (Tensor): [N, Co] tensor of output features.
-            - neighbor_cache (SparseConv3dNeighborCache): neighbor cache for backward or future reuse of shared structures.
-    """
-    assert coords.shape[1] == 4, "Coords should have 4 dimensions (batch + 3 spatial dims)"
-    assert weight.ndim == 5, "Weight should have 5 dimensions (Co, Kw, Kh, Kd, Ci)"
-
-    return sparse_submanifold_conv(
-        feats=feats,
-        coords=coords,
-        shape=shape,
-        weight=weight,
-        bias=bias,
-        neighbor_cache=neighbor_cache,
-        dilation=dilation,
-        algorithm=algorithm
-    )
+    batch_dims = coords.shape[1] - D_spatial
+    spatial_out = tuple(output_shape[2:])
+    batch_bounds: list[tuple[int, int]] = []
+    for i in range(batch_dims):
+        batch_bounds.append((0, shape[0]) if i == 0 else (0, 1))
+    return tuple(batch_bounds) + tuple((0, w) for w in spatial_out)
 
 
-def sparse_submanifold_conv_any_offset(
-    feats: Tensor,
+def _build_sparse_conv_neighbor_map_cuda(
     coords: Tensor,
-    offsets: Tensor,
-    weight: Tensor,
-    bias: Optional[Tensor] = None,
-    neighbor_cache: Optional[SparseConvNeighborCache] = None,
-    algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] = None,
-) -> Tuple[Tensor, SparseConvNeighborCache]:
+    shape: torch.Size,
+    output_coords: Tensor | None,
+    kernel_size: tuple[int, ...],
+    stride: tuple[int, ...],
+    padding: tuple[int, ...],
+    dilation: tuple[int, ...],
+    need_bwd: bool,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """CUDA-extension neighbor-map construction for the dense-kernel formulation.
+
+    Returns ``(fwd_neighbor_map, bwd_neighbor_map_or_None, output_coords)``. If
+    ``output_coords`` was not provided, it is built here using ``spconv.OUT_COORD_ALGO``.
     """
-    Sparse submanifold convolution function with general kernel offsets.
+    N, C, W, H, Dd = shape
+    if output_coords is None:
+        if spconv.OUT_COORD_ALGO == 0:  # HASHMAP
+            output_coords = kernels.cuda.hashmap_build_sparse_conv_out_coords(
+                coords, spconv.OUT_COORD_HASHMAP_RATIO, spconv.SERIALIZATION_MODE,
+                N, W, H, Dd,
+                kernel_size[0], kernel_size[1], kernel_size[2],
+                stride[0], stride[1], stride[2],
+                padding[0], padding[1], padding[2],
+                dilation[0], dilation[1], dilation[2],
+            )
+        else:  # EXPAND_UNIQUE
+            output_coords = kernels.cuda.expand_unique_build_sparse_conv_out_coords(
+                coords, spconv.SERIALIZATION_MODE,
+                N, W, H, Dd,
+                kernel_size[0], kernel_size[1], kernel_size[2],
+                stride[0], stride[1], stride[2],
+                padding[0], padding[1], padding[2],
+                dilation[0], dilation[1], dilation[2],
+            )
+    fwd_nm, bwd_nm = kernels.cuda.hashmap_build_sparse_conv_neighbour_map(
+        coords, output_coords, spconv.HASHMAP_RATIO, need_bwd,
+        N, W, H, Dd,
+        kernel_size[0], kernel_size[1], kernel_size[2],
+        stride[0], stride[1], stride[2],
+        padding[0], padding[1], padding[2],
+        dilation[0], dilation[1], dilation[2],
+    )
+    # CUDA path returns uint32 with 0xffffffff as null; bit-identical to int32 -1.
+    fwd_nm = fwd_nm.view(dtype=torch.int32)
+    if need_bwd and bwd_nm is not None and bwd_nm.numel() > 0:
+        bwd_nm = bwd_nm.view(dtype=torch.int32)
+    else:
+        bwd_nm = None
+    return fwd_nm, bwd_nm, output_coords
 
-    Args:
-        feats (Tensor): [N, C] tensor of input features.
-        coords (Tensor): [N, B + D] tensor of input coordinates.
-            Each row represents a coordinate, where the first B dimensions are batch indices, and the last D dimensions are spatial coordinates.
-        offsets (Tensor): [V, D] tensor of kernel offsets.
-            V is the kernel volume, and D is the spatial dimension.
-        weight (Tensor): [Co, V, Ci] tensor of weights.
-        bias (Optional[Tensor]): [Co] tensor of biases.
-        neighbor_cache (Optional[SparseConvNeighborCache]): neighbor cache for forward.
-            if None, will be computed in forward.
-        algorithm (Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"]): algorithm to use for convolution.
 
-    Returns:
-        Tuple[Tensor, SparseConvNeighborCache]:
-            - output (Tensor): [N, Co] tensor of output features.
-            - neighbor_cache (SparseConvNeighborCache): neighbor cache for backward or future reuse of shared structures.
+def _build_sparse_conv_neighbor_map_triton(
+    coords: Tensor,
+    shape: torch.Size,
+    output_coords: Tensor | None,
+    output_shape: torch.Size,
+    kernel_size: tuple[int, ...],
+    stride: tuple[int, ...],
+    padding: tuple[int, ...],
+    dilation: tuple[int, ...],
+    D_spatial: int,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Triton neighbor-map construction for the dense-kernel formulation.
+
+    Returns ``(fwd_neighbor_map, bwd_neighbor_map_or_None, output_coords)``. When
+    ``output_coords`` is generated here, the underlying Triton routine yields the
+    bwd map for free, so it is returned as well; otherwise only the fwd map is
+    built (the cache will derive the bwd map on demand).
     """
-    # A current limitation: the gemm backward relies on the symmetry of neighbors.
-    assert torch.equal(offsets, (-offsets).flip(0)), "Offsets must be symmetric."
+    # Convert dense-conv (kernel_size, padding, dilation) to the centered-kernel
+    # representation expected by the Triton API.
+    # Standard: coord_out * stride - padding + k * dilation = coord_in,  k in [0, K).
+    # Triton:   coord_out * stride + offset + delta = coord_in, delta centered around 0.
+    # ⇒ offset_d = ((K - 1) // 2) * dilation - padding.
+    offset = tuple(
+        ((k - 1) // 2) * d - p
+        for k, d, p in zip(kernel_size, dilation, padding)
+    )
+    if output_coords is None:
+        boundary = _boundary_for_sparse_conv(coords, shape, output_shape, D_spatial)
+        output_coords, fwd_nm, bwd_nm = kernels.triton.get_conv_output_coords_kernel_size_dilation_triton(
+            coords,
+            kernel_size=kernel_size,
+            stride=stride,
+            dilation=dilation,
+            offset=offset,
+            boundary=boundary,
+        )
+        return fwd_nm, bwd_nm, output_coords
 
-    if neighbor_cache is None:
-        neighbor_cache = _compute_neighbor_cache_any_offset(coords, offsets)
-    
-    SparseConvFunc = _select_SparseConv_function(algorithm)
-    output, neighbor_cache = SparseConvFunc.apply(feats, neighbor_cache, weight, bias)
-    return output, neighbor_cache
+    fwd_nm = kernels.triton.build_neighbor_map_from_kernel_size_dilation_triton(
+        coords, output_coords,
+        kernel_size=kernel_size,
+        stride=stride,
+        dilation=dilation,
+        offset=offset,
+    )
+    return fwd_nm, None, output_coords
 
+
+def _build_sparse_conv_any_neighbor_map_triton(
+    coords: Tensor,
+    shape: torch.Size,
+    output_coords: Tensor | None,
+    output_shape: torch.Size,
+    kernel_delta: Tensor,
+    stride: tuple[int, ...],
+    offset: tuple[int, ...],
+    D_spatial: int,
+) -> tuple[Tensor, Tensor | None, Tensor]:
+    """Triton neighbor-map construction for the arbitrary-``kernel_delta`` formulation.
+
+    Returns ``(fwd_neighbor_map, bwd_neighbor_map_or_None, output_coords)``.
+    """
+    if output_coords is None:
+        boundary = _boundary_for_sparse_conv(coords, shape, output_shape, D_spatial)
+        output_coords, fwd_nm, bwd_nm = kernels.triton.get_conv_output_coords_kernel_delta_triton(
+            coords, kernel_delta,
+            stride=stride, offset=offset, boundary=boundary,
+        )
+        return fwd_nm, bwd_nm, output_coords
+
+    fwd_nm = kernels.triton.build_neighbor_map_from_kernel_delta_triton(
+        coords, output_coords, kernel_delta,
+        stride=stride, offset=offset,
+    )
+    return fwd_nm, None, output_coords
 
 
 def sparse_conv(
     feats: Tensor,
     coords: Tensor,
     shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None,
     kernel_size: tuple[int, ...],
-    stride: tuple[int, ...],
-    dilation: tuple[int, ...],
-    padding: tuple[int, ...],
-):
-    ...
+    stride: tuple[int, ...] | None = None,
+    dilation: tuple[int, ...] | None = None,
+    padding: tuple[int, ...] | None = None,
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: Optional[SparseConvNeighborCache] = None,
+    algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] = None,
+) -> Tuple[Tensor, Tensor, torch.Size, SparseConvNeighborCache]:
+    """Strided / general sparse convolution.
+
+    Computes ``output[coord_out] = sum_v input[coord_out * stride - padding + dilation * v] * weight[v]``
+    where ``v`` ranges over the dense kernel volume defined by ``kernel_size``.
+
+    Args:
+        feats (Tensor): [M, Ci] input features.
+        coords (Tensor): [M, B + Ds] input coordinates (batch dims followed by spatial dims).
+        shape (torch.Size): input dense shape (*batch_dims, C, S1, ..., SDs)
+        weight (Tensor): [Co, K1, ..., KDs, Ci] convolution weights.
+        bias (Optional[Tensor]): [Co] bias.
+        kernel_size: tuple of length Ds.
+        stride / dilation / padding: tuples of length Ds. Default to all-1 / all-1 / all-0.
+        output_coords (Optional[Tensor]): if provided, used directly; otherwise generated.
+        output_shape (Optional[torch.Size]): if not provided, computed from
+            ``kernel_size``, ``stride``, ``padding`` and ``dilation`` using the dense-conv formula.
+        neighbor_cache: if provided, ``output_coords`` must also be provided and consistent.
+        algorithm: index-GEMM algorithm variant.
+
+    Returns:
+        (output_feats, output_coords, output_shape, neighbor_cache).
+    """
+    assert coords.is_contiguous(), "Coords should be contiguous"
+    D_spatial = len(kernel_size)
+    stride   = tuple(stride)   if stride   is not None else (1,) * D_spatial
+    dilation = tuple(dilation) if dilation is not None else (1,) * D_spatial
+    padding  = tuple(padding)  if padding  is not None else (0,) * D_spatial
+    assert len(stride) == D_spatial and len(dilation) == D_spatial and len(padding) == D_spatial, (
+        "kernel_size / stride / dilation / padding must all have the same length."
+    )
+
+    # Step 1: output shape
+    if output_shape is None:
+        output_shape = _compute_sparse_conv_output_shape(shape, kernel_size, stride, padding, dilation)
+
+    # Steps 2 + 3: output coords and neighbor map.
+    # Output coords of strided sparse conv differ from input coords, so the
+    # symmetric-kernel shortcut from submanifold_conv does not apply: the backward
+    # neighbor map is always genuinely needed (and only computed lazily by the
+    # cache when not provided up-front).
+    if neighbor_cache is None:
+        # CUDA extension only supports the original 3D-spatial / int32 / 4-col-coords case.
+        use_cuda_extension = (
+            config.USE_CUDA_EXTENSION
+            and not config._USE_PYTORCH_FOR_TEST
+            and coords.is_cuda
+            and coords.shape[1] == 4
+            and coords.dtype == torch.int32
+            and D_spatial == 3
+            and len(shape) == 5
+        )
+
+        if use_cuda_extension:
+            # CUDA path doesn't return the bwd map for free, so only request it
+            # if no externally supplied output_coords (i.e., we'd otherwise have
+            # no bwd map at all; cache will compute on demand via transpose).
+            fwd_nm, bwd_nm, output_coords = _build_sparse_conv_neighbor_map_cuda(
+                coords, shape, output_coords,
+                kernel_size, stride, padding, dilation,
+                need_bwd=False,
+            )
+        else:
+            fwd_nm, bwd_nm, output_coords = _build_sparse_conv_neighbor_map_triton(
+                coords, shape, output_coords, output_shape,
+                kernel_size, stride, padding, dilation,
+                D_spatial,
+            )
+
+        neighbor_cache = SparseConvNeighborCache(
+            fwd_neighbor_map=fwd_nm, bwd_neighbor_map=bwd_nm,
+            num_input_coords=coords.shape[0],
+            num_output_coords=output_coords.shape[0],
+        )
+    else:
+        assert output_coords is not None, (
+            "When passing a precomputed neighbor_cache, output_coords must also be provided."
+        )
+
+    # Step 4: dispatch to the chosen index-GEMM Function.
+    SparseConvFunc = _select_function(algorithm)
+    output_feats, neighbor_cache = SparseConvFunc.apply(
+        feats, neighbor_cache, weight.flatten(1, -2), bias,
+    )
+    return output_feats, output_coords, output_shape, neighbor_cache
 
 
-def submanifold_conv(
+def sparse_conv_any(
     feats: Tensor,
     coords: Tensor,
-    kernel_size: tuple[int, ...],
-    dilation: tuple[int, ...],
-):
-    ...
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None,
+    kernel_delta: Tensor,
+    stride: tuple[int, ...] | None = None,
+    offset: tuple[int, ...] | None = None,
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: Optional[SparseConvNeighborCache] = None,
+    algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] = None,
+) -> Tuple[Tensor, Tensor, torch.Size, SparseConvNeighborCache]:
+    """Strided / general sparse convolution with arbitrary kernel offsets.
+
+    Computes ``output[coord_out] = sum_v input[coord_out * stride + offset + kernel_delta[v]] * weight[v]``.
+
+    Args:
+        feats (Tensor): [M, Ci] input features.
+        coords (Tensor): [M, B + Ds] input coordinates.
+        shape (torch.Size): input dense shape (*batch_dims, C, S1, ..., SDs)
+        weight (Tensor): [Co, V, Ci] convolution weights.
+        bias (Optional[Tensor]): [Co] bias.
+        kernel_delta (Tensor): [V, Ds] kernel offsets.
+        stride / offset: tuples of length Ds. Default to all-1 / all-0.
+        output_coords (Optional[Tensor]): if provided, used directly; otherwise generated.
+        output_shape (Optional[torch.Size]): if not provided, computed as ``input_shape // stride``.
+        neighbor_cache: if provided, ``output_coords`` must also be provided and consistent.
+        algorithm: index-GEMM algorithm variant.
+
+    Returns:
+        (output_feats, output_coords, output_shape, neighbor_cache).
+
+    Notes:
+        The CUDA extension only supports the dense ``kernel_size``-based formulation,
+        so this function always uses the Triton backend. Symmetric-kernel detection
+        is intentionally omitted: input and output coordinate sets differ for a
+        strided sparse conv, so the symmetric-kernel shortcut cannot apply.
+    """
+    assert coords.is_contiguous(), "Coords should be contiguous"
+    D_spatial = kernel_delta.shape[1]
+    stride = tuple(stride) if stride is not None else (1,) * D_spatial
+    offset = tuple(offset) if offset is not None else (0,) * D_spatial
+    assert len(stride) == D_spatial and len(offset) == D_spatial, (
+        "stride / offset must match kernel_delta's spatial dimensionality."
+    )
+
+    # Step 1: output shape
+    if output_shape is None:
+        output_shape = _compute_sparse_conv_any_output_shape(shape, stride)
+
+    # Step 2 + 3: output coords + neighbor map (Triton only).
+    if neighbor_cache is None:
+        fwd_nm, bwd_nm, output_coords = _build_sparse_conv_any_neighbor_map_triton(
+            coords, shape, output_coords, output_shape,
+            kernel_delta, stride, offset, D_spatial,
+        )
+        neighbor_cache = SparseConvNeighborCache(
+            fwd_neighbor_map=fwd_nm, bwd_neighbor_map=bwd_nm,
+            num_input_coords=coords.shape[0],
+            num_output_coords=output_coords.shape[0],
+        )
+    else:
+        assert output_coords is not None, (
+            "When passing a precomputed neighbor_cache, output_coords must also be provided."
+        )
+
+    # Step 4
+    SparseConvFunc = _select_function(algorithm)
+    output_feats, neighbor_cache = SparseConvFunc.apply(feats, neighbor_cache, weight, bias)
+    return output_feats, output_coords, output_shape, neighbor_cache

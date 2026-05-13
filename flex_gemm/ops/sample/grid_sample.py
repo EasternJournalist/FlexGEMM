@@ -168,7 +168,7 @@ class GridSample3dTrilinearFunction(Function):
         return grad_feats, None, None, None
 
 
-def grid_sample_3d(
+def sparse_grid_sample_3d(
     feats: torch.Tensor,
     coords: torch.Tensor,
     shape: torch.Size,

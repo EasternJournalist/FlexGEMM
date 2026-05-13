@@ -38,6 +38,7 @@ def sparse_conv_masked_implicit_gemm_kernel(
     valid_kernel_seg,
     # Specialize
     TRANSPOSE_WEIGHT: tl.constexpr = False,  # Whether to transpose the weight matrix
+    FLIP_WEIGHT: tl.constexpr = False,  # Whether to flip the weight matrix along V dimension
 ):
     """
     Indice convolution forward kernel using masked implicit GEMM.
@@ -76,10 +77,11 @@ def sparse_conv_masked_implicit_gemm_kernel(
         bk = k % num_k
         v = tl.load(valid_kernel + valid_kernel_start + v)
         # Calculate pointers to weight matrix.
+        weight_v = V - 1 - v if FLIP_WEIGHT else v
         if not TRANSPOSE_WEIGHT:
-            weight_ptr = weight + (offset_co[None, :] * V * Ci) + (v * Ci) + (bk * BK + offset_k[:, None])      # (BK, B2)
+            weight_ptr = weight + (offset_co[None, :] * V * Ci) + (weight_v * Ci) + (bk * BK + offset_k[:, None])      # (BK, B2)
         else:
-            weight_ptr = weight + (offset_co[None, :]) + (v * Co) + ((bk * BK + offset_k[:, None]) * V * Co)    # (BK, B2)
+            weight_ptr = weight + (offset_co[None, :]) + (weight_v * Co) + ((bk * BK + offset_k[:, None]) * V * Co)    # (BK, B2)
         # Calculate pointers to input matrix.
         neighbor_offset = tl.load(neighbor + offset_sorted_m * V + v)                             # (B1,)
         input_ptr = input + bk * BK + (neighbor_offset[:, None].to(tl.int64) * Ci + offset_k[None, :])         # (B1, BK)
@@ -218,32 +220,66 @@ def sparse_conv_fwd_masked_implicit_gemm(
 def sparse_conv_bwd_input_masked_implicit_gemm(
     grad_output: torch.Tensor,
     weight: torch.Tensor,
-    bwd_neighbor_map: torch.Tensor,
-    bwd_sorted_idx: Optional[torch.Tensor],
-    bwd_valid_kernel: Callable[[int], torch.Tensor],
-    bwd_valid_kernel_seg: Callable[[int], torch.Tensor],
+    *,
+    symmetric: bool,
+    fwd_neighbor_map: Optional[torch.Tensor] = None,
+    fwd_sorted_idx: Optional[torch.Tensor] = None,
+    fwd_valid_kernel: Optional[Callable[[int], torch.Tensor]] = None,
+    fwd_valid_kernel_seg: Optional[Callable[[int], torch.Tensor]] = None,
+    bwd_neighbor_map: Optional[torch.Tensor] = None,
+    bwd_sorted_idx: Optional[torch.Tensor] = None,
+    bwd_valid_kernel: Optional[Callable[[int], torch.Tensor]] = None,
+    bwd_valid_kernel_seg: Optional[Callable[[int], torch.Tensor]] = None,
 ) -> torch.Tensor:
+    """
+    Backward to input for sparse convolution using masked implicit GEMM.
+
+    Cache arguments are keyword-only. When ``symmetric=True``, pass the
+    ``fwd_*`` cache; the weight matrix is internally flipped along the V dimension
+    so the forward cache is reused. Otherwise, pass the ``bwd_*`` cache.
+    """
+    if symmetric:
+        assert fwd_neighbor_map is not None, "symmetric=True requires fwd_neighbor_map"
+        assert bwd_neighbor_map is None and bwd_sorted_idx is None \
+            and bwd_valid_kernel is None and bwd_valid_kernel_seg is None, \
+            "symmetric=True forbids passing bwd_* cache arguments"
+        neighbor_map = fwd_neighbor_map
+        sorted_idx = fwd_sorted_idx
+        valid_kernel_cb = fwd_valid_kernel
+        valid_kernel_seg_cb = fwd_valid_kernel_seg
+    else:
+        assert bwd_neighbor_map is not None, "symmetric=False requires bwd_neighbor_map"
+        assert fwd_neighbor_map is None and fwd_sorted_idx is None \
+            and fwd_valid_kernel is None and fwd_valid_kernel_seg is None, \
+            "symmetric=False forbids passing fwd_* cache arguments"
+        neighbor_map = bwd_neighbor_map
+        sorted_idx = bwd_sorted_idx
+        valid_kernel_cb = bwd_valid_kernel
+        valid_kernel_seg_cb = bwd_valid_kernel_seg
+
     Co, V, Ci = weight.shape
     M = grad_output.shape[0]
-    N = bwd_neighbor_map.shape[0]
+    N = neighbor_map.shape[0]
 
     grad_input = torch.empty((N, Ci), device=grad_output.device, dtype=grad_output.dtype)
     grid = lambda META: (triton.cdiv(Ci, META['B2']) * triton.cdiv(N, META['B1']),)
-    if bwd_sorted_idx is None:
+    if sorted_idx is None:
         sparse_conv_implicit_gemm_kernel[grid](
-            grad_output, weight, None, bwd_neighbor_map, grad_input,
+            grad_output, weight, None, neighbor_map, grad_input,
             N, int(math.log2(M)), int(math.log2(N)), Co, Ci, V,
             allow_tf32=config.allow_tf32,
             TRANSPOSE_WEIGHT=True,
+            FLIP_WEIGHT=symmetric,
         )
     else:
         sparse_conv_masked_implicit_gemm_kernel[grid](
-            grad_output, weight, None, bwd_neighbor_map, bwd_sorted_idx, grad_input,
+            grad_output, weight, None, neighbor_map, sorted_idx, grad_input,
             N, int(math.log2(M)), int(math.log2(N)), Co, Ci, V,
-            valid_kernel=bwd_valid_kernel,
-            valid_kernel_seg=bwd_valid_kernel_seg,
+            valid_kernel=valid_kernel_cb,
+            valid_kernel_seg=valid_kernel_seg_cb,
             allow_tf32=config.allow_tf32,
             TRANSPOSE_WEIGHT=True,
+            FLIP_WEIGHT=symmetric,
         )
     return grad_input
 

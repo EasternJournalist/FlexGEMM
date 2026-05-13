@@ -44,6 +44,7 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk_kernel(
     valid_kernel_seg,
     # Specialize
     TRANSPOSE_WEIGHT: tl.constexpr = False,  # Whether to transpose the weight matrix
+    FLIP_WEIGHT: tl.constexpr = False,  # Whether to flip the weight matrix along V dimension
 ):
     """
     Indice convolution forward kernel using masked implicit GEMM split-k.
@@ -85,10 +86,11 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk_kernel(
         bk = k % num_k
         v = tl.load(valid_kernel + valid_kernel_start + v)
         # Calculate pointers to weight matrix.
+        weight_v = V - 1 - v if FLIP_WEIGHT else v
         if not TRANSPOSE_WEIGHT:
-            weight_ptr = weight + (offset_co[None, :] * V * Ci) + (v * Ci) + (bk * BK + offset_k[:, None])      # (BK, B2)
+            weight_ptr = weight + (offset_co[None, :] * V * Ci) + (weight_v * Ci) + (bk * BK + offset_k[:, None])      # (BK, B2)
         else:
-            weight_ptr = weight + (offset_co[None, :]) + (v * Co) + ((bk * BK + offset_k[:, None]) * V * Co)    # (BK, B2)
+            weight_ptr = weight + (offset_co[None, :]) + (weight_v * Co) + ((bk * BK + offset_k[:, None]) * V * Co)    # (BK, B2)
         # Calculate pointers to input matrix.
         neighbor_offset = tl.load(neighbor + offset_sorted_m * V + v)                             # (B1,)
         input_ptr = input + bk * BK + (neighbor_offset[:, None].to(tl.int64) * Ci + offset_k[None, :])         # (B1, BK)
@@ -231,6 +233,7 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk(
     fwd_valid_kernel_seg: Callable[[int], torch.Tensor],
     SPLITK: int = 1,
     TRANSPOSE_WEIGHT: bool = False,
+    FLIP_WEIGHT: bool = False,
 ) -> torch.Tensor:
     assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
     assert input.is_contiguous(), "Matrix input must be contiguous"
@@ -250,6 +253,7 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk(
             valid_kernel_seg=fwd_valid_kernel_seg,
             allow_tf32=config.allow_tf32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
+            FLIP_WEIGHT=FLIP_WEIGHT,
         )
         return output
     else:
@@ -263,6 +267,7 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk(
             SPLITK=SPLITK,
             allow_tf32=config.allow_tf32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
+            FLIP_WEIGHT=FLIP_WEIGHT,
         )
         return output.sum(dim=0).to(input.dtype)
     
@@ -336,20 +341,50 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
 def sparse_conv_bwd_input_masked_implicit_gemm_splitk(
     grad_output: torch.Tensor,
     weight: torch.Tensor,
-    bwd_neighbor_map: torch.Tensor,
-    bwd_sorted_idx: Optional[torch.Tensor],
-    bwd_valid_kernel: Callable[[int], torch.Tensor],
-    bwd_valid_kernel_seg: Callable[[int], torch.Tensor],
+    *,
+    symmetric: bool,
+    fwd_neighbor_map: Optional[torch.Tensor] = None,
+    fwd_sorted_idx: Optional[torch.Tensor] = None,
+    fwd_valid_kernel: Optional[Callable[[int], torch.Tensor]] = None,
+    fwd_valid_kernel_seg: Optional[Callable[[int], torch.Tensor]] = None,
+    bwd_neighbor_map: Optional[torch.Tensor] = None,
+    bwd_sorted_idx: Optional[torch.Tensor] = None,
+    bwd_valid_kernel: Optional[Callable[[int], torch.Tensor]] = None,
+    bwd_valid_kernel_seg: Optional[Callable[[int], torch.Tensor]] = None,
 ) -> torch.Tensor:
-    if bwd_sorted_idx is None:
+    """
+    Backward to input for sparse convolution using split-K masked implicit GEMM.
+    See :func:`sparse_conv_bwd_input_masked_implicit_gemm` for the cache contract.
+    """
+    if symmetric:
+        assert fwd_neighbor_map is not None, "symmetric=True requires fwd_neighbor_map"
+        assert bwd_neighbor_map is None and bwd_sorted_idx is None \
+            and bwd_valid_kernel is None and bwd_valid_kernel_seg is None, \
+            "symmetric=True forbids passing bwd_* cache arguments"
+        neighbor_map = fwd_neighbor_map
+        sorted_idx = fwd_sorted_idx
+        valid_kernel_cb = fwd_valid_kernel
+        valid_kernel_seg_cb = fwd_valid_kernel_seg
+    else:
+        assert bwd_neighbor_map is not None, "symmetric=False requires bwd_neighbor_map"
+        assert fwd_neighbor_map is None and fwd_sorted_idx is None \
+            and fwd_valid_kernel is None and fwd_valid_kernel_seg is None, \
+            "symmetric=False forbids passing fwd_* cache arguments"
+        neighbor_map = bwd_neighbor_map
+        sorted_idx = bwd_sorted_idx
+        valid_kernel_cb = bwd_valid_kernel
+        valid_kernel_seg_cb = bwd_valid_kernel_seg
+    if sorted_idx is None:
         grad_input = sparse_conv_fwd_implicit_gemm_splitk(
-            grad_output, weight, None, bwd_neighbor_map,
-            TRANSPOSE_WEIGHT=True
+            grad_output, weight, None, neighbor_map,
+            TRANSPOSE_WEIGHT=True,
+            FLIP_WEIGHT=symmetric,
         )
     else:
         grad_input = sparse_conv_fwd_masked_implicit_gemm_splitk(
-            grad_output, weight, None, bwd_neighbor_map, bwd_sorted_idx,
-            bwd_valid_kernel, bwd_valid_kernel_seg,
-            TRANSPOSE_WEIGHT=True
+            grad_output, weight, None, neighbor_map, sorted_idx,
+            valid_kernel_cb, valid_kernel_seg_cb,
+            TRANSPOSE_WEIGHT=True,
+            FLIP_WEIGHT=symmetric,
         )
     return grad_input

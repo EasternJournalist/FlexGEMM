@@ -6,13 +6,13 @@ if config.USE_AUTOTUNE_CACHE:
 
 from . import kernels
 from . import ops
+from . import nn
 
 # Top-level imports for convenience
-from .ops.spconv import (
-    sparse_submanifold_conv,
-    sparse_submanifold_conv3d,
-    sparse_submanifold_conv_any_offset,
-)
-from .ops.grid_sample import (
-    grid_sample_3d,
+from .ops import (
+    submanifold_conv,
+    submanifold_conv_any,
+    sparse_conv,
+    sparse_conv_any,
+    sparse_grid_sample_3d
 )
