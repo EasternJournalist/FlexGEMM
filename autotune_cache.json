@@ -11055,8 +11055,8 @@
         "flex_gemm.triton.gemm.gemm_nn_splitk_lock.gemm_nn_splitk_lock_kernel": {}
     },
     "NVIDIA A100 80GB PCIe": {
-        "flex_gemm.kernels.triton.grid_sample.indice_weighed_sum_bwd.indice_weighed_sum_bwd_input_kernel": {},
-        "flex_gemm.kernels.triton.grid_sample.indice_weighed_sum_fwd.indice_weighed_sum_fwd_kernel": {},
+        "flex_gemm.kernels.triton.grid_sample.index_weighted_sum_bwd.index_weighted_sum_bwd_input_kernel": {},
+        "flex_gemm.kernels.triton.grid_sample.index_weighted_sum_fwd.index_weighted_sum_fwd_kernel": {},
         "flex_gemm.kernels.triton.spconv.indice_conv_fwd_implicit_gemm.indice_conv_fwd_implicit_gemm_kernel": {},
         "flex_gemm.kernels.triton.spconv.indice_conv_fwd_implicit_gemm_splitk.indice_conv_fwd_implicit_gemm_kernel": {},
         "flex_gemm.kernels.triton.spconv.indice_conv_fwd_implicit_gemm_splitk.indice_conv_fwd_implicit_gemm_splitk_kernel": {},

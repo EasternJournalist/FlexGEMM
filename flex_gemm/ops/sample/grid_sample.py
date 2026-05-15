@@ -53,7 +53,7 @@ class GridSample3dNearestFunction(Function):
         else:
             if grid.dtype.is_floating_point:
                 grid_int = grid.round()
-            indices = kernels.triton.hashmap_build_lookup_triton(
+            indices = kernels.triton.hashmap_build_lookup(
                 coords.int(),
                 grid_int.int().flatten(0, -2),
             ).reshape(grid.shape[:-1])
@@ -133,7 +133,7 @@ class GridSample3dTrilinearFunction(Function):
             # TODO: Implement trilinear interpolation for the Triton backend
             raise NotImplementedError("Trilinear interpolation is not yet implemented for the Triton backend")
             
-        out = kernels.triton.indice_weighed_sum_fwd(
+        out = kernels.triton.index_weighted_sum_fwd(
             feats,
             indices.view(-1, 8),
             weight.view(-1, 8),
@@ -158,7 +158,7 @@ class GridSample3dTrilinearFunction(Function):
             dtype=grad_output.dtype
         )
 
-        grad_feats = kernels.triton.indice_weighed_sum_bwd_input(
+        grad_feats = kernels.triton.index_weighted_sum_bwd_input(
             grad_output.reshape(-1, ctx.C).contiguous(),
             indices.view(-1, 8),
             weight.view(-1, 8),

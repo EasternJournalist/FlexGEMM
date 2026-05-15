@@ -8,7 +8,7 @@ import triton
 import triton.language as tl
 
 from .hashmap import (
-    hashmap_build_triton, 
+    hashmap_build, 
     _hashmap_lookup_inline_32bit, 
     _vec_load, 
     pad_to_size_along_dim, 
@@ -18,12 +18,12 @@ from .utils import segment_take, _lengths_to_offsets
 
 
 __all__ = [
-    "build_neighbor_map_from_kernel_delta_triton",
-    "build_neighbor_map_from_kernel_size_dilation_triton",
-    "transpose_neighbor_map_triton",
-    "get_conv_output_coords_kernel_size_dilation_triton",
-    "get_conv_output_coords_kernel_delta_torch",
-    "get_conv_output_coords_kernel_delta_triton",
+    "build_neighbor_map_from_kernel_delta",
+    "build_neighbor_map_from_kernel_size_dilation",
+    "transpose_neighbor_map",
+    "get_output_coords_kernel_size_dilation",
+    "get_output_coords_kernel_delta_torch",
+    "get_output_coords_kernel_delta",
     "neighbor_map_gray_code_sort",
     "neighbor_map_valid_signal",
     "neighbor_map_valid_kernel",
@@ -98,7 +98,7 @@ def _hashmap_prepare_offs_masks_inline(
 
 # ===== Arbitrary neighbor offsets ======
 @triton.jit
-def _hashmap_build_neighbor_map_from_kernel_delta_triton_kernel(
+def _hashmap_build_neighbor_map_from_kernel_delta_kernel(
     hashmap_ptr: tl.tensor,
     hashmap_size: int,
     coords_in_ptr: tl.const,
@@ -315,7 +315,7 @@ def _hashmap_build_neighbor_map_kernel_size_dilation_triton_kernel(
     )
 
 
-def build_neighbor_map_from_kernel_size_dilation_triton(
+def build_neighbor_map_from_kernel_size_dilation(
     input_coords: Tensor,
     output_coords: Tensor | None,
     kernel_size: tuple[int, ...],
@@ -379,7 +379,7 @@ def build_neighbor_map_from_kernel_size_dilation_triton(
 
     # Build hashmap for input coords if not provided
     if hashmap is None:
-        hashmap = hashmap_build_triton(input_coords)
+        hashmap = hashmap_build(input_coords)
     
     INT16_DELTA = V < 32768
     if any(s != 1 for s in stride_D) or any(o != 0 for o in offset_D):
@@ -442,7 +442,7 @@ def build_neighbor_map_from_kernel_size_dilation_triton(
     return neighbor_map
 
 
-def build_neighbor_map_from_kernel_delta_triton(
+def build_neighbor_map_from_kernel_delta(
     input_coords: Tensor,
     output_coords: Tensor | None,
     delta: Tensor,
@@ -486,7 +486,7 @@ def build_neighbor_map_from_kernel_delta_triton(
     
     M = output_coords.shape[0]
     if hashmap is None:
-        hashmap = hashmap_build_triton(input_coords)
+        hashmap = hashmap_build(input_coords)
     
     V = delta.shape[0]
     stride_D = tuple(stride) + (1,) * (D - len(stride))
@@ -511,7 +511,7 @@ def build_neighbor_map_from_kernel_delta_triton(
         BLOCK_M = 256 // BLOCK_V 
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(V, BLOCK_V))
 
-    _hashmap_build_neighbor_map_from_kernel_delta_triton_kernel[grid](
+    _hashmap_build_neighbor_map_from_kernel_delta_kernel[grid](
         hashmap_ptr=hashmap,
         hashmap_size=hashmap.shape[0],
         coords_in_ptr=input_coords,
@@ -534,7 +534,7 @@ def build_neighbor_map_from_kernel_delta_triton(
 # ============================= backward neighbor map ====================================
 # ========================================================================================
 @triton.jit
-def _transpose_neighbor_map_triton_kernel(
+def _transpose_neighbor_map_kernel(
     fwd_neighbor_map_ptr: tl.const,
     bwd_neighbor_map_ptr: tl.pointer_type,
     M: int,
@@ -570,7 +570,7 @@ def _transpose_neighbor_map_triton_kernel(
     )
 
 
-def transpose_neighbor_map_triton(
+def transpose_neighbor_map(
     neighbor_map: Tensor,
     N: int,
 ) -> Tensor:
@@ -604,7 +604,7 @@ def transpose_neighbor_map_triton(
     BLOCK_M = max(1, 256 // BLOCK_V)
     grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(V, BLOCK_V))
 
-    _transpose_neighbor_map_triton_kernel[grid](
+    _transpose_neighbor_map_kernel[grid](
         fwd_neighbor_map_ptr=neighbor_map,
         bwd_neighbor_map_ptr=bwd_neighbor_map,
         M=M,
@@ -622,7 +622,7 @@ def transpose_neighbor_map_torch(
 ) -> Tensor:
     """Build backward neighbor map using :func:`torch.scatter`.
 
-    Equivalent to ``transpose_neighbor_map_triton`` but implemented
+    Equivalent to ``transpose_neighbor_map`` but implemented
     purely with PyTorch ops.
 
     Args:
@@ -655,7 +655,7 @@ def transpose_neighbor_map_torch(
 # =======================================================================================
 
 
-def get_conv_output_coords_kernel_size_dilation_torch(
+def get_output_coords_kernel_size_dilation_torch(
     input_coords: torch.Tensor,
     kernel_size: tuple[int, ...],
     stride: tuple[int, ...] | None,
@@ -709,7 +709,7 @@ def get_conv_output_coords_kernel_size_dilation_torch(
     return unique_out_coords, fwd_neighbor_map, bwd_neighbor_map
 
 
-# def get_conv_output_coords_kernel_size_dilation_strided_torch(
+# def get_output_coords_kernel_size_dilation_strided_torch(
 #     input_coords: torch.Tensor,
 #     kernel_size: tuple[int, ...],
 #     stride: tuple[int, ...] | None,
@@ -804,7 +804,7 @@ def get_conv_output_coords_kernel_size_dilation_torch(
 
 
 @triton.jit
-def _get_conv_output_coords_4d_triton_kernel(
+def _get_output_coords_4d_triton_kernel(
     coords_in_ptr,        # (N, D=4) int32 input coords
     out_candidates_ptr,   # (N * V, D=4) int32 output candidates buffer
     valid_mask_ptr,       # (N * V,) int8 valid mask
@@ -879,7 +879,7 @@ def _get_conv_output_coords_4d_triton_kernel(
 
 
 @triton.jit
-def _get_conv_output_coords_nd_triton_kernel(
+def _get_output_coords_nd_triton_kernel(
     coords_in_ptr,        # (N, D) int32 input coords
     out_candidates_ptr,   # (N * V, D) int32 output candidates buffer
     valid_mask_ptr,       # (N * V,) int8 valid mask
@@ -947,7 +947,7 @@ def _get_conv_output_coords_nd_triton_kernel(
     tl.store(valid_mask_ptr + out_idx, valid.to(tl.int8), mask=mask_MV)
 
 
-def get_conv_output_coords_kernel_size_dilation_triton(
+def get_output_coords_kernel_size_dilation(
     input_coords: Tensor,
     kernel_size: tuple[int, ...],
     stride: tuple[int, ...] | None = None,
@@ -1046,7 +1046,7 @@ def get_conv_output_coords_kernel_size_dilation_triton(
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(V, BLOCK_V))
 
     if D == 4 and all(k <= 5 for k in kernel_size_D):
-        _get_conv_output_coords_4d_triton_kernel[grid](
+        _get_output_coords_4d_triton_kernel[grid](
             coords_in_ptr=input_coords_padded,
             out_candidates_ptr=out_candidates,
             valid_mask_ptr=valid_mask,
@@ -1065,7 +1065,7 @@ def get_conv_output_coords_kernel_size_dilation_triton(
             dtype=torch.int16,
             device=device,
         )
-        _get_conv_output_coords_nd_triton_kernel[grid](
+        _get_output_coords_nd_triton_kernel[grid](
             coords_in_ptr=input_coords_padded,
             out_candidates_ptr=out_candidates,
             valid_mask_ptr=valid_mask,
@@ -1110,7 +1110,7 @@ def get_conv_output_coords_kernel_size_dilation_triton(
     bwd_nm = bwd_nm_flat.view(N, V)
 
     # Build fwd_neighbor_map (M, V): fwd[m, v] = n (input coord index)
-    fwd_nm = transpose_neighbor_map_triton(bwd_nm, N=M)
+    fwd_nm = transpose_neighbor_map(bwd_nm, N=M)
 
     # Unpad coordinates back to original number of dimensions
     unique_out_coords = unique_out_coords[:, :orig_D].to(coord_dtype).contiguous()
@@ -1119,7 +1119,7 @@ def get_conv_output_coords_kernel_size_dilation_triton(
 
 
 @triton.jit
-def _get_conv_output_coords_delta_triton_kernel(
+def _get_output_coords_delta_triton_kernel(
     coords_in_ptr,        # (N, D) coord-dtype input coords
     out_candidates_ptr,   # (N * V, D) coord-dtype output candidates buffer
     valid_mask_ptr,       # (N * V,) int8 valid mask
@@ -1187,14 +1187,14 @@ def _get_conv_output_coords_delta_triton_kernel(
     tl.store(valid_mask_ptr + out_idx, valid.to(tl.int8), mask=mask_MV)
 
 
-def get_conv_output_coords_kernel_delta_torch(
+def get_output_coords_kernel_delta_torch(
     input_coords: Tensor,
     delta: Tensor,
     stride: tuple[int, ...] | None,
     offset: tuple[int, ...] | None,
     boundary: tuple[tuple[int, int], ...],
 ) -> tuple[Tensor, Tensor, Tensor]:
-    """Reference implementation of :func:`get_conv_output_coords_kernel_delta_triton`.
+    """Reference implementation of :func:`get_output_coords_kernel_delta`.
 
     For each ``coord_in`` and each ``delta[v]``:
         ``candidate_out = (coord_in - offset - delta[v]) // stride``
@@ -1242,7 +1242,7 @@ def get_conv_output_coords_kernel_delta_torch(
     return unique_out_coords, fwd_neighbor_map, bwd_neighbor_map
 
 
-def get_conv_output_coords_kernel_delta_triton(
+def get_output_coords_kernel_delta(
     input_coords: Tensor,
     delta: Tensor,
     stride: tuple[int, ...] | None = None,
@@ -1251,7 +1251,7 @@ def get_conv_output_coords_kernel_delta_triton(
 ) -> tuple[Tensor, Tensor, Tensor]:
     """Compute output coords for strided sparse convolution with arbitrary kernel deltas.
 
-    Like :func:`get_conv_output_coords_kernel_size_dilation_triton`, but the kernel is
+    Like :func:`get_output_coords_kernel_size_dilation`, but the kernel is
     specified by an explicit ``(V, D)`` tensor of neighbor offsets instead of
     ``kernel_size`` / ``dilation``.
 
@@ -1333,7 +1333,7 @@ def get_conv_output_coords_kernel_delta_triton(
     BLOCK_M = max(1, 256 // BLOCK_V)
     grid = (triton.cdiv(N, BLOCK_M), triton.cdiv(V, BLOCK_V))
 
-    _get_conv_output_coords_delta_triton_kernel[grid](
+    _get_output_coords_delta_triton_kernel[grid](
         coords_in_ptr=input_coords_padded,
         out_candidates_ptr=out_candidates,
         valid_mask_ptr=valid_mask,
@@ -1364,7 +1364,7 @@ def get_conv_output_coords_kernel_delta_triton(
     bwd_nm_flat[valid_indices] = unique_inverse.to(torch.int32)
     bwd_nm = bwd_nm_flat.view(N, V)
 
-    fwd_nm = transpose_neighbor_map_triton(bwd_nm, N=M)
+    fwd_nm = transpose_neighbor_map(bwd_nm, N=M)
 
     unique_out_coords = unique_out_coords[:, :orig_D].to(coord_dtype).contiguous()
 

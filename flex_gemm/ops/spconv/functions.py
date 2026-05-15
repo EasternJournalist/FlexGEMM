@@ -9,7 +9,7 @@ from .. import spconv
 from ... import config
 from ..utils import make_conv_kernel_delta, init_hashmap, lookup_pytorch
 from ... import kernels
-from .neighbor_cache import SparseConvNeighborCache
+from ..neighbor_cache import NeighborCache
 
 
 __all__ = [
@@ -24,10 +24,10 @@ class SparseConvExplicitGemmFunction(Function):
     def forward(
         ctx,
         input: Tensor,
-        neighbor_cache: SparseConvNeighborCache,
+        neighbor_cache: NeighborCache,
         weight: Tensor,
         bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SparseConvNeighborCache]:
+    ) -> Tuple[Tensor, NeighborCache]:
         assert input.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
         assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
@@ -50,7 +50,7 @@ class SparseConvExplicitGemmFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor, _):
         input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
+        neighbor_cache: NeighborCache = ctx.neighbor_cache
         neighbor_map = neighbor_cache.fwd_neighbor_map
         N = input.shape[0]
         Co, V, Ci = weight.shape
@@ -87,10 +87,10 @@ class SparseConvImplicitGemmFunction(Function):
     def forward(
         ctx,
         input: Tensor,
-        neighbor_cache: SparseConvNeighborCache,
+        neighbor_cache: NeighborCache,
         weight: Tensor,
         bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SparseConvNeighborCache]:
+    ) -> Tuple[Tensor, NeighborCache]:
         assert input.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
         assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
@@ -109,7 +109,7 @@ class SparseConvImplicitGemmFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor, _):
         input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
+        neighbor_cache: NeighborCache = ctx.neighbor_cache
 
         grad_output = grad_output.contiguous()
         if input.requires_grad:
@@ -143,10 +143,10 @@ class SparseConvImplicitGemmSplitKFunction(Function):
     def forward(
         ctx,
         feats: Tensor,
-        neighbor_cache: SparseConvNeighborCache,
+        neighbor_cache: NeighborCache,
         weight: Tensor,
         bias: Optional[Tensor] = None,
-    ) -> Tuple[Tensor, SparseConvNeighborCache]:
+    ) -> Tuple[Tensor, NeighborCache]:
         assert feats.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
         assert feats.shape[-1] == Ci, f"Input channels ({feats.shape[-1]}) should match weight channels ({Ci})"
@@ -165,7 +165,7 @@ class SparseConvImplicitGemmSplitKFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: Tensor, _):
         input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
+        neighbor_cache: NeighborCache = ctx.neighbor_cache
 
         grad_output = grad_output.contiguous()
         if input.requires_grad:
@@ -199,10 +199,10 @@ class SparseConvMaskedImplicitGemmFunction(Function):
     def forward(
         ctx,
         input: torch.Tensor,
-        neighbor_cache: SparseConvNeighborCache,
+        neighbor_cache: NeighborCache,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, SparseConvNeighborCache]:
+    ) -> Tuple[torch.Tensor, NeighborCache]:
         assert input.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
         assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
@@ -224,7 +224,7 @@ class SparseConvMaskedImplicitGemmFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, _):
         input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
+        neighbor_cache: NeighborCache = ctx.neighbor_cache
 
         grad_output = grad_output.contiguous()
         if input.requires_grad:
@@ -266,10 +266,10 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
     def forward(
         ctx,
         input: torch.Tensor,
-        neighbor_cache: SparseConvNeighborCache,
+        neighbor_cache: NeighborCache,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, SparseConvNeighborCache]:
+    ) -> Tuple[torch.Tensor, NeighborCache]:
         assert input.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
         assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
@@ -291,7 +291,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, _):
         input, weight, bias = ctx.saved_tensors
-        neighbor_cache: SparseConvNeighborCache = ctx.neighbor_cache
+        neighbor_cache: NeighborCache = ctx.neighbor_cache
 
         grad_output = grad_output.contiguous()
         if input.requires_grad:

@@ -1,4 +1,4 @@
-"""Micro-profile build_segments_from_indices_triton to find the constant-time bottleneck.
+"""Micro-profile build_segments_from_indices to find the constant-time bottleneck.
 
 Hypothesis: ~175us constant cost regardless of N suggests Python/launch overhead,
 not GPU work. Break the function into its sub-steps and time each independently.
@@ -9,9 +9,9 @@ import torch
 import triton
 
 from flex_gemm.kernels.triton.pool import (
-    build_segments_from_indices_triton,
-    scatter_count_triton,
-    _scatter_count_kernel,
+    build_segments_from_indices,
+    scatter_rank_triton,
+    _scatter_rank_kernel,
     _scatter_to_segments_kernel,
 )
 from flex_gemm.kernels.triton.utils import _lengths_to_offsets
@@ -56,18 +56,18 @@ def main():
         indices = make_uniform_indices(M, V, device)
 
         # whole function
-        t_whole = bench(lambda: build_segments_from_indices_triton(indices, M))
+        t_whole = bench(lambda: build_segments_from_indices(indices, M))
 
         # === sub-steps ===
         # scatter_count (counts + ranks). includes 2x torch.zeros/empty + 1 triton kernel.
-        t_count = bench(lambda: scatter_count_triton(indices, M))
+        t_count = bench(lambda: scatter_rank_triton(indices, M))
 
         # cumsum offsets
         counts = torch.zeros((M,), dtype=torch.int32, device=device)
         t_cumsum = bench(lambda: _lengths_to_offsets(counts.to(torch.int64)))
 
         # scatter_to_segments alone (precompute everything else)
-        counts2, ranks = scatter_count_triton(indices, M)
+        counts2, ranks = scatter_rank_triton(indices, M)
         seg_offsets = _lengths_to_offsets(counts2.to(torch.int64))
 
         def stage3():
@@ -97,7 +97,7 @@ def main():
         grid = (triton.cdiv(N, BLOCK_SIZE),)
 
         def kern1():
-            _scatter_count_kernel[grid](
+            _scatter_rank_kernel[grid](
                 indices_ptr=indices,
                 counts_ptr=scratch_counts,
                 ranks_ptr=scratch_ranks,

@@ -8,9 +8,10 @@ import triton
 import triton.language as tl
 
 __all__ = [
-    'hashmap_build_triton',
-    'hashmap_lookup_triton',
-    'hashmap_build_lookup_triton',
+    'hashmap_build',
+    'hashmap_lookup',
+    'hashmap_build_lookup',
+    'hashmap_unique',
 ]
 
 
@@ -276,7 +277,7 @@ def _hashmap_unique_kernel_32bit(
     tl.store(results_ptr + idx, found_idx, mask=mask)
 
 
-def hashmap_build_triton(keys: Tensor) -> Tensor:
+def hashmap_build(keys: Tensor) -> Tensor:
     """
     Build a hash map from the given keys using Triton.
     
@@ -289,8 +290,8 @@ def hashmap_build_triton(keys: Tensor) -> Tensor:
     Notes
     -----
         The hash map stores a combination of a hash tag and the index of each key.
-        See `hashmap_lookup_triton` for querying the hash map.
-        Use `hashmap_build_lookup_triton` for a combined build and lookup operation.
+        See `hashmap_lookup` for querying the hash map.
+        Use `hashmap_build_lookup` for a combined build and lookup operation.
     """
     # Determine hash map size (next power of two greater than 2x number of elements)
     n_keys = keys.shape[0]
@@ -318,12 +319,12 @@ def hashmap_build_triton(keys: Tensor) -> Tensor:
     return hashmap
 
 
-def hashmap_lookup_triton(hashmap: Tensor, keys: Tensor, queries: Tensor) -> Tensor:
+def hashmap_lookup(hashmap: Tensor, keys: Tensor, queries: Tensor) -> Tensor:
     """
     Lookup the indices of the given queries in the provided hash map.
 
     Args:
-        hashmap (Tensor): A 1D tensor representing the hash map built using `hashmap_build_triton`.
+        hashmap (Tensor): A 1D tensor representing the hash map built using `hashmap_build`.
         keys (Tensor): A tensor of shape `(n_keys, *key_dims)` representing the keys used to build the hash map.
         queries (Tensor): A tensor of shape `(n_queries, *key_dims)` representing the queries to look up.
     
@@ -366,7 +367,7 @@ def hashmap_lookup_triton(hashmap: Tensor, keys: Tensor, queries: Tensor) -> Ten
     return results
 
 
-def hashmap_build_lookup_triton(keys: Tensor, queries: Tensor) -> Tensor:
+def hashmap_build_lookup(keys: Tensor, queries: Tensor) -> Tensor:
     """
     Build a hash map from the given keys and lookup the indices of the given queries in a single operation.
     Args:

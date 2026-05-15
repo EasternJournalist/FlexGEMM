@@ -11,8 +11,6 @@ from . import nn
 # Top-level imports for convenience
 from .ops import (
     submanifold_conv,
-    submanifold_conv_any,
     sparse_conv,
-    sparse_conv_any,
     sparse_grid_sample_3d
 )

@@ -3,7 +3,7 @@ import os
 import pytest
 import torch
 
-from flex_gemm.kernels.triton import hashmap_build_triton, hashmap_lookup_triton
+from flex_gemm.kernels.triton import hashmap_build, hashmap_lookup
 
 
 def _make_unique_keys(n: int, dim: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
@@ -30,12 +30,12 @@ def _time_cuda_ms(fn, warmup: int = 20, iters: int = 100) -> float:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton kernels")
 @pytest.mark.parametrize("dtype", [torch.int16, torch.int32])
-def test_hashmap_build_triton_basic_properties(dtype: torch.dtype) -> None:
+def test_hashmap_build_basic_properties(dtype: torch.dtype) -> None:
     device = torch.device("cuda")
     n_keys = 512
     keys = _make_unique_keys(n_keys, dim=4, device=device, dtype=dtype)
 
-    hashmap = hashmap_build_triton(keys)
+    hashmap = hashmap_build(keys)
 
     assert hashmap.ndim == 1
     assert hashmap.device.type == "cuda"
@@ -50,7 +50,7 @@ def test_hashmap_build_triton_basic_properties(dtype: torch.dtype) -> None:
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for Triton kernels")
 @pytest.mark.parametrize("dtype", [torch.int32, torch.int16])
-def test_hashmap_lookup_triton_matches_reference(dtype: torch.dtype) -> None:
+def test_hashmap_lookup_matches_reference(dtype: torch.dtype) -> None:
     device = torch.device("cuda")
     n_keys = 1024
     key_dim = 8
@@ -62,8 +62,8 @@ def test_hashmap_lookup_triton_matches_reference(dtype: torch.dtype) -> None:
     missing_queries = _make_unique_keys(8, dim=key_dim, device=device, dtype=dtype) + 10_000_000
     queries = torch.cat([present_queries, missing_queries], dim=0)
 
-    hashmap = hashmap_build_triton(keys)
-    out = hashmap_lookup_triton(hashmap, keys, queries)
+    hashmap = hashmap_build(keys)
+    out = hashmap_lookup(hashmap, keys, queries)
 
     assert out.dtype == torch.int32
     assert out.shape == (queries.shape[0],)
@@ -87,11 +87,11 @@ def test_hashmap_triton_speed_benchmark(dtype: torch.dtype) -> None:
     missing_queries = _make_unique_keys(n_queries, dim=key_dim, device=device, dtype=dtype) + 20_000_000
     queries = torch.cat([present_queries, missing_queries], dim=0)
 
-    build_ms = _time_cuda_ms(lambda: hashmap_build_triton(keys), warmup=20, iters=50)
-    hashmap = hashmap_build_triton(keys)
-    lookup_ms = _time_cuda_ms(lambda: hashmap_lookup_triton(hashmap, keys, queries), warmup=20, iters=100)
+    build_ms = _time_cuda_ms(lambda: hashmap_build(keys), warmup=20, iters=50)
+    hashmap = hashmap_build(keys)
+    lookup_ms = _time_cuda_ms(lambda: hashmap_lookup(hashmap, keys, queries), warmup=20, iters=100)
 
-    out = hashmap_lookup_triton(hashmap, keys, queries)
+    out = hashmap_lookup(hashmap, keys, queries)
     assert (out[:n_queries] >= 0).all()
     assert (out[n_queries:] == -1).all()
 

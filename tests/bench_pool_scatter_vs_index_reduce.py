@@ -5,9 +5,10 @@ gathered tensor after index_select has shape (M*V, C) and can be reshaped to
 (M, V, C) for a plain .sum/.mean/.max — the ideal performance upper bound for
 the segment-based approach when segment lengths are uniform.
 
-Approach A  (segment):       build_segments_from_indices_triton -> index_select -> segment_reduce
-Approach B  (ideal):         build_segments_from_indices_triton -> index_select -> reshape -> reduce
+Approach A  (segment):       build_segments_from_indices -> index_select -> segment_reduce
+Approach B  (ideal):         build_segments_from_indices -> index_select -> reshape -> reduce
 Approach C  (scatter_reduce):torch.scatter_reduce (functional)
+Approach D  (csr spmm):      torch.sparse_csr_tensor(...) @ feats  (sum/mean only)
 
 Run:  PYTHONPATH=. python tests/bench_pool_scatter_vs_index_reduce.py
 """
@@ -16,8 +17,8 @@ import time
 import torch
 
 from flex_gemm.kernels.triton.pool import (
-    build_segments_from_indices_triton,
-    index_segment_reduce_triton,
+    build_segments_from_indices,
+    index_segment_reduce,
 )
 
 
@@ -38,19 +39,19 @@ def make_uniform_indices(M, V, device):
     perm = torch.randperm(idx.shape[0], device=device)
     return idx[perm]
 
-@torch.compile(dynamic=True)
+
 def index_selected_segment_reduce(feats: torch.Tensor, seg_indices: torch.Tensor, seg_offsets: torch.Tensor, reduce: str):
     gathered = feats.index_select(0, seg_indices)
     return torch.segment_reduce(gathered, reduce, offsets=seg_offsets, axis=0)
 
 def approach_segment(feats, indices, M, reduce):
-    seg_indices, seg_offsets = build_segments_from_indices_triton(indices, M)
-    return index_selected_segment_reduce(feats, seg_indices, seg_offsets, reduce)
+    seg_indices, seg_offsets = build_segments_from_indices(indices, M)
+    return index_segment_reduce(feats, seg_indices, seg_offsets, reduce)
 
 
 def approach_reshape(feats, indices, M, V, reduce):
     """Ideal upper bound: uniform segment length V allows reshape instead of segment_reduce."""
-    seg_indices, _seg_offsets = build_segments_from_indices_triton(indices, M)
+    seg_indices, _seg_offsets = build_segments_from_indices(indices, M)
     gathered = feats.index_select(0, seg_indices)          # (M*V, C)
     C = feats.shape[1]
     g = gathered.reshape(M, V, C)
@@ -64,11 +65,38 @@ def approach_reshape(feats, indices, M, V, reduce):
         raise ValueError(reduce)
 
 
-def approach_scatter_reduce(feats, indices, M, reduce):
-    scatter_reduce_name = {"sum": "sum", "mean": "mean", "max": "amax"}[reduce]
-    idx = indices.to(torch.int64).unsqueeze(1).expand_as(feats)
+def approach_scatter_reduce(feats: torch.Tensor, indices: torch.Tensor, M: int, reduce: str):
+    idx = indices.unsqueeze(1).expand_as(feats)
     out = feats.new_zeros(M, feats.shape[1])
-    return torch.scatter_reduce(out, 0, idx, feats, reduce=scatter_reduce_name, include_self=False)
+    return torch.scatter_reduce(out, 0, idx, feats, reduce=reduce, include_self=False)
+
+
+def build_csr(seg_indices: torch.Tensor, seg_offsets: torch.Tensor, M: int, N: int,
+              reduce: str, dtype: torch.dtype, device):
+    """Build an (M, N) CSR matrix whose row-i nonzeros mark the inputs feeding output i.
+
+    For ``sum``  -> values are 1.
+    For ``mean`` -> values are 1 / (segment length). Since every segment has the same
+                    length V here, this is just 1/V uniformly.
+    """
+    nnz = seg_indices.shape[0]
+    crow = seg_offsets.to(torch.int32)
+    col = seg_indices.to(torch.int32)
+    if reduce == "sum":
+        values = torch.ones(nnz, dtype=dtype, device=device)
+    elif reduce == "mean":
+        seg_len = torch.diff(crow).to(dtype)  # (M,)
+        # Per-nnz weight = 1 / seg_len[row]; broadcast via repeat_interleave.
+        values = (1.0 / seg_len).repeat_interleave(seg_len.to(torch.int64))
+    else:
+        raise ValueError(f"CSR spmm does not support reduce={reduce!r}")
+    return torch.sparse_csr_tensor(crow, col, values, size=(M, N))
+
+
+def approach_csr(feats: torch.Tensor, seg_indices: torch.Tensor, seg_offsets: torch.Tensor,
+                 M: int, reduce: str):
+    csr = build_csr(seg_indices, seg_offsets, M, feats.shape[0], reduce, feats.dtype, feats.device)
+    return torch.sparse.mm(csr, feats)
 
 
 def approach_no_gather(feats, M, V, reduce):
@@ -110,9 +138,10 @@ def main():
     ]
 
     print(f"{'N':>9} {'M':>9} {'V':>4} {'C':>5} {'reduce':>6} | "
-          f"{'build_seg':>9} {'gather+red':>10} {'fused tri':>9} {'no_gather':>9} | {'seg total':>9} {'fused tot':>9} {'scatter':>9} | "
-          f"{'err (seg - scat)':>9} {'err (fused - scat)':>9}")
-    print("-" * 160)
+          f"{'build_seg':>9} {'fused tri':>9} {'csr spmm':>9} {'no_gather':>9} | "
+          f"{'fused tot':>9} {'csr+build':>9} {'scatter':>9} | "
+          f"{'err seg':>9} {'err fused':>9} {'err csr':>9}")
+    print("-" * 180)
 
     for M, V, C in configs:
         N = M * V
@@ -133,34 +162,46 @@ def main():
 
             # --- timing: break approach_segment into two stages ---
             # Stage 1: build_segments
-            t_build = bench(lambda: build_segments_from_indices_triton(indices, M))
+            t_build = bench(lambda: build_segments_from_indices(indices, M))
 
             # Precompute outputs of earlier stages for isolating later-stage cost.
-            seg_indices, seg_offsets = build_segments_from_indices_triton(indices, M)
-
-            # Stage 2a: torch.compile fused gather+reduce
-            t_gather_red = bench(
-                lambda r=reduce: index_selected_segment_reduce(feats, seg_indices, seg_offsets, r)
-            )
+            seg_indices, seg_offsets = build_segments_from_indices(indices, M)
 
             # Stage 2b: hand-written fused Triton kernel
-            out_fused = index_segment_reduce_triton(feats, seg_indices, seg_offsets, reduce)
+            out_fused = index_segment_reduce(feats, seg_indices, seg_offsets, reduce)
             err_fused = (out_fused - out_scat).abs().max().item()
             t_fused = bench(
-                lambda r=reduce: index_segment_reduce_triton(feats, seg_indices, seg_offsets, r)
+                lambda r=reduce: index_segment_reduce(feats, seg_indices, seg_offsets, r)
             )
 
-            t_seg_total   = t_build + t_gather_red
             t_fused_total = t_build + t_fused
 
             # Reference timings
             t_no_gather = bench(lambda r=reduce: approach_no_gather(feats, M, V, r))
             t_scat      = bench(lambda r=reduce: approach_scatter_reduce(feats, indices, M, r))
 
+            # CSR spmm approach (sum/mean only — max isn't a semiring op for spmm).
+            if reduce in ("sum", "mean"):
+                out_csr = approach_csr(feats, seg_indices, seg_offsets, M, reduce)
+                err_csr = (out_csr - out_scat).abs().max().item()
+                csr_prebuilt = build_csr(seg_indices, seg_offsets, M, feats.shape[0],
+                                         reduce, feats.dtype, feats.device)
+                t_csr = bench(lambda c=csr_prebuilt: torch.sparse.mm(c, feats))
+                t_csr_build = bench(
+                    lambda r=reduce: approach_csr(feats, seg_indices, seg_offsets, M, r)
+                )
+                csr_spmm_str = f"{t_csr:>9.4f}"
+                csr_total_str = f"{t_csr_build:>9.4f}"
+                err_csr_str = f"{err_csr:>9.2e}"
+            else:
+                csr_spmm_str = f"{'n/a':>9}"
+                csr_total_str = f"{'n/a':>9}"
+                err_csr_str = f"{'n/a':>9}"
+
             print(f"{N:>9} {M:>9} {V:>4} {C:>5} {reduce:>6} | "
-                  f"{t_build:>9.4f} {t_gather_red:>10.4f} {t_fused:>9.4f} {t_no_gather:>9.4f} | "
-                  f"{t_seg_total:>9.4f} {t_fused_total:>9.4f} {t_scat:>9.4f} | "
-                  f"{err:>9.2e} {err_fused:>9.2e}")
+                  f"{t_build:>9.4f} {t_fused:>9.4f} {csr_spmm_str} {t_no_gather:>9.4f} | "
+                  f"{t_fused_total:>9.4f} {csr_total_str} {t_scat:>9.4f} | "
+                  f"{err:>9.2e} {err_fused:>9.2e} {err_csr_str}")
 
 
 if __name__ == "__main__":
