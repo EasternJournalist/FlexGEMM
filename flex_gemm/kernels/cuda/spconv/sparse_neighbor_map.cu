@@ -87,8 +87,33 @@ torch::Tensor hashmap_build_sparse_conv_out_coords(
     int Ho = (H + 2 * Ph - Dh * (Kh - 1) - 1) / Sh + 1;
     int Do = (D + 2 * Pd - Dd * (Kd - 1) - 1) / Sd + 1;
     int V = Kw * Kh * Kd;
-    size_t hashmap_size = static_cast<size_t>(
-        hashmap_ratio * Kw * Kh * Kd / Sw / Sh / Sd * in_coords.size(0)
+
+    // Size the hashmap to a true upper bound on the unique valid output coords.
+    //
+    // Two clean bounds are always correct:
+    //   * NV  = N * V              -- each input emits at most V candidates;
+    //   * VOL = B * Wo * Ho * Do   -- total dense output volume.
+    // ``min(NV, VOL) * hashmap_ratio`` is a tight, dilation-independent
+    // capacity that keeps the open-addressing load factor at ``1/ratio``.
+    //
+    // The previous ``V/(Sw*Sh*Sd) * N`` heuristic implicitly assumed the
+    // per-axis divisibility check filters ~1/S^D of expansions, which breaks
+    // whenever ``dilation`` defeats that filter (e.g. ``dilation == stride``).
+    // Once the map filled up, ``linear_probing_insert`` would spin forever.
+    uint64_t nv = 0;
+    TORCH_CHECK(
+        is_safe_mul(static_cast<uint64_t>(in_coords.size(0)), static_cast<uint64_t>(V), nv),
+        "N*V overflows 64-bit when sizing hashmap."
+    );
+    uint64_t vol = static_cast<uint64_t>(B);
+    bool vol_safe = true;
+    vol_safe &= is_safe_mul(vol, static_cast<uint64_t>(std::max(Wo, 0)), vol);
+    vol_safe &= is_safe_mul(vol, static_cast<uint64_t>(std::max(Ho, 0)), vol);
+    vol_safe &= is_safe_mul(vol, static_cast<uint64_t>(std::max(Do, 0)), vol);
+    uint64_t unique_upper = vol_safe ? std::min(nv, vol) : nv;
+    size_t hashmap_size = std::max<size_t>(
+        static_cast<size_t>(hashmap_ratio * static_cast<double>(unique_upper)),
+        static_cast<size_t>(16)
     );
 
     // Implementation

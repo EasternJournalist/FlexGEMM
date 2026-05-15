@@ -2,11 +2,11 @@ import torch
 from torch import Tensor
 from typing import *
 
-from ..neighbor_cache import NeighborCache, build_neighbor_cache
+from ..neighbor_cache import NeighborCache, NeighborCacheT, build_neighbor_cache
 from .functions import _select_function
 
 
-__all__ = ['sparse_conv']
+__all__ = ['sparse_conv_transpose']
 
 
 _Algo = Literal[
@@ -15,8 +15,34 @@ _Algo = Literal[
 ]
 
 
+def _infer_transpose_output_shape(
+    input_shape: torch.Size,
+    kernel_size: tuple[int, ...],
+    stride: tuple[int, ...],
+    dilation: tuple[int, ...],
+    padding: tuple[int, ...],
+) -> torch.Size:
+    """Compute the dense output shape for sparse conv-transpose.
+
+    Uses the standard ``nn.ConvTransposeNd`` relation (no ``output_padding``)::
+
+        H_out = (H_in - 1) * stride - 2 * padding + dilation * (K - 1) + 1
+
+    Layout matches :func:`sparse_conv`: ``input_shape`` is
+    ``(*batch_dims, C, S1, ..., SDs)`` and only the trailing ``Ds`` spatial
+    dims are rescaled; the batch and channel prefix are passed through.
+    """
+    D_spatial = len(kernel_size)
+    spatial_in = input_shape[-D_spatial:]
+    spatial_out = tuple(
+        (s - 1) * st - 2 * p + d * (k - 1) + 1
+        for s, k, st, d, p in zip(spatial_in, kernel_size, stride, dilation, padding)
+    )
+    return torch.Size((*input_shape[:-D_spatial], *spatial_out))
+
+
 @overload
-def sparse_conv(
+def sparse_conv_transpose(
     feats: Tensor,
     coords: Tensor,
     shape: torch.Size,
@@ -28,24 +54,33 @@ def sparse_conv(
     padding: tuple[int, ...] | None = None,
     output_coords: Tensor | None = None,
     output_shape: torch.Size | None = None,
-    neighbor_cache: NeighborCache | None = None,
+    neighbor_cache: NeighborCacheT | None = None,
     algorithm: _Algo = None,
-) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
-    """Strided / general sparse convolution with a dense ``(kernel_size, dilation)`` kernel.
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCacheT]:
+    """Sparse conv-transpose with a dense ``(kernel_size, dilation)`` kernel.
 
-    Computes ``output[coord_out] = sum_v input[coord_out * stride - padding + dilation * v] * weight[v]``
-    where ``v`` ranges over the dense kernel volume. ``kernel_size`` is inferred
-    from ``weight.shape[1:-1]``.
+    Computes ``output[c_out] = sum_v input[c_in_v] * weight[v]`` where
+    ``c_out = c_in_v * stride - padding + dilation * v`` (equivalently, each
+    small-side input coord splats into the ``V`` neighbouring large-side
+    output coords). ``kernel_size`` is inferred from ``weight.shape[1:-1]``.
+
+    The output spatial extent matches :class:`torch.nn.ConvTransposeNd`::
+
+        H_out = (H_in - 1) * stride - 2 * padding + dilation * (K - 1) + 1
 
     Args:
-        feats (Tensor): [M, Ci] input features.
-        coords (Tensor): [M, B + Ds] input coordinates.
-        shape (torch.Size): input dense shape (*batch_dims, C, S1, ..., SDs).
-        weight (Tensor): [Co, K1, ..., KDs, Ci] convolution weights.
+        feats (Tensor): [M, Ci] small-side (input) features.
+        coords (Tensor): [M, B + Ds] small-side coordinates.
+        shape (torch.Size): small-side dense shape (*batch_dims, C, S1, ..., SDs).
+        weight (Tensor): [Co, K1, ..., KDs, Ci] convolution-transpose weights.
         bias (Optional[Tensor]): [Co] bias.
         stride / dilation / padding: tuples of length Ds. Default all-1 / all-1 / all-0.
-        output_coords / output_shape: passthrough to :func:`build_neighbor_cache`.
-        neighbor_cache: if provided, must be consistent with the call (verified via
+        output_coords: optional large-side coordinates. Built by the fused
+            output-coords path when ``None``.
+        output_shape: large-side dense shape. Auto-derived from the formula
+            above when ``None``.
+        neighbor_cache: if provided, must be a :class:`NeighborCacheT`
+            consistent with the call (verified via
             :meth:`NeighborCache.assert_match`).
         algorithm: index-GEMM algorithm variant.
 
@@ -56,7 +91,7 @@ def sparse_conv(
 
 
 @overload
-def sparse_conv(
+def sparse_conv_transpose(
     feats: Tensor,
     coords: Tensor,
     shape: torch.Size,
@@ -67,24 +102,31 @@ def sparse_conv(
     stride: tuple[int, ...] | None = None,
     offset: tuple[int, ...] | None = None,
     output_coords: Tensor | None = None,
-    output_shape: torch.Size | None = None,
-    neighbor_cache: NeighborCache | None = None,
+    output_shape: torch.Size,
+    neighbor_cache: NeighborCacheT | None = None,
     algorithm: _Algo = None,
-) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
-    """Strided / general sparse convolution with an arbitrary ``kernel_delta`` kernel.
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCacheT]:
+    """Sparse conv-transpose with an arbitrary ``kernel_delta`` kernel.
 
-    Computes ``output[coord_out] = sum_v input[coord_out * stride + offset + kernel_delta[v]] * weight[v]``.
+    Computes ``output[c_out] = sum_v input[c_in_v] * weight[v]`` where
+    ``c_out = c_in_v * stride + offset + kernel_delta[v]``.
 
     Args:
-        feats (Tensor): [M, Ci] input features.
-        coords (Tensor): [M, B + Ds] input coordinates.
-        shape (torch.Size): input dense shape.
-        weight (Tensor): [Co, V, Ci] convolution weights.
+        feats (Tensor): [M, Ci] small-side features.
+        coords (Tensor): [M, B + Ds] small-side coordinates.
+        shape (torch.Size): small-side dense shape.
+        weight (Tensor): [Co, V, Ci] convolution-transpose weights.
         bias (Optional[Tensor]): [Co] bias.
         kernel_delta (Tensor): [V, Ds] kernel offsets.
         stride / offset: tuples of length Ds. Default all-1 / all-0.
-        output_coords / output_shape: passthrough to :func:`build_neighbor_cache`.
-        neighbor_cache: if provided, must be consistent with the call.
+        output_coords: optional large-side coordinates. Built by the fused
+            output-coords path when ``None``.
+        output_shape: large-side dense shape. **Required** -- the output
+            extent cannot be inferred from ``kernel_delta`` alone (taps may
+            be arbitrary). Pass ``output_coords`` directly to skip the
+            output-coords builder if you already have them.
+        neighbor_cache: if provided, must be a :class:`NeighborCacheT`
+            consistent with the call.
         algorithm: index-GEMM algorithm variant.
 
     Returns:
@@ -93,7 +135,7 @@ def sparse_conv(
     ...
 
 
-def sparse_conv(
+def sparse_conv_transpose(
     feats: Tensor,
     coords: Tensor,
     shape: torch.Size,
@@ -107,17 +149,21 @@ def sparse_conv(
     offset: tuple[int, ...] | None = None,
     output_coords: Tensor | None = None,
     output_shape: torch.Size | None = None,
-    neighbor_cache: NeighborCache | None = None,
+    neighbor_cache: NeighborCacheT | None = None,
     algorithm: _Algo = None,
-) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCacheT]:
     """Dispatch on (kernel parameterization). See the two overloads above."""
     assert coords.is_contiguous(), "Coords should be contiguous"
 
     # When a neighbor_cache is supplied, any topology argument left as ``None``
-    # is filled in from the cache. ``output_coords`` is special: it must be
-    # resolvable from either the argument or the cache, otherwise we have no
-    # output coordinates to return.
+    # is filled in from the cache. This mirrors ``sparse_conv``'s resolution
+    # order; the extra check is that the cache must be a transposed view.
     if neighbor_cache is not None:
+        assert neighbor_cache.is_transposed, (
+            "sparse_conv_transpose requires a NeighborCacheT (got a forward "
+            "NeighborCache). Use ``.T`` to flip a forward cache, or pass "
+            "``transpose=True`` to build_neighbor_cache."
+        )
         if output_coords is None:
             output_coords = neighbor_cache.output_coords
         assert output_coords is not None, (
@@ -149,6 +195,13 @@ def sparse_conv(
         assert len(stride) == D_spatial and len(dilation) == D_spatial and len(padding) == D_spatial, (
             "weight kernel shape / stride / dilation / padding must all have the same length."
         )
+        # build_neighbor_cache(transpose=True) refuses to auto-derive the
+        # large-side dense shape; fill it in from the standard ConvTranspose
+        # formula when the caller hasn't already supplied one.
+        if output_shape is None and shape is not None:
+            output_shape = _infer_transpose_output_shape(
+                shape, kernel_size, stride, dilation, padding
+            )
         # Centered-kernel offset for ``assert_match`` (the cache only stores offset).
         match_offset = tuple(((k - 1) // 2) * d - p for k, d, p in zip(kernel_size, dilation, padding))
 
@@ -162,6 +215,7 @@ def sparse_conv(
                 padding=padding,
                 input_shape=shape,
                 output_shape=output_shape,
+                transpose=True,
             )
             output_coords = neighbor_cache.output_coords
             output_shape = neighbor_cache.output_shape
@@ -173,6 +227,7 @@ def sparse_conv(
                 stride=stride,
                 dilation=dilation,
                 offset=match_offset,
+                is_transposed=True,
             )
         weight_v = weight.flatten(1, -2)
     else:
@@ -186,6 +241,11 @@ def sparse_conv(
         assert len(stride) == D_spatial and len(offset) == D_spatial, (
             "stride / offset must match kernel_delta's spatial dimensionality."
         )
+        assert output_shape is not None or output_coords is not None, (
+            "kernel_delta sparse_conv_transpose needs either ``output_shape`` "
+            "or ``output_coords`` -- the dense output extent cannot be "
+            "inferred from kernel_delta alone."
+        )
 
         if neighbor_cache is None:
             neighbor_cache = build_neighbor_cache(
@@ -196,6 +256,7 @@ def sparse_conv(
                 offset=offset,
                 input_shape=shape,
                 output_shape=output_shape,
+                transpose=True,
             )
             output_coords = neighbor_cache.output_coords
             output_shape = neighbor_cache.output_shape
@@ -206,6 +267,7 @@ def sparse_conv(
                 kernel_delta=kernel_delta,
                 stride=stride,
                 offset=offset,
+                is_transposed=True,
             )
         weight_v = weight
 

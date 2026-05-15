@@ -14,6 +14,7 @@ __all__ = [
     'hashmap_unique',
 ]
 
+HASHMAP_LOAD_FACTOR = 0.3
 
 def pad_to_size_along_dim(x: Tensor, dim: int | tuple[int, ...], size: int | tuple[int, ...], value: Number = 0., side: Literal['left', 'right'] = 'right') -> Tensor:
     "Pad the specified dimension of the tensor to the next power of two with zeros."
@@ -117,10 +118,14 @@ def _hashmap_build_kernel_32bit(
     # Upper tag bits, lower index bits. (index must be smaller than hashmap_size)
     store_val = (hash_val & TAG_BIT_MASK) | idx
 
-    # Probing loop
+    # Probing loop. Every lane in this program executes the same number of
+    # iterations, so a single scalar ``probes`` counter is enough to cap the
+    # work at ``hashmap_size``. Exiting early when the bound is hit beats an
+    # infinite spin if the caller mis-sized the table.
     to_be_inserted = mask
     target_slot = hash_val & SLOT_BIT_MASK
-    while tl.sum(to_be_inserted) > 0:
+    probes = 0
+    while (tl.max(to_be_inserted) > 0) & (probes < hashmap_size):
         # Try to insert the key index into the hash table
         prev = tl.atomic_cas(hashmap_ptr + target_slot, tl.where(to_be_inserted, -1, -2), store_val)
         # Update mask: keep only those that failed to insert
@@ -129,6 +134,12 @@ def _hashmap_build_kernel_32bit(
         # Update target_slot for next attempt
         target_slot += tl.where(to_be_inserted, 1, 0)
         target_slot &= SLOT_BIT_MASK
+        probes += 1
+    # Sanity check: every active lane must have either inserted or matched an
+    # existing duplicate. The high-level API sizes the table for load factor
+    # 0.3 so this should be unreachable; the assert is a guard for future
+    # callers that bypass the wrapper.
+    tl.device_assert(tl.max(to_be_inserted) == 0, "hashmap_build: hashmap full -- caller mis-sized the table")
 
 
 @triton.jit
@@ -157,9 +168,13 @@ def _hashmap_lookup_inline_32bit(
     is_active = tl.broadcast_to(mask, query_vec_32.shape[:-1])
     found_idx = tl.full(query_vec_32.shape[:-1], -1, tl.int32)
 
-    # Probing loop
+    # Probing loop. The N-probe bound below is enough to guarantee that an
+    # existing key is found; if the map is full and the key is absent we
+    # would otherwise spin forever. A single scalar counter suffices because
+    # every lane in this program runs the same number of iterations.
     curr_slot = hash_val & SLOT_BIT_MASK
-    while tl.sum(is_active) > 0:
+    probes = 0
+    while (tl.max(is_active) > 0) & (probes < hashmap_size):
         # Compute current slot to probe
         stored_val = tl.load(hashmap_ptr + curr_slot, mask=is_active, other=-1)
 
@@ -183,6 +198,12 @@ def _hashmap_lookup_inline_32bit(
         # Update current slot
         curr_slot += 1
         curr_slot &= SLOT_BIT_MASK
+        probes += 1
+    # Sanity check: any lane that is still active after ``hashmap_size``
+    # probes means the table is full and we cannot conclusively decide
+    # whether the key is present. Trip a device-side assert so the host
+    # sees an error instead of a silently mis-returned -1.
+    tl.device_assert(tl.max(is_active) == 0, "hashmap_lookup: hashmap full -- caller mis-sized the table")
     return found_idx
     
 
@@ -220,6 +241,7 @@ def _hashmap_unique_kernel_32bit(
     hashmap_size: int,
     keys_ptr: tl.const,
     results_ptr: tl.pointer_type,
+    is_canonical_ptr: tl.pointer_type,
     n_keys: int,
     D: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
@@ -230,6 +252,10 @@ def _hashmap_unique_kernel_32bit(
     its own index is the canonical one. On CAS failure, compare the existing
     slot's stored key against ours (tag first, then full key); if it matches
     record the existing key's index, otherwise advance to the next slot.
+
+    Also writes a per-key boolean (uint8) into ``is_canonical_ptr`` indicating
+    whether this lane's key is the canonical (first inserted) occurrence,
+    which saves a separate comparison kernel on the host side.
     """
     tl.static_assert(D * keys_ptr.dtype.element_ty.itemsize % 4 == 0, "keys byte width must be divisible by 4")
     keys_ptr_32 = tl.cast(keys_ptr, tl.pointer_type(tl.int32))
@@ -251,7 +277,8 @@ def _hashmap_unique_kernel_32bit(
     found_idx = tl.where(mask, idx, -1)
     active = mask
     target_slot = hash_val & SLOT_BIT_MASK
-    while tl.sum(active) > 0:
+    probes = 0
+    while (tl.max(active) > 0) & (probes < hashmap_size):
         # Try to claim the slot. Inactive lanes use an expected value (-2)
         # that never matches so the CAS is a no-op for them.
         prev = tl.atomic_cas(hashmap_ptr + target_slot, tl.where(active, -1, -2), store_val)
@@ -261,7 +288,7 @@ def _hashmap_unique_kernel_32bit(
         inserted = active & (prev == -1)
         active = active & ~inserted
 
-        # CAS failed: slot occupied by some prior key. Check if it is ours.
+        # CAS failed: slot occupied by some prior key. Check if it matches ours
         prev_tag = prev & TAG_BIT_MASK
         prev_idx = prev & SLOT_BIT_MASK
         tag_match = active & (prev_tag == my_tag)
@@ -273,8 +300,20 @@ def _hashmap_unique_kernel_32bit(
         # Advance to the next slot for lanes that still need to probe.
         target_slot += tl.where(active, 1, 0)
         target_slot &= SLOT_BIT_MASK
+        # Bound iteration count to avoid an infinite spin if the caller
+        # mis-sized the table; ``hashmap_unique`` sizes for load factor 0.3
+        # so this guard is purely defensive.
+        probes += 1
+
+    # Sanity check: every key must have either claimed a slot or matched an
+    # existing duplicate. Surfaces a device-side assert if a future caller
+    # bypasses the wrapper and supplies an undersized table.
+    tl.device_assert(tl.max(active) == 0, "hashmap_unique: hashmap full -- caller mis-sized the table")
 
     tl.store(results_ptr + idx, found_idx, mask=mask)
+    # A lane is canonical iff its final found_idx is its own idx (i.e. it
+    # successfully inserted and was not preempted by a matching prior key).
+    tl.store(is_canonical_ptr + idx, (found_idx == idx).to(tl.int8), mask=mask)
 
 
 def hashmap_build(keys: Tensor) -> Tensor:
@@ -293,9 +332,10 @@ def hashmap_build(keys: Tensor) -> Tensor:
         See `hashmap_lookup` for querying the hash map.
         Use `hashmap_build_lookup` for a combined build and lookup operation.
     """
-    # Determine hash map size (next power of two greater than 2x number of elements)
+    # Determine hash map size
     n_keys = keys.shape[0]
-    hashmap_size = triton.next_power_of_2(n_keys * 2)
+    hashmap_size = triton.next_power_of_2(int(n_keys / HASHMAP_LOAD_FACTOR))
+    assert hashmap_size <= (1 << 30), "Hash map size exceeds 2^30, which is the limit for our 32-bit implementation."
 
     # Pad keys to a byte width that is a power of two in int32 words.
     keys = keys.flatten(1).contiguous().view(torch.uint8)
@@ -313,7 +353,7 @@ def hashmap_build(keys: Tensor) -> Tensor:
         keys_ptr=keys_i32,
         n_keys=n_keys,
         D=D_32,
-        BLOCK_SIZE=BLOCK_SIZE,
+        BLOCK_SIZE=BLOCK_SIZE
     )
 
     return hashmap
@@ -387,8 +427,9 @@ def hashmap_build_lookup(keys: Tensor, queries: Tensor) -> Tensor:
     n_keys = keys.shape[0]
     n_queries = queries.shape[0]
 
-    # Determine hash map size (next power of two greater than 2x number of elements)
-    hashmap_size = triton.next_power_of_2(n_keys * 2)
+    # Determine hash map size
+    hashmap_size = triton.next_power_of_2(int(n_keys / HASHMAP_LOAD_FACTOR))
+    assert hashmap_size <= (1 << 30), "Hash map size exceeds 2^30, which is the limit for our 32-bit implementation."
 
     # Pad keys and queries to a byte width that is a power of two in int32 words.
     keys = keys.flatten(1).contiguous().view(torch.uint8)
@@ -463,7 +504,8 @@ def hashmap_unique(
             return returns[0]
         return returns
 
-    hashmap_size = triton.next_power_of_2(n_keys * 2)
+    hashmap_size = triton.next_power_of_2(int(n_keys / HASHMAP_LOAD_FACTOR))
+    assert hashmap_size <= (1 << 30), "Hash map size exceeds 2^30, which is the limit for our 32-bit implementation."
 
     keys_bytes = keys.flatten(1).contiguous().view(torch.uint8)
     D_32 = triton.next_power_of_2(triton.cdiv(keys_bytes.shape[1], 4))
@@ -471,6 +513,7 @@ def hashmap_unique(
 
     hashmap = torch.full((hashmap_size,), -1, dtype=torch.int32, device=keys.device)
     indices = torch.empty((n_keys,), dtype=torch.int32, device=keys.device)
+    is_canonical = torch.empty((n_keys,), dtype=torch.bool, device=keys.device)
 
     BLOCK_SIZE = 64
     grid = (triton.cdiv(n_keys, BLOCK_SIZE),)
@@ -479,15 +522,15 @@ def hashmap_unique(
         hashmap_size=hashmap_size,
         keys_ptr=keys_i32,
         results_ptr=indices,
+        is_canonical_ptr=is_canonical,
         n_keys=n_keys,
         D=D_32,
         BLOCK_SIZE=BLOCK_SIZE,
     )
 
-    is_canonical = indices == torch.arange(n_keys, device=keys.device, dtype=indices.dtype)
-    unique_indices = is_canonical.nonzero(as_tuple=True)[0]
+    unique_indices = is_canonical.nonzero(as_tuple=True)[0].to(torch.int32)
     num_uniques = unique_indices.shape[0]
-    unique_keys = keys.index_select(0, unique_indices)
+    unique_keys = keys[unique_indices]
 
     returns = (unique_keys,)
 
@@ -495,9 +538,8 @@ def hashmap_unique(
         returns += (unique_indices,)
 
     if return_inverse:
-        inverse_dtype = torch.int64 if num_uniques >= 2 ** 31 else torch.int32
-        unique_inverse = torch.empty(n_keys, dtype=inverse_dtype, device=keys.device)
-        unique_inverse[unique_indices] = torch.arange(num_uniques, device=keys.device, dtype=inverse_dtype)
+        unique_inverse = torch.empty(n_keys, dtype=torch.int32, device=keys.device)
+        unique_inverse[unique_indices] = torch.arange(num_uniques, device=keys.device, dtype=torch.int32)
         unique_inverse = unique_inverse[indices]
         returns += (unique_inverse,)
 

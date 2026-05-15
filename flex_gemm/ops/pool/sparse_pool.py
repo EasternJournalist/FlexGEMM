@@ -87,7 +87,7 @@ def sparse_pool(
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
-            shape=shape,
+            input_shape=shape,
             output_shape=output_shape,
         )
         output_coords = neighbor_cache.output_coords

@@ -100,7 +100,7 @@ def test_sparse_pool_breakdown(cfg):
                 coords, None,
                 submanifold=False,
                 kernel_size=k, stride=s, padding=p,
-                shape=shape,
+                input_shape=shape,
             )
         ms_build = _time_cuda_ms(build_cache)
         rows.append(("(a) build_neighbor_cache  [out_coords + fwd/bwd nm]", ms_build))

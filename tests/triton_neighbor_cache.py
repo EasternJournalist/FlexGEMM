@@ -7,15 +7,17 @@ import torch
 
 from flex_gemm import kernels as _kernels
 from flex_gemm.kernels.triton.neighbor_cache import (
-    transpose_neighbor_map_torch,
     transpose_neighbor_map,
     build_neighbor_map_from_kernel_delta,
     build_neighbor_map_from_kernel_size_dilation,
-    get_output_coords_kernel_size_dilation_torch,
     get_output_coords_kernel_size_dilation,
-    get_output_coords_kernel_delta_torch,
     get_output_coords_kernel_delta,
 )
+from flex_gemm.kernels.triton.neighbor_cache.output_coords import (
+    get_output_coords_kernel_size_dilation_torch, 
+    get_output_coords_kernel_delta_torch
+)
+from flex_gemm.kernels.triton.neighbor_cache.neighbor_map import transpose_neighbor_map_torch
 from flex_gemm.ops.utils import make_conv_kernel_delta, init_hashmap
 from utils import sphere_coords
 
@@ -229,7 +231,7 @@ def test_neighbor_map_triton_dense_speed_benchmark() -> None:
 @pytest.mark.skipif(os.getenv("RUN_BENCHMARKS") != "1", reason="Set RUN_BENCHMARKS=1 to run benchmark tests")
 @pytest.mark.parametrize("method", [
     "kernel_size_dilation",
-    "kernel_delta",
+    # "kernel_delta",
 ])
 @pytest.mark.parametrize("dtype", [
     torch.int16, 
@@ -485,12 +487,14 @@ def test_get_output_coords_kernel_size_dilation_matches_torch(
 
     # Reference: use a very wide boundary when boundary is None.
     ref_boundary = boundary if boundary is not None else ((-32768, 32767),) * D
-    ref_coords, _ref_fwd, ref_bwd = get_output_coords_kernel_size_dilation_torch(
+    ref_coords, ref_bwd = get_output_coords_kernel_size_dilation_torch(
         coords, kernel_size, stride=stride, offset=offset, dilation=dilation, boundary=ref_boundary
     )
-    tri_coords, tri_fwd, tri_bwd = get_output_coords_kernel_size_dilation(
+    _ref_fwd = transpose_neighbor_map_torch(ref_bwd, ref_coords.shape[0])
+    tri_coords, tri_bwd = get_output_coords_kernel_size_dilation(
         coords, kernel_size, stride=stride, dilation=dilation, offset=offset, boundary=boundary
     )
+    tri_fwd = transpose_neighbor_map(tri_bwd, tri_coords.shape[0])
 
     # 1) Same set of unique output coords (order may differ).
     ref_s = torch.unique(_sorted_coords(ref_coords.to(torch.int32)), dim=0)
@@ -566,10 +570,11 @@ def test_get_output_coords_kernel_size_dilation_matches_torch(
         cuda_s = torch.unique(_sorted_coords(cuda_out_xyz[in_bounds]), dim=0)
         # Re-derive the Triton coord set under the same fixed-shape boundary.
         _, _, _ = tri_coords, tri_fwd, tri_bwd  # silence unused warnings
-        tri_coords_fix, tri_fwd_fix, tri_bwd_fix = get_output_coords_kernel_size_dilation(
+        tri_coords_fix, tri_bwd_fix = get_output_coords_kernel_size_dilation(
             coords, kernel_size, stride=stride, dilation=dilation, offset=offset,
             boundary=((0, Wo), (0, Ho), (0, Do)),
         )
+        tri_fwd_fix = transpose_neighbor_map(tri_bwd_fix, tri_coords_fix.shape[0])
         tri_s = torch.unique(_sorted_coords(tri_coords_fix.to(torch.int32)), dim=0)
         assert cuda_s.shape == tri_s.shape and (cuda_s == tri_s).all(), (
             f"[{tag}] cuda vs triton output coord set mismatch"
@@ -619,14 +624,12 @@ def test_get_output_coords_kernel_size_dilation_speed_benchmark(
     triton_ms = _time_cuda_ms(
         lambda: get_output_coords_kernel_size_dilation(
             coords, kernel_size, stride=stride, dilation=dilation, offset=offset, boundary=boundary,
-            return_neighbor_maps=False,
         ),
         warmup=3,
         iters=10,
     )
     M = get_output_coords_kernel_size_dilation(
         coords, kernel_size, stride=stride, dilation=dilation, offset=offset, boundary=boundary,
-        return_neighbor_maps=False,
     )[0].shape[0]
 
     cuda_str = ""
@@ -646,7 +649,6 @@ def test_get_output_coords_kernel_size_dilation_speed_benchmark(
         Hin = int(coords4[:, 2].max().item()) + 1
         Din = int(coords4[:, 3].max().item()) + 1
 
-        # Match `return_neighbor_maps=False`: time only the output-coord build,
         # without the separate neighbour-map call.
         def _cuda_run():
             return _kernels.cuda.hashmap_build_sparse_conv_out_coords(
@@ -707,12 +709,13 @@ def test_get_output_coords_kernel_delta_matches_torch(
     )
 
     ref_boundary = boundary if boundary is not None else ((-32768, 32767),) * D
-    ref_coords, _ref_fwd, ref_bwd = get_output_coords_kernel_delta_torch(
+    ref_coords, ref_bwd = get_output_coords_kernel_delta_torch(
         coords, delta, stride=stride, offset=offset, boundary=ref_boundary,
     )
-    tri_coords, tri_fwd, tri_bwd = get_output_coords_kernel_delta(
+    tri_coords, tri_bwd = get_output_coords_kernel_delta(
         coords, delta, stride=stride, offset=offset, boundary=boundary,
     )
+    tri_fwd = transpose_neighbor_map(tri_bwd, tri_coords.shape[0])
 
     # 1) Same set of unique output coords.
     ref_s = torch.unique(_sorted_coords(ref_coords.to(torch.int32)), dim=0)
