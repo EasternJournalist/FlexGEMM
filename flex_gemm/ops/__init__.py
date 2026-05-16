@@ -1,3 +1,7 @@
+from .index_cache import (
+    IndexCache,
+    IndexCacheT,
+)
 from .neighbor_cache import (
     NeighborCache,
     NeighborCacheT,
@@ -13,7 +17,7 @@ from .spconv.sparse_conv_transpose import (
     sparse_conv_transpose,
 )
 from .sample.grid_sample import (
-    sparse_grid_sample_3d,
+    sparse_grid_sample,
 )
 from .pool.submanifold_pool import (
     submanifold_pool,

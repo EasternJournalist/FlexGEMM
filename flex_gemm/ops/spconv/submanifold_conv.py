@@ -120,8 +120,6 @@ def submanifold_conv(
             neighbor_cache.assert_match(
                 input_coords=coords,
                 output_coords=coords,
-                kernel_size=kernel_size,
-                dilation=dilation,
             )
         weight_v = weight.flatten(1, -2)
     else:
@@ -143,8 +141,6 @@ def submanifold_conv(
             neighbor_cache.assert_match(
                 input_coords=coords,
                 output_coords=coords,
-                kernel_delta=kernel_delta,
-                symmetric=symmetric,
             )
         weight_v = weight
 

@@ -12,5 +12,5 @@ from . import nn
 from .ops import (
     submanifold_conv,
     sparse_conv,
-    sparse_grid_sample_3d
+    sparse_grid_sample,
 )

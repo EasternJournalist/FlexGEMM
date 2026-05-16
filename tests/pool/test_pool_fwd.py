@@ -128,8 +128,8 @@ def test_submanifold_pool_speed(cfg):
                 )
                 # Force lazy segments to materialize so the timed iters
                 # measure only the segment_reduce kernel.
-                _ = nc.fwd_neighbor_seg_indices
-                _ = nc.fwd_neighbor_seg_offsets
+                _ = nc.fwd_seg_indices
+                _ = nc.fwd_seg_offsets
                 ms = _time_cuda_ms(
                     lambda kk=k, rr=reduce, c=nc: flex_gemm.ops.submanifold_pool(
                         feats, coords, kernel_size=kk, reduce=rr, neighbor_cache=c,
@@ -186,8 +186,8 @@ def test_sparse_pool_speed(cfg):
                     feats, coords, shape,
                     kernel_size=k, stride=s, padding=p, reduce=reduce,
                 )
-                _ = nc.fwd_neighbor_seg_indices
-                _ = nc.fwd_neighbor_seg_offsets
+                _ = nc.fwd_seg_indices
+                _ = nc.fwd_seg_offsets
                 ms = _time_cuda_ms(
                     lambda kk=k, ss=s, pp=p, rr=reduce,
                            oc=out_coords, osh=out_shape, c=nc:

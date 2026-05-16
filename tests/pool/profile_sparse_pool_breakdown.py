@@ -2,7 +2,7 @@
 
 Splits the cold-path cost of ``sparse_pool`` into:
   (a) ``build_neighbor_cache`` only — i.e. output_coords + fwd/bwd nm.
-  (b) Materializing ``fwd_neighbor_seg_indices`` / ``fwd_neighbor_seg_offsets``
+  (b) Materializing ``fwd_seg_indices`` / ``fwd_seg_offsets``
       (= segment construction from the neighbor map).
   (c) ``index_segment_reduce`` itself.
 
@@ -81,7 +81,7 @@ def _print_table(title: str, num_points: int, rows: list[tuple[str, float]]):
 
 def _build_segments(nc) -> tuple[torch.Tensor, torch.Tensor]:
     """Force materialization of (seg_indices, seg_offsets)."""
-    return nc.fwd_neighbor_seg_indices, nc.fwd_neighbor_seg_offsets
+    return nc.fwd_seg_indices, nc.fwd_seg_offsets
 
 
 @requires_cuda
@@ -112,12 +112,12 @@ def test_sparse_pool_breakdown(cfg):
         # Make sure neighbor_map is already there (it is, build path stores it).
         def seg_only(c=nc_for_seg):
             # Drop any cached segment outputs to force re-compute.
-            for attr in ('_fwd_neighbor_seg_indices', '_fwd_neighbor_seg_offsets'):
+            for attr in ('_fwd_seg_indices', '_fwd_seg_offsets'):
                 if hasattr(c, attr):
                     delattr(c, attr)
             return _build_segments(c)
         ms_seg = _time_cuda_ms(seg_only)
-        rows.append(("(b) materialize fwd_neighbor_seg_{indices,offsets}", ms_seg))
+        rows.append(("(b) materialize fwd_seg_{indices,offsets}", ms_seg))
 
         # (c) index_segment_reduce given segments.
         seg_indices, seg_offsets = _build_segments(nc_for_seg)

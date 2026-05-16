@@ -38,7 +38,7 @@ from torch import Tensor
 from .. import config
 from .. import kernels
 from .utils import make_conv_kernel_delta, init_hashmap, lookup_pytorch
-from flex_gemm.kernels.triton.utils import _lengths_to_offsets
+from .index_cache import IndexCache, IndexCacheT, _INDEX_CACHE_INTERNAL_TOKEN
 from . import spconv
 
 __all__ = ["NeighborCache", "NeighborCacheT", "build_neighbor_cache"]
@@ -48,60 +48,38 @@ __all__ = ["NeighborCache", "NeighborCacheT", "build_neighbor_cache"]
 # NeighborCache
 # ====================================================================== #
 
-class NeighborCache:
-    """Lazy fwd / bwd neighbor-map cache + topology container.
+# Sentinel that authorizes constructing a NeighborCacheT. Direct
+# instantiation is disallowed — legitimate entry points are
+# :attr:`NeighborCache.T` / :meth:`NeighborCache.transpose` and the
+# ``transpose=True`` branch of :func:`build_neighbor_cache` (which routes
+# through ``NeighborCache.T``).
+_NCT_INTERNAL_TOKEN: Final = object()
 
-    The cache is the canonical "everything about this conv/pool's index
-    structure" object: it knows both the topology (``input_coords``,
-    ``output_coords``, kernel parameterization, strides…) and the derived
-    indexing tensors (forward / backward neighbor maps and their
-    post-processing artifacts).
 
-    Topology attributes are written by :func:`build_neighbor_cache` and may
-    be ``None`` on caches built directly without one or another field
-    (e.g. ``kernel_size`` is ``None`` on a ``kernel_delta`` cache and vice
-    versa). :meth:`assert_match` skips comparisons whose stored value is
-    ``None``.
+class NeighborCache(IndexCache):
+    """Lazy fwd / bwd neighbor-map cache for sparse convolutions.
+
+    Specializes :class:`flex_gemm.ops.IndexCache` for the convolution case:
+    the ``(M, V)`` neighbor map is an ``index_map`` whose ``V`` columns
+    additionally carry kernel-slot semantics (column ``v`` corresponds to
+    the ``v``-th kernel offset). Because ``V`` is constant across both
+    directions, the cache uses the much cheaper ``transpose_neighbor_map``
+    Triton kernel for fwd ↔ bwd derivation instead of the generic
+    ``scatter_to_segment``-based path inherited from :class:`IndexCache`.
+
+    The cache deliberately does **not** remember the kernel parameters
+    (``kernel_size`` / ``kernel_delta`` / ``stride`` / ``dilation`` /
+    ``offset`` / ``padding``) it was built from. Ops always re-receive
+    those from the caller and trust the cache to match — passing a stale
+    cache is the caller's responsibility. Only ``input_coords`` /
+    ``output_coords`` / ``is_transposed`` are checked.
+
+    Storage keys are the same as :class:`IndexCache`
+    (``_fwd_index_map`` / ``_fwd_seg_indices`` / …); the
+    ``fwd_neighbor_map`` / ``bwd_neighbor_map`` etc. properties are kept
+    as backward-compatible aliases for the corresponding
+    ``*_index_map`` accessors.
     """
-
-    # --- topology --------------------------------------------------------
-    input_coords: Tensor
-    output_coords: Tensor
-    input_shape: torch.Size | None
-    output_shape: torch.Size | None
-    kernel_size: tuple[int, ...] | None
-    kernel_delta: Tensor | None
-    stride: tuple[int, ...] | None
-    dilation: tuple[int, ...] | None
-    padding: tuple[int, ...] | None
-    offset: tuple[int, ...] | None
-    symmetric: bool
-    """ When True, input/output coordinates coincide and kernel offsets are
-    centrally symmetric, so the backward-input pass can reuse the forward
-    cache with the weight flipped along the V dimension.
-    """
-
-    num_input_coords: int
-    "Number of input coordinates (rows of the bwd neighbor map)."
-
-    num_output_coords: int
-    "Number of output coordinates (rows of the fwd neighbor map)."
-
-    # Direction flag. ``False`` for caches built by :func:`build_neighbor_cache`.
-    # ``True`` only on :class:`NeighborCacheT` views. See ``NeighborCache.T``
-    # for the semantics — in the transposed view the meaning of input vs.
-    # output, and of fwd vs. bwd buffers, is swapped, but the kernel topology
-    # (kernel_size / kernel_delta / stride / dilation / offset) is kept
-    # **as-is** because it describes the edge labels of the same underlying
-    # adjacency graph. The ``is_transposed`` flag is what tells a consumer
-    # which direction the cache represents.
-    is_transposed: ClassVar[bool] = False
-
-    # Signature fields used by ``assert_match``. ``padding`` is intentionally
-    # absent: :func:`build_neighbor_cache` converts ``padding`` to a centered
-    # ``offset`` up-front, so only ``offset`` participates in matching.
-    _SIG_TENSOR_KEYS: ClassVar[frozenset] = frozenset({"input_coords", "output_coords", "kernel_delta"})
-    _SIG_TUPLE_KEYS: ClassVar[frozenset] = frozenset({"kernel_size", "stride", "dilation", "offset"})
 
     def __init__(
         self,
@@ -114,144 +92,67 @@ class NeighborCache:
         output_coords: Tensor,
         input_shape: torch.Size | None = None,
         output_shape: torch.Size | None = None,
-        kernel_size: tuple[int, ...] | None = None,
-        kernel_delta: Tensor | None = None,
-        stride: tuple[int, ...] | None = None,
-        dilation: tuple[int, ...] | None = None,
-        offset: tuple[int, ...] | None = None,
         symmetric: bool = False,
-        num_input_coords: int | None = None,
-        num_output_coords: int | None = None,
     ):
-        assert fwd_neighbor_map is not None or bwd_neighbor_map is not None, \
-            "At least one of forward/backward neighbor map should be provided"
-
-        # Topology — stash directly as attributes so callers can read them.
-        self.input_coords = input_coords
-        self.output_coords = output_coords
-        self.input_shape = input_shape
-        self.output_shape = output_shape
-        self.kernel_size = tuple(kernel_size) if kernel_size is not None else None
-        self.kernel_delta = kernel_delta
-        self.stride = tuple(stride) if stride is not None else None
-        self.dilation = tuple(dilation) if dilation is not None else None
-        self.offset = tuple(offset) if offset is not None else None
-        self.symmetric = bool(symmetric)
-
-        # Sizes — default from coords if not provided.
-        if num_input_coords is None:
-            num_input_coords = input_coords.shape[0]
-        if num_output_coords is None:
-            num_output_coords = output_coords.shape[0]
-        if symmetric:
-            assert num_input_coords == num_output_coords, \
-                "symmetric=True implies num_input_coords == num_output_coords"
-        self.num_input_coords = num_input_coords
-        self.num_output_coords = num_output_coords
-
-        if fwd_neighbor_map is not None:
-            assert fwd_neighbor_map.shape[0] == self.num_output_coords, \
-                f"fwd_neighbor_map.shape[0]={fwd_neighbor_map.shape[0]} but num_output_coords={self.num_output_coords}"
-            self['_fwd_neighbor_map'] = fwd_neighbor_map
-        if bwd_neighbor_map is not None:
-            assert bwd_neighbor_map.shape[0] == self.num_input_coords, \
-                f"bwd_neighbor_map.shape[0]={bwd_neighbor_map.shape[0]} but num_input_coords={self.num_input_coords}"
-            self['_bwd_neighbor_map'] = bwd_neighbor_map
-
-    # ------------------------------------------------------------------ #
-    # Signature validation
-    # ------------------------------------------------------------------ #
-    def assert_match(
-        self,
-        *,
-        input_coords: Tensor | None = None,
-        output_coords: Tensor | None = None,
-        kernel_size: tuple[int, ...] | None = None,
-        kernel_delta: Tensor | None = None,
-        stride: tuple[int, ...] | None = None,
-        dilation: tuple[int, ...] | None = None,
-        offset: tuple[int, ...] | None = None,
-        symmetric: bool | None = None,
-        is_transposed: bool | None = None,
-    ) -> None:
-        """Verify the cache was built from the given inputs.
-
-        Any argument left as ``None`` is skipped. A topology attribute that
-        is ``None`` on the cache (i.e. wasn't recorded) is also skipped — only
-        recorded-vs-provided pairs are compared.
-
-        ``padding`` is *not* part of the signature: :func:`build_neighbor_cache`
-        converts it to a centered ``offset`` up-front, so callers that use
-        the (kernel_size, padding) parameterization must do the same
-        conversion before invoking this method (or pass ``offset`` directly).
-
-        Tensor identity is checked first; if the cached signature tensor is a
-        different object, we fall back to ``(shape, dtype, device, data_ptr)``
-        equality so that views over the same storage still match.
-
-        ``is_transposed`` distinguishes forward caches from transposed-view
-        caches (:class:`NeighborCacheT`). Topology fields (kernel_size,
-        stride, …) carry the same numerical values on the view but their
-        *meaning* is bound to the direction, so consumers that care about
-        forward vs. transposed semantics should pass an explicit
-        ``is_transposed`` to ``assert_match``.
-
-        To keep this check meaningful, callers should materialize default
-        parameter values (e.g. ``stride=(1, 1, 1)`` instead of ``stride=None``)
-        before invoking either :func:`build_neighbor_cache` or
-        ``assert_match`` so the two paths produce identical signatures.
-        """
-        provided = dict(
+        super().__init__(
+            fwd_index_map=fwd_neighbor_map,
+            bwd_index_map=bwd_neighbor_map,
             input_coords=input_coords,
             output_coords=output_coords,
-            kernel_size=kernel_size,
-            kernel_delta=kernel_delta,
-            stride=stride,
-            dilation=dilation,
-            offset=offset,
+            input_shape=input_shape,
+            output_shape=output_shape,
+            symmetric=symmetric,
         )
-        for name, expected in provided.items():
-            if expected is None:
-                continue
-            stored = getattr(self, name, None)
-            if stored is None:
-                continue
-            if name in self._SIG_TENSOR_KEYS:
-                if expected is stored:
-                    continue
-                ok = (
-                    expected.shape == stored.shape
-                    and expected.dtype == stored.dtype
-                    and expected.device == stored.device
-                    and expected.data_ptr() == stored.data_ptr()
-                )
-                assert ok, f"NeighborCache signature mismatch on {name!r}"
+
+    # ------------------------------------------------------------------ #
+    # neighbor_map aliases — index_map columns carry kernel-slot semantics
+    # for conv consumers; the storage / properties live on IndexCache.
+    # ------------------------------------------------------------------ #
+    @property
+    def fwd_neighbor_map(self) -> Tensor:
+        return self.fwd_index_map
+
+    @property
+    def bwd_neighbor_map(self) -> Tensor:
+        return self.bwd_index_map
+
+    @property
+    def fwd_neighbor_mask(self) -> Tensor:
+        return self.fwd_index_mask
+
+    @property
+    def bwd_neighbor_mask(self) -> Tensor:
+        return self.bwd_index_mask
+
+    # ------------------------------------------------------------------ #
+    # fwd / bwd index_map overrides: V is constant across directions, so
+    # use the dedicated ``transpose_neighbor_map`` kernel instead of the
+    # generic scatter-based path inherited from IndexCache.
+    # ------------------------------------------------------------------ #
+    @property
+    def fwd_index_map(self) -> Tensor:
+        if '_fwd_index_map' not in self:
+            if self.symmetric:
+                self['_fwd_index_map'] = self.bwd_index_map.flip(1)
             else:
-                assert tuple(expected) == stored, (
-                    f"NeighborCache signature mismatch on {name!r}: cache was "
-                    f"built with {stored} but op was called with {tuple(expected)}"
+                self['_fwd_index_map'] = kernels.triton.transpose_neighbor_map(
+                    self.bwd_index_map, self.num_output_coords,
                 )
-        if symmetric is not None:
-            assert bool(symmetric) == bool(self.symmetric), \
-                f"NeighborCache symmetric mismatch: cache={self.symmetric}, op={symmetric}"
-        if is_transposed is not None:
-            assert bool(is_transposed) == bool(self.is_transposed), \
-                f"NeighborCache is_transposed mismatch: cache={self.is_transposed}, op={is_transposed}"
+        return self['_fwd_index_map']
+
+    @property
+    def bwd_index_map(self) -> Tensor:
+        if '_bwd_index_map' not in self:
+            if self.symmetric:
+                self['_bwd_index_map'] = self.fwd_index_map.flip(1)
+            else:
+                self['_bwd_index_map'] = kernels.triton.transpose_neighbor_map(
+                    self.fwd_index_map, self.num_input_coords,
+                )
+        return self['_bwd_index_map']
 
     # ------------------------------------------------------------------ #
-    # Dict-like access for cached tensors
-    # ------------------------------------------------------------------ #
-    def __getitem__(self, key):
-        return getattr(self, key)
-
-    def __setitem__(self, key, value):
-        setattr(self, key, value)
-
-    def __contains__(self, key):
-        return hasattr(self, key)
-
-    # ------------------------------------------------------------------ #
-    # Forward post-processing
+    # Conv-specific forward post-processing
     # ------------------------------------------------------------------ #
     def _fwd_post_process_gray_code_sort(self) -> None:
         self['_fwd_gray_code'], self['_fwd_sorted_idx'] = \
@@ -264,28 +165,6 @@ class NeighborCache:
     def _fwd_post_process_valid_kernel(self, block_size: int) -> None:
         self[f'_fwd_valid_kernel_{block_size}'], self[f'_fwd_valid_kernel_seg_{block_size}'] = \
             kernels.triton.neighbor_map_valid_kernel(self['_fwd_gray_code'], self['_fwd_sorted_idx'], block_size)
-
-    def _fwd_post_process_neighbor_seg(self) -> None:
-        nm, nm_mask = self.fwd_neighbor_map, self.fwd_neighbor_mask
-        seg_lengths = nm_mask.sum(dim=1, dtype=torch.int32)
-        seg_offsets = _lengths_to_offsets(seg_lengths)
-        seg_indices = nm[nm_mask]
-        self['_fwd_neighbor_seg_indices'], self['_fwd_neighbor_seg_offsets'] = seg_indices, seg_offsets
-
-    @property
-    def fwd_neighbor_map(self) -> Tensor:
-        if '_fwd_neighbor_map' not in self:
-            if self.symmetric:
-                self['_fwd_neighbor_map'] = self.bwd_neighbor_map.flip(1)
-            else:
-                self['_fwd_neighbor_map'] = kernels.triton.transpose_neighbor_map(self.bwd_neighbor_map, self.num_output_coords)
-        return self['_fwd_neighbor_map']
-
-    @property
-    def fwd_neighbor_mask(self) -> Tensor:
-        if '_fwd_neighbor_mask' not in self:
-            self['_fwd_neighbor_mask'] = self.fwd_neighbor_map.view(dtype=torch.int32) != -1
-        return self['_fwd_neighbor_mask']
 
     @property
     def fwd_gray_code(self) -> Tensor:
@@ -327,28 +206,8 @@ class NeighborCache:
             self._fwd_post_process_valid_kernel(block_size)
         return self[f'_fwd_valid_kernel_seg_{block_size}']
 
-    @property
-    def fwd_neighbor_seg_indices(self) -> Tensor:
-        "Segmented indices for the forward neighbor map. Shape (nnz,) indices range from 0 to N-1."
-        if '_fwd_neighbor_seg_indices' not in self:
-            if self.symmetric and '_bwd_neighbor_seg_indices' in self:
-                self['_fwd_neighbor_seg_indices'] = self['_bwd_neighbor_seg_indices']
-            else:
-                self._fwd_post_process_neighbor_seg()
-        return self['_fwd_neighbor_seg_indices']
-
-    @property
-    def fwd_neighbor_seg_offsets(self) -> Tensor:
-        "Segment offsets for the forward neighbor map. Shape (M + 1)"
-        if '_fwd_neighbor_seg_offsets' not in self:
-            if self.symmetric and '_bwd_neighbor_seg_offsets' in self:
-                self['_fwd_neighbor_seg_offsets'] = self['_bwd_neighbor_seg_offsets']
-            else:
-                self._fwd_post_process_neighbor_seg()
-        return self['_fwd_neighbor_seg_offsets']
-
     # ------------------------------------------------------------------ #
-    # Backward post-processing
+    # Conv-specific backward post-processing
     # ------------------------------------------------------------------ #
     def _bwd_post_process_gray_code_sort(self) -> None:
         self['_bwd_gray_code'], self['_bwd_sorted_idx'] = \
@@ -361,28 +220,6 @@ class NeighborCache:
     def _bwd_post_process_valid_kernel(self, block_size: int) -> None:
         self[f'_bwd_valid_kernel_{block_size}'], self[f'_bwd_valid_kernel_seg_{block_size}'] = \
             kernels.triton.neighbor_map_valid_kernel(self.bwd_gray_code, self.bwd_sorted_idx, block_size)
-    
-    def _bwd_post_process_neighbor_seg(self) -> None:
-        nm, nm_mask = self.bwd_neighbor_map, self.bwd_neighbor_mask
-        seg_lengths = nm_mask.sum(dim=1, dtype=torch.int32)
-        seg_offsets = _lengths_to_offsets(seg_lengths)
-        seg_indices = nm[nm_mask]
-        self['_bwd_neighbor_seg_indices'], self['_bwd_neighbor_seg_offsets'] = seg_indices, seg_offsets
-    
-    @property
-    def bwd_neighbor_map(self) -> Tensor:
-        if '_bwd_neighbor_map' not in self:
-            if self.symmetric:
-                self['_bwd_neighbor_map'] = self.fwd_neighbor_map.flip(1)
-            else:
-                self['_bwd_neighbor_map'] = kernels.triton.transpose_neighbor_map(self.fwd_neighbor_map, self.num_input_coords)
-        return self['_bwd_neighbor_map']
-
-    @property
-    def bwd_neighbor_mask(self) -> Tensor:
-        if '_bwd_neighbor_mask' not in self:
-            self['_bwd_neighbor_mask'] = self.bwd_neighbor_map.view(dtype=torch.int32) != -1
-        return self['_bwd_neighbor_mask']
 
     @property
     def bwd_gray_code(self) -> Tensor:
@@ -418,24 +255,6 @@ class NeighborCache:
             self._bwd_post_process_valid_kernel(block_size)
         return self[f'_bwd_valid_kernel_seg_{block_size}']
 
-    @property
-    def bwd_neighbor_seg_indices(self) -> Tensor:
-        if '_bwd_neighbor_seg_indices' not in self:
-            if self.symmetric and '_fwd_neighbor_seg_indices' in self:
-                self['_bwd_neighbor_seg_indices'] = self['_fwd_neighbor_seg_indices']
-            else:
-                self._bwd_post_process_neighbor_seg()
-        return self['_bwd_neighbor_seg_indices']
-    
-    @property
-    def bwd_neighbor_seg_offsets(self) -> Tensor:
-        if '_bwd_neighbor_seg_offsets' not in self:
-            if self.symmetric and '_fwd_neighbor_seg_offsets' in self:
-                self['_bwd_neighbor_seg_offsets'] = self['_fwd_neighbor_seg_offsets']
-            else:
-                self._bwd_post_process_neighbor_seg()
-        return self['_bwd_neighbor_seg_offsets']
-
     # ------------------------------------------------------------------ #
     # Transposed view
     # ------------------------------------------------------------------ #
@@ -443,13 +262,10 @@ class NeighborCache:
     def T(self) -> "NeighborCacheT":
         """Return a transposed view of this cache.
 
-        The view is a zero-copy wrapper: it holds only a reference to ``self``
-        and re-exposes ``input``/``output`` and ``fwd``/``bwd`` buffers with
-        their roles swapped. Any lazy-computed tensors materialized through
-        the view are stored back on the underlying cache, so further reads
-        from either side are cache hits.
-
-        See :class:`NeighborCacheT` for the precise swap rules.
+        Zero-copy: the view holds only a reference to ``self`` and re-exposes
+        ``input``/``output`` and ``fwd``/``bwd`` buffers with their roles
+        swapped. Lazy-computed tensors materialized through the view are
+        stored back on the underlying cache.
         """
         return NeighborCacheT(self, _token=_NCT_INTERNAL_TOKEN)
 
@@ -462,78 +278,37 @@ class NeighborCache:
 # NeighborCacheT  (transposed view)
 # ====================================================================== #
 
-# Sentinel that authorizes constructing a NeighborCacheT. Direct instantiation
-# is disallowed — the only legitimate entry points are ``NeighborCache.T`` and
-# ``NeighborCache.transpose()`` (which pass this token internally) and the
-# ``transpose=True`` path of :func:`build_neighbor_cache` (which routes through
-# ``NeighborCache.T`` after building the underlying forward cache).
-_NCT_INTERNAL_TOKEN: Final = object()
-
-
-def _swap_fwd_bwd_key(key: str) -> str:
-    """Translate a cached-buffer key between fwd/bwd namespaces.
-
-    Keys starting with ``_fwd_`` become ``_bwd_`` and vice versa; other
-    attribute names (topology fields, ``_original`` etc.) are returned
-    unchanged.
-    """
-    if key.startswith("_fwd_"):
-        return "_bwd_" + key[len("_fwd_"):]
-    if key.startswith("_bwd_"):
-        return "_fwd_" + key[len("_bwd_"):]
-    return key
-
-
-class NeighborCacheT(NeighborCache):
+class NeighborCacheT(IndexCacheT, NeighborCache):
     """Zero-copy transposed view of a :class:`NeighborCache`.
 
-    A neighbor cache is conceptually the set of triples
-    ``(i in [0, N), o in [0, M), e in [0, V))``, i.e. a sparse 0/1 tensor in
-    ``[N, M, V]``. ``fwd_neighbor_map`` and ``bwd_neighbor_map`` are two
-    serializations of the same triples. A *transpose* swaps the input and
-    output axes — the underlying triples are unchanged, but the roles of
-    ``fwd``/``bwd`` and of ``input``/``output`` flip.
-
-    This class never owns buffers: it holds a reference to the original
-    :class:`NeighborCache`, and every read/write is delegated to it with the
-    appropriate swap. Lazy-computed results therefore accumulate on the
-    underlying cache and are visible from either side.
+    The view re-exposes ``input``/``output`` coords and ``fwd``/``bwd``
+    buffers with their roles swapped. ``NeighborCache``'s ``*_neighbor_*``
+    alias properties (which forward to ``*_index_*`` on the base class)
+    automatically pick up the swap, so consumers see a fully transposed
+    neighbor cache with no extra plumbing.
 
     Swap rules:
 
     * ``input_coords`` ↔ ``output_coords``
     * ``num_input_coords`` ↔ ``num_output_coords``
     * ``input_shape`` ↔ ``output_shape``
-    * Every cached buffer keyed ``_fwd_*`` ↔ ``_bwd_*`` (neighbor maps,
+    * Every cached buffer keyed ``_fwd_*`` ↔ ``_bwd_*`` (index maps,
       masks, segments, gray codes, valid signals, valid kernels).
-    * Kernel topology fields (``kernel_size``, ``kernel_delta``, ``stride``,
-      ``dilation``, ``offset``, ``padding``) and ``symmetric`` are kept
-      **unchanged**: they describe the edge labels of the underlying
-      adjacency graph, which the transpose does not touch. The
-      ``is_transposed`` flag is what tells consumers which direction this
-      view represents.
+    * ``symmetric`` is unchanged (it's a property of the adjacency).
+    * ``is_transposed`` is ``True``.
 
-    Notes:
-        Because the topology fields are the same as the original's,
-        ``build_neighbor_cache`` together with a transposed view's topology
-        would *not* reproduce the view's neighbor maps — it would build the
-        original cache instead. A transposed cache can only be obtained
-        indirectly via :attr:`NeighborCache.T`. Consumers that care about
-        direction should pass an explicit ``is_transposed`` flag when
-        validating via :meth:`assert_match`.
-
-        ``T.T`` is the original :class:`NeighborCache` (not a doubly-wrapped
-        view).
+    ``T.T`` is the original :class:`NeighborCache` (not a doubly-wrapped
+    view). A transposed cache can only be obtained indirectly via
+    :attr:`NeighborCache.T` or :func:`build_neighbor_cache` with
+    ``transpose=True``.
     """
 
-    is_transposed: ClassVar[bool] = True
+    # MRO note: ``(IndexCacheT, NeighborCache)``. IndexCacheT first so its
+    # ``__init__`` / ``__getitem__`` / topology properties / ``T`` win;
+    # NeighborCache provides the ``fwd_neighbor_map`` etc. alias properties
+    # and the conv-specific gray_code / valid_signal / valid_kernel
+    # post-processing.
 
-    # ``NeighborCacheT`` deliberately does **not** call ``NeighborCache.__init__``:
-    # we want zero owned state besides the reference to ``_original``. The
-    # ``_token`` argument enforces that the only callers are the trusted
-    # accessors (:attr:`NeighborCache.T` / :meth:`NeighborCache.transpose`); user
-    # code wanting a transposed cache must go through those or through
-    # :func:`build_neighbor_cache` with ``transpose=True``.
     def __init__(self, original: "NeighborCache", *, _token: Any = None):
         assert _token is _NCT_INTERNAL_TOKEN, (
             "NeighborCacheT cannot be instantiated directly. Use "
@@ -542,90 +317,8 @@ class NeighborCacheT(NeighborCache):
         )
         assert not isinstance(original, NeighborCacheT), \
             "NeighborCacheT should wrap a NeighborCache, not another view"
-        # Use object.__setattr__ to bypass any future __setattr__ override.
-        object.__setattr__(self, "_original", original)
-
-    # ------------------------------------------------------------------ #
-    # Dict-like access — swap fwd/bwd keys, delegate to the original.
-    # ------------------------------------------------------------------ #
-    def __getitem__(self, key):
-        return self._original[_swap_fwd_bwd_key(key)]
-
-    def __setitem__(self, key, value):
-        self._original[_swap_fwd_bwd_key(key)] = value
-
-    def __contains__(self, key):
-        return _swap_fwd_bwd_key(key) in self._original
-
-    # ------------------------------------------------------------------ #
-    # Topology — swap input/output, pass everything else through.
-    # ------------------------------------------------------------------ #
-    @property
-    def input_coords(self) -> Tensor:
-        return self._original.output_coords
-
-    @property
-    def output_coords(self) -> Tensor:
-        return self._original.input_coords
-
-    @property
-    def num_input_coords(self) -> int:
-        return self._original.num_output_coords
-
-    @property
-    def num_output_coords(self) -> int:
-        return self._original.num_input_coords
-
-    @property
-    def input_shape(self) -> torch.Size | None:
-        return self._original.output_shape
-
-    @property
-    def output_shape(self) -> torch.Size | None:
-        return self._original.input_shape
-
-    # The remaining topology fields describe edge labels and are unchanged
-    # under transpose.
-    @property
-    def kernel_size(self) -> tuple[int, ...] | None:
-        return self._original.kernel_size
-
-    @property
-    def kernel_delta(self) -> Tensor | None:
-        return self._original.kernel_delta
-
-    @property
-    def stride(self) -> tuple[int, ...] | None:
-        return self._original.stride
-
-    @property
-    def dilation(self) -> tuple[int, ...] | None:
-        return self._original.dilation
-
-    @property
-    def offset(self) -> tuple[int, ...] | None:
-        return self._original.offset
-
-    @property
-    def padding(self) -> tuple[int, ...] | None:
-        return getattr(self._original, "padding", None)
-
-    @property
-    def symmetric(self) -> bool:
-        return self._original.symmetric
-
-    # ------------------------------------------------------------------ #
-    # Transpose inverse: ``T.T`` is the original cache, not a new view.
-    # ------------------------------------------------------------------ #
-    @property
-    def T(self) -> "NeighborCache":
-        return self._original
-
-    def transpose(self) -> "NeighborCache":
-        return self._original
-
-
-
+        # Hand off to IndexCacheT with its expected sentinel.
+        IndexCacheT.__init__(self, original, _token=_INDEX_CACHE_INTERNAL_TOKEN)
 
 # ====================================================================== #
 # build_neighbor_cache — overloads + dispatcher
@@ -1010,10 +703,6 @@ def _build_submanifold_kernel_size(
         output_coords=input_coords,
         input_shape=input_shape,
         output_shape=input_shape,
-        kernel_size=kernel_size,
-        stride=stride,
-        dilation=dilation,
-        offset=offset,
         symmetric=kernel_symmetric,
     )
 
@@ -1094,9 +783,6 @@ def _build_submanifold_kernel_delta(
         output_coords=input_coords,
         input_shape=input_shape,
         output_shape=input_shape,
-        kernel_delta=kernel_delta,
-        stride=stride,
-        offset=offset,
         symmetric=symmetric,
     )
 
@@ -1217,10 +903,6 @@ def _build_strided_kernel_size_auto(
             output_coords=output_coords,
             input_shape=input_shape,
             output_shape=output_shape,
-            kernel_size=kernel_size,
-            stride=stride,
-            dilation=dilation,
-            offset=offset_t,
             symmetric=False,
         )
     else:
@@ -1239,10 +921,6 @@ def _build_strided_kernel_size_auto(
             output_coords=input_coords,
             input_shape=output_shape,
             output_shape=input_shape,
-            kernel_size=kernel_size,
-            stride=stride,
-            dilation=dilation,
-            offset=offset_t,
             symmetric=False,
         )
         return underlying.T
@@ -1412,10 +1090,6 @@ def _build_strided_kernel_size_custom(
         output_coords=output_coords,
         input_shape=input_shape,
         output_shape=output_shape,
-        kernel_size=kernel_size,
-        stride=stride,
-        dilation=dilation,
-        offset=offset_t,
         symmetric=False,
     )
     return underlying.T if transposed else underlying
@@ -1469,9 +1143,6 @@ def _build_strided_kernel_delta_auto(
             output_coords=output_coords,
             input_shape=input_shape,
             output_shape=output_shape,
-            kernel_delta=kernel_delta,
-            stride=stride,
-            offset=offset_t,
             symmetric=False,
         )
     else:
@@ -1482,9 +1153,6 @@ def _build_strided_kernel_delta_auto(
             output_coords=input_coords,
             input_shape=output_shape,
             output_shape=input_shape,
-            kernel_delta=kernel_delta,
-            stride=stride,
-            offset=offset_t,
             symmetric=False,
         )
         return underlying.T
@@ -1561,9 +1229,6 @@ def _build_strided_kernel_delta_custom(
         output_coords=output_coords,
         input_shape=input_shape,
         output_shape=output_shape,
-        kernel_delta=kernel_delta,
-        stride=stride,
-        offset=offset_t,
         symmetric=False,
     )
     return underlying.T if transposed else underlying

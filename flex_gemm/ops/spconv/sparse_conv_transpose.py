@@ -155,9 +155,9 @@ def sparse_conv_transpose(
     """Dispatch on (kernel parameterization). See the two overloads above."""
     assert coords.is_contiguous(), "Coords should be contiguous"
 
-    # When a neighbor_cache is supplied, any topology argument left as ``None``
-    # is filled in from the cache. This mirrors ``sparse_conv``'s resolution
-    # order; the extra check is that the cache must be a transposed view.
+    # When a neighbor_cache is supplied, ``input_shape`` / ``output_shape`` /
+    # ``output_coords`` are filled in from it. Kernel topology is *not*
+    # stored on the cache — the caller must supply it on every call.
     if neighbor_cache is not None:
         assert neighbor_cache.is_transposed, (
             "sparse_conv_transpose requires a NeighborCacheT (got a forward "
@@ -166,24 +166,10 @@ def sparse_conv_transpose(
         )
         if output_coords is None:
             output_coords = neighbor_cache.output_coords
-        assert output_coords is not None, (
-            "output_coords could not be resolved: pass it explicitly, or supply "
-            "a neighbor_cache whose ``output_coords`` is populated."
-        )
         if output_shape is None:
             output_shape = neighbor_cache.output_shape
         if shape is None:
             shape = neighbor_cache.input_shape
-        if kernel_delta is None and neighbor_cache.kernel_delta is not None:
-            kernel_delta = neighbor_cache.kernel_delta
-        if stride is None:
-            stride = neighbor_cache.stride
-        if dilation is None:
-            dilation = neighbor_cache.dilation
-        if offset is None:
-            offset = neighbor_cache.offset
-        # Note: padding is converted to a centered offset before being stored
-        # on the cache, so we don't pull it from there.
 
     if kernel_delta is None:
         # kernel_size mode: weight is [Co, K1, ..., KDs, Ci]; infer kernel_size.
@@ -202,8 +188,6 @@ def sparse_conv_transpose(
             output_shape = _infer_transpose_output_shape(
                 shape, kernel_size, stride, dilation, padding
             )
-        # Centered-kernel offset for ``assert_match`` (the cache only stores offset).
-        match_offset = tuple(((k - 1) // 2) * d - p for k, d, p in zip(kernel_size, dilation, padding))
 
         if neighbor_cache is None:
             neighbor_cache = build_neighbor_cache(
@@ -223,10 +207,6 @@ def sparse_conv_transpose(
             neighbor_cache.assert_match(
                 input_coords=coords,
                 output_coords=output_coords,
-                kernel_size=kernel_size,
-                stride=stride,
-                dilation=dilation,
-                offset=match_offset,
                 is_transposed=True,
             )
         weight_v = weight.flatten(1, -2)
@@ -264,9 +244,6 @@ def sparse_conv_transpose(
             neighbor_cache.assert_match(
                 input_coords=coords,
                 output_coords=output_coords,
-                kernel_delta=kernel_delta,
-                stride=stride,
-                offset=offset,
                 is_transposed=True,
             )
         weight_v = weight

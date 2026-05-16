@@ -71,14 +71,12 @@ def submanifold_pool(
         neighbor_cache.assert_match(
             input_coords=input_coords,
             output_coords=input_coords,
-            kernel_size=kernel_size,
-            dilation=dilation,
         )
 
     output_feats = index_segment_reduce(
         feats, 
-        neighbor_cache.fwd_neighbor_seg_indices, 
-        neighbor_cache.fwd_neighbor_seg_offsets, 
+        neighbor_cache.fwd_seg_indices, 
+        neighbor_cache.fwd_seg_offsets, 
         reduce
     )
     # NOTE: not sure if convert to segment is faster than direct index_map_reduce:

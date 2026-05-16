@@ -113,31 +113,17 @@ def sparse_conv(
     """Dispatch on (kernel parameterization). See the two overloads above."""
     assert coords.is_contiguous(), "Coords should be contiguous"
 
-    # When a neighbor_cache is supplied, any topology argument left as ``None``
-    # is filled in from the cache. ``output_coords`` is special: it must be
-    # resolvable from either the argument or the cache, otherwise we have no
-    # output coordinates to return.
+    # When a neighbor_cache is supplied, ``input_shape`` / ``output_shape`` /
+    # ``output_coords`` are filled in from it. Kernel topology (kernel_size,
+    # stride, dilation, ...) is *not* stored on the cache — the caller must
+    # supply it on every call.
     if neighbor_cache is not None:
         if output_coords is None:
             output_coords = neighbor_cache.output_coords
-        assert output_coords is not None, (
-            "output_coords could not be resolved: pass it explicitly, or supply "
-            "a neighbor_cache whose ``output_coords`` is populated."
-        )
         if output_shape is None:
             output_shape = neighbor_cache.output_shape
         if shape is None:
             shape = neighbor_cache.input_shape
-        if kernel_delta is None and neighbor_cache.kernel_delta is not None:
-            kernel_delta = neighbor_cache.kernel_delta
-        if stride is None:
-            stride = neighbor_cache.stride
-        if dilation is None:
-            dilation = neighbor_cache.dilation
-        if offset is None:
-            offset = neighbor_cache.offset
-        # Note: padding is converted to a centered offset before being stored
-        # on the cache, so we don't pull it from there.
 
     if kernel_delta is None:
         # kernel_size mode: weight is [Co, K1, ..., KDs, Ci]; infer kernel_size.
@@ -149,8 +135,6 @@ def sparse_conv(
         assert len(stride) == D_spatial and len(dilation) == D_spatial and len(padding) == D_spatial, (
             "weight kernel shape / stride / dilation / padding must all have the same length."
         )
-        # Centered-kernel offset for ``assert_match`` (the cache only stores offset).
-        match_offset = tuple(((k - 1) // 2) * d - p for k, d, p in zip(kernel_size, dilation, padding))
 
         if neighbor_cache is None:
             neighbor_cache = build_neighbor_cache(
@@ -169,10 +153,6 @@ def sparse_conv(
             neighbor_cache.assert_match(
                 input_coords=coords,
                 output_coords=output_coords,
-                kernel_size=kernel_size,
-                stride=stride,
-                dilation=dilation,
-                offset=match_offset,
             )
         weight_v = weight.flatten(1, -2)
     else:
@@ -203,9 +183,6 @@ def sparse_conv(
             neighbor_cache.assert_match(
                 input_coords=coords,
                 output_coords=output_coords,
-                kernel_delta=kernel_delta,
-                stride=stride,
-                offset=offset,
             )
         weight_v = weight
 

@@ -16,6 +16,7 @@ __all__ = [
 
 HASHMAP_LOAD_FACTOR = 0.3
 
+
 def pad_to_size_along_dim(x: Tensor, dim: int | tuple[int, ...], size: int | tuple[int, ...], value: Number = 0., side: Literal['left', 'right'] = 'right') -> Tensor:
     "Pad the specified dimension of the tensor to the next power of two with zeros."
     if isinstance(dim, int):
@@ -38,6 +39,14 @@ def pad_to_size_along_dim(x: Tensor, dim: int | tuple[int, ...], size: int | tup
             value=value
         )
     return x
+
+@triton.jit
+def _reduce_all(x, axis=None):
+    return tl.min(x, axis=axis) > 0
+
+@triton.jit
+def _reduce_any(x, axis=None):
+    return tl.max(x, axis=axis) > 0
 
 
 @triton.jit
@@ -91,9 +100,18 @@ def _vec_pack_little_endian_to_int32(vec: tl.tensor) -> tl.tensor:
         return tl.sum(vec_u8.to(tl.uint32) << (tl.arange(0, 4) << 3), axis=-1).to(tl.int32)
 
 
+# NOTE: an earlier version of this file used a custom ``tl.inline_asm_elementwise``
+# helper to emit a PTX-predicated ``atom.global.cas.b32``, so masked-out
+# lanes wouldn't issue the atomic at all. In the build kernel this tripped
+# a Triton mis-compile (~2x occupancy) that survived even an explicit
+# materialization barrier, and gains in the unique kernel were marginal.
+# We now use plain ``tl.atomic_cas`` with the ``tl.where(mask, -1, -2)``
+# trick everywhere -- inactive lanes still touch L2 but never collide.
+
+
 @triton.jit
 def _hashmap_build_kernel_32bit(
-    hashmap_ptr: tl.tensor, 
+    hashmap_ptr: tl.tensor,
     hashmap_size: int,
     keys_ptr: tl.const,
     n_keys: int,
@@ -111,34 +129,31 @@ def _hashmap_build_kernel_32bit(
     SLOT_BIT_MASK = tl.cast(hashmap_size - 1, tl.int32)
     TAG_BIT_MASK = (~SLOT_BIT_MASK) & 0x7FFF_FFFF
 
-    # Compute hash value
-    # Load key vectors once, then hash from registers.
+    # Compute hash and stored value: upper bits are the tag, lower bits
+    # are the key's index. (index must be < hashmap_size, which the host
+    # ensures by sizing the table for load factor 0.3.)
     key_vec = _vec_load(keys_ptr_32 + idx * D_32, mask=mask, D=D_32)
     hash_val = _vec_hash_32bit(key_vec, D=D_32)
-    # Upper tag bits, lower index bits. (index must be smaller than hashmap_size)
     store_val = (hash_val & TAG_BIT_MASK) | idx
 
-    # Probing loop. Every lane in this program executes the same number of
-    # iterations, so a single scalar ``probes`` counter is enough to cap the
-    # work at ``hashmap_size``. Exiting early when the bound is hit beats an
-    # infinite spin if the caller mis-sized the table.
+    # Linear-probe insertion loop. Inactive lanes feed an expected value
+    # of ``-2`` to ``tl.atomic_cas``; that value can never match the empty
+    # sentinel (``-1``) nor any valid stored value (``>= 0``), so the CAS
+    # is a memory-level no-op for them.
     to_be_inserted = mask
     target_slot = hash_val & SLOT_BIT_MASK
     probes = 0
-    while (tl.max(to_be_inserted) > 0) & (probes < hashmap_size):
-        # Try to insert the key index into the hash table
+    while _reduce_any(to_be_inserted) & (probes < hashmap_size):
         prev = tl.atomic_cas(hashmap_ptr + target_slot, tl.where(to_be_inserted, -1, -2), store_val)
-        # Update mask: keep only those that failed to insert
-        to_be_inserted = to_be_inserted & (prev >= 0)
+        inserted = to_be_inserted & (prev == -1)
+        to_be_inserted = to_be_inserted & ~inserted
 
-        # Update target_slot for next attempt
-        target_slot += tl.where(to_be_inserted, 1, 0)
-        target_slot &= SLOT_BIT_MASK
+        # Unconditional advance is fine: already-inserted lanes will just
+        # do a no-op CAS on the next slot.
+        target_slot = (target_slot + 1) & SLOT_BIT_MASK
         probes += 1
-    # Sanity check: every active lane must have either inserted or matched an
-    # existing duplicate. The high-level API sizes the table for load factor
-    # 0.3 so this should be unreachable; the assert is a guard for future
-    # callers that bypass the wrapper.
+    # Defensive guard: the high-level API sizes the table for load factor
+    # 0.3 so this should be unreachable.
     tl.device_assert(tl.max(to_be_inserted) == 0, "hashmap_build: hashmap full -- caller mis-sized the table")
 
 
@@ -174,7 +189,7 @@ def _hashmap_lookup_inline_32bit(
     # every lane in this program runs the same number of iterations.
     curr_slot = hash_val & SLOT_BIT_MASK
     probes = 0
-    while (tl.max(is_active) > 0) & (probes < hashmap_size):
+    while _reduce_any(is_active) & (probes < hashmap_size):
         # Compute current slot to probe
         stored_val = tl.load(hashmap_ptr + curr_slot, mask=is_active, other=-1)
 
@@ -188,7 +203,7 @@ def _hashmap_lookup_inline_32bit(
         is_match = is_active & (stored_tag == query_tag)
         # Then compare full keys
         key_vec = _vec_load(keys_ptr_32 + stored_idx * D_32, mask=is_match, D=D_32)
-        is_match &= tl.min(key_vec == query_vec_32, axis=-1) > 0
+        is_match &= _reduce_all(key_vec == query_vec_32, axis=-1)
 
         # Update found indices
         success = is_match & is_active
@@ -196,8 +211,7 @@ def _hashmap_lookup_inline_32bit(
         is_active &= ~success
         
         # Update current slot
-        curr_slot += 1
-        curr_slot &= SLOT_BIT_MASK
+        curr_slot = (curr_slot + 1) & SLOT_BIT_MASK
         probes += 1
     # Sanity check: any lane that is still active after ``hashmap_size``
     # probes means the table is full and we cannot conclusively decide
@@ -233,6 +247,7 @@ def _hashmap_lookup_kernel_32bit(
 
     # Store results
     tl.store(results_ptr + offs, found_idx, mask=mask)
+
 
 
 @triton.jit
@@ -274,32 +289,33 @@ def _hashmap_unique_kernel_32bit(
     my_tag = hash_val & TAG_BIT_MASK
     store_val = my_tag | idx
 
-    found_idx = tl.where(mask, idx, -1)
+    found_idx = idx
     active = mask
     target_slot = hash_val & SLOT_BIT_MASK
     probes = 0
-    while (tl.max(active) > 0) & (probes < hashmap_size):
-        # Try to claim the slot. Inactive lanes use an expected value (-2)
-        # that never matches so the CAS is a no-op for them.
+    while _reduce_any(active) & (probes < hashmap_size):
+        # Inactive lanes feed ``expected = -2`` so their CAS is a memory-level
+        # no-op.
         prev = tl.atomic_cas(hashmap_ptr + target_slot, tl.where(active, -1, -2), store_val)
 
-        # CAS succeeded: prev == -1, our key now owns this slot. found_idx
-        # is already pre-populated with our own idx for active lanes.
-        inserted = active & (prev == -1)
-        active = active & ~inserted
+        # CAS succeeded (prev == -1): our key now owns this slot and the
+        # pre-initialized ``found_idx = idx`` is already the canonical one.
+        # CAS failed (prev >= 0): keep this lane active so we can check
+        # whether the existing entry is a duplicate of ours.
+        active &= (prev >= 0)
 
-        # CAS failed: slot occupied by some prior key. Check if it matches ours
+        # Compare the existing entry against our key (tag first, then full key).
         prev_tag = prev & TAG_BIT_MASK
         prev_idx = prev & SLOT_BIT_MASK
         tag_match = active & (prev_tag == my_tag)
         existing_key = _vec_load(keys_ptr_32 + prev_idx * D_32, mask=tag_match, D=D_32)
-        full_match = tag_match & (tl.min(existing_key == key_vec, axis=-1) > 0)
+        full_match = tag_match & _reduce_all(existing_key == key_vec, axis=-1)
         found_idx = tl.where(full_match, prev_idx, found_idx)
         active = active & ~full_match
 
-        # Advance to the next slot for lanes that still need to probe.
-        target_slot += tl.where(active, 1, 0)
-        target_slot &= SLOT_BIT_MASK
+        # Linear-probe advance. Unconditional ``+ 1`` is fine: settled lanes
+        # will just do a no-op CAS on the next slot.
+        target_slot = (target_slot + 1) & SLOT_BIT_MASK
         # Bound iteration count to avoid an infinite spin if the caller
         # mis-sized the table; ``hashmap_unique`` sizes for load factor 0.3
         # so this guard is purely defensive.
@@ -311,8 +327,6 @@ def _hashmap_unique_kernel_32bit(
     tl.device_assert(tl.max(active) == 0, "hashmap_unique: hashmap full -- caller mis-sized the table")
 
     tl.store(results_ptr + idx, found_idx, mask=mask)
-    # A lane is canonical iff its final found_idx is its own idx (i.e. it
-    # successfully inserted and was not preempted by a matching prior key).
     tl.store(is_canonical_ptr + idx, (found_idx == idx).to(tl.int8), mask=mask)
 
 
@@ -343,8 +357,8 @@ def hashmap_build(keys: Tensor) -> Tensor:
     keys_i32 = pad_to_size_along_dim(keys, dim=1, size=D_32 * 4, value=0, side='right').view(torch.int32)
 
     hashmap = torch.full((hashmap_size,), -1, dtype=torch.int32, device=keys.device)
-    
-    BLOCK_SIZE = 64
+
+    BLOCK_SIZE = 32
     grid = (triton.cdiv(n_keys, BLOCK_SIZE), )
     
     _hashmap_build_kernel_32bit[grid](
@@ -391,7 +405,7 @@ def hashmap_lookup(hashmap: Tensor, keys: Tensor, queries: Tensor) -> Tensor:
 
     results = torch.empty((n_queries,), dtype=torch.int32, device=keys.device)
     
-    BLOCK_SIZE = 64
+    BLOCK_SIZE = 32
     grid = (triton.cdiv(n_queries, BLOCK_SIZE), )
     _hashmap_lookup_kernel_32bit[grid](
         queries_ptr=queries_i32,
@@ -441,7 +455,7 @@ def hashmap_build_lookup(keys: Tensor, queries: Tensor) -> Tensor:
     hashmap = torch.full((hashmap_size,), -1, dtype=torch.int32, device=keys.device)
     results = torch.empty((n_queries,), dtype=torch.int32, device=keys.device)
     
-    BLOCK_SIZE = 64
+    BLOCK_SIZE = 32
     grid = (triton.cdiv(n_keys, BLOCK_SIZE), )
     
     _hashmap_build_kernel_32bit[grid](
@@ -515,7 +529,7 @@ def hashmap_unique(
     indices = torch.empty((n_keys,), dtype=torch.int32, device=keys.device)
     is_canonical = torch.empty((n_keys,), dtype=torch.bool, device=keys.device)
 
-    BLOCK_SIZE = 64
+    BLOCK_SIZE = 32
     grid = (triton.cdiv(n_keys, BLOCK_SIZE),)
     _hashmap_unique_kernel_32bit[grid](
         hashmap_ptr=hashmap,
@@ -546,3 +560,4 @@ def hashmap_unique(
     if len(returns) == 1:
         return returns[0]
     return returns
+

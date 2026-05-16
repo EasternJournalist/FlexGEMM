@@ -77,8 +77,6 @@ def sparse_pool(
     assert len(stride) == D_spatial and len(padding) == D_spatial, (
         "kernel_size / stride / padding must all have the same length."
     )
-    # Centered-kernel offset for ``assert_match`` (no dilation in pools).
-    offset = tuple((k - 1) // 2 - p for k, p in zip(kernel_size, padding))
 
     if neighbor_cache is None:
         neighbor_cache = build_neighbor_cache(
@@ -99,15 +97,12 @@ def sparse_pool(
         neighbor_cache.assert_match(
             input_coords=input_coords,
             output_coords=output_coords,
-            kernel_size=kernel_size,
-            stride=stride,
-            offset=offset,
         )
 
     output_feats = index_segment_reduce(
         feats,
-        neighbor_cache.fwd_neighbor_seg_indices,
-        neighbor_cache.fwd_neighbor_seg_offsets,
+        neighbor_cache.fwd_seg_indices,
+        neighbor_cache.fwd_seg_offsets,
         reduce,
     )
     return output_feats, output_coords, output_shape, neighbor_cache
