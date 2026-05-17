@@ -1,9 +1,10 @@
 import os
+from typing import Literal
 
 USE_AUTOTUNE_CACHE = os.environ.get('FLEX_GEMM_USE_AUTOTUNE_CACHE', '1') == '1'
 AUTOSAVE_AUTOTUNE_CACHE = os.environ.get('FLEX_GEMM_AUTOSAVE_AUTOTUNE_CACHE', '1') == '1'
 
-AUTOTUNE_MODE = os.environ.get('FLEX_GEMM_AUTOTUNE_MODE', 'adaptive')
+AUTOTUNE_MODE: Literal['adaptive', 'always', 'never'] = os.environ.get('FLEX_GEMM_AUTOTUNE_MODE', 'adaptive')
 """Autotune trigger policy. One of:
 
 - ``'adaptive'`` (default): tune lazily — for each registered autotune kernel,
