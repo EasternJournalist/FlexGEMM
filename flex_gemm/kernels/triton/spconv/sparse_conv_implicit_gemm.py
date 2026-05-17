@@ -3,7 +3,7 @@ import math
 import torch
 import triton
 import triton.language as tl
-from ....utils.autotuner import triton_autotune
+from ....autotuner import triton_autotune
 from . import config
 
 

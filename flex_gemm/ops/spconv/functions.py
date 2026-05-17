@@ -32,7 +32,7 @@ class SparseConvExplicitGemmFunction(Function):
         Co, V, Ci = weight.shape
         assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
 
-        neighbor_map = neighbor_cache.fwd_neighbor_map
+        neighbor_map = neighbor_cache.fwd_map
         N = input.shape[0]
         im2col = input.index_select(0, neighbor_map.view(-1).view(dtype=torch.int32).clamp_min(0))\
                         .masked_fill((neighbor_map == -1).view(-1, 1), 0).view(N, V * Ci)
@@ -51,7 +51,7 @@ class SparseConvExplicitGemmFunction(Function):
     def backward(ctx, grad_output: Tensor, _):
         input, weight, bias = ctx.saved_tensors
         neighbor_cache: NeighborCache = ctx.neighbor_cache
-        neighbor_map = neighbor_cache.fwd_neighbor_map
+        neighbor_map = neighbor_cache.fwd_map
         N = input.shape[0]
         Co, V, Ci = weight.shape
 
@@ -99,7 +99,7 @@ class SparseConvImplicitGemmFunction(Function):
             input,
             weight,
             bias,
-            neighbor_cache.fwd_neighbor_map
+            neighbor_cache.fwd_map
         )
 
         ctx.save_for_backward(input, weight, bias)
@@ -112,29 +112,39 @@ class SparseConvImplicitGemmFunction(Function):
         neighbor_cache: NeighborCache = ctx.neighbor_cache
 
         grad_output = grad_output.contiguous()
+        
         if input.requires_grad:
             if neighbor_cache.symmetric:
                 grad_input = kernels.triton.sparse_conv_bwd_input_implicit_gemm(
                     grad_output,
                     weight,
                     symmetric=True,
-                    fwd_neighbor_map=neighbor_cache.fwd_neighbor_map,
+                    fwd_neighbor_map=neighbor_cache.fwd_map,
                 )
             else:
                 grad_input = kernels.triton.sparse_conv_bwd_input_implicit_gemm(
                     grad_output,
                     weight,
                     symmetric=False,
-                    bwd_neighbor_map=neighbor_cache.bwd_neighbor_map,
+                    bwd_neighbor_map=neighbor_cache.bwd_map,
                 )
+        else:
+            grad_input = None
+
         if weight.requires_grad:
             grad_weight = kernels.triton.sparse_conv_bwd_weight_implicit_gemm(
                 grad_output, 
                 input, 
-                neighbor_cache.fwd_neighbor_map
+                neighbor_cache.fwd_map
             )
+        else:
+            grad_weight = None
+
         if bias is not None and bias.requires_grad:
             grad_bias = grad_output.sum(dim=0)
+        else:
+            grad_bias = None
+
         return grad_input, None, grad_weight, grad_bias
 
 
@@ -155,7 +165,7 @@ class SparseConvImplicitGemmSplitKFunction(Function):
             feats,
             weight,
             bias,
-            neighbor_cache.fwd_neighbor_map
+            neighbor_cache.fwd_map
         )
 
         ctx.save_for_backward(feats, weight, bias)
@@ -174,23 +184,32 @@ class SparseConvImplicitGemmSplitKFunction(Function):
                     grad_output,
                     weight,
                     symmetric=True,
-                    fwd_neighbor_map=neighbor_cache.fwd_neighbor_map,
+                    fwd_neighbor_map=neighbor_cache.fwd_map,
                 )
             else:
                 grad_input = kernels.triton.sparse_conv_bwd_input_implicit_gemm_splitk(
                     grad_output,
                     weight,
                     symmetric=False,
-                    bwd_neighbor_map=neighbor_cache.bwd_neighbor_map,
+                    bwd_neighbor_map=neighbor_cache.bwd_map,
                 )
+        else:
+            grad_input = None
+
         if weight.requires_grad:
             grad_weight = kernels.triton.sparse_conv_bwd_weight_implicit_gemm_splitk(
                 grad_output,
                 input,
-                neighbor_cache.fwd_neighbor_map
+                neighbor_cache.fwd_map
             )
+        else:
+            grad_weight = None
+
         if bias is not None and bias.requires_grad:
             grad_bias = grad_output.sum(dim=0)
+        else:
+            grad_bias = None
+
         return grad_input, None, grad_weight, grad_bias
 
 
@@ -211,7 +230,7 @@ class SparseConvMaskedImplicitGemmFunction(Function):
             input,
             weight,
             bias,
-            neighbor_cache.fwd_neighbor_map,
+            neighbor_cache.fwd_map,
             neighbor_cache.fwd_sorted_idx,
             neighbor_cache.fwd_valid_kernel_callback,
             neighbor_cache.fwd_valid_kernel_seg_callback,
@@ -233,7 +252,7 @@ class SparseConvMaskedImplicitGemmFunction(Function):
                     grad_output,
                     weight,
                     symmetric=True,
-                    fwd_neighbor_map=neighbor_cache.fwd_neighbor_map,
+                    fwd_neighbor_map=neighbor_cache.fwd_map,
                     fwd_sorted_idx=neighbor_cache.fwd_sorted_idx,
                     fwd_valid_kernel=neighbor_cache.fwd_valid_kernel_callback,
                     fwd_valid_kernel_seg=neighbor_cache.fwd_valid_kernel_seg_callback,
@@ -243,11 +262,14 @@ class SparseConvMaskedImplicitGemmFunction(Function):
                     grad_output,
                     weight,
                     symmetric=False,
-                    bwd_neighbor_map=neighbor_cache.bwd_neighbor_map,
+                    bwd_neighbor_map=neighbor_cache.bwd_map,
                     bwd_sorted_idx=neighbor_cache.bwd_sorted_idx,
                     bwd_valid_kernel=neighbor_cache.bwd_valid_kernel_callback,
                     bwd_valid_kernel_seg=neighbor_cache.bwd_valid_kernel_seg_callback,
                 )
+        else:
+            grad_input = None
+                
         if weight.requires_grad:
             grad_weight = kernels.triton.sparse_conv_bwd_weight_masked_implicit_gemm(
                 grad_output,
@@ -256,8 +278,14 @@ class SparseConvMaskedImplicitGemmFunction(Function):
                 neighbor_cache.fwd_valid_signal_o,
                 neighbor_cache.fwd_valid_signal_seg,
             )
+        else:
+            grad_weight = None
+
         if bias is not None and bias.requires_grad:
             grad_bias = grad_output.sum(dim=0)
+        else:
+            grad_bias = None
+
         return grad_input, None, grad_weight, grad_bias
 
 
@@ -278,7 +306,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
             input,
             weight,
             bias,
-            neighbor_cache.fwd_neighbor_map,
+            neighbor_cache.fwd_map,
             neighbor_cache.fwd_sorted_idx,
             neighbor_cache.fwd_valid_kernel_callback,
             neighbor_cache.fwd_valid_kernel_seg_callback,
@@ -300,7 +328,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
                     grad_output,
                     weight,
                     symmetric=True,
-                    fwd_neighbor_map=neighbor_cache.fwd_neighbor_map,
+                    fwd_neighbor_map=neighbor_cache.fwd_map,
                     fwd_sorted_idx=neighbor_cache.fwd_sorted_idx,
                     fwd_valid_kernel=neighbor_cache.fwd_valid_kernel_callback,
                     fwd_valid_kernel_seg=neighbor_cache.fwd_valid_kernel_seg_callback,
@@ -310,11 +338,14 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
                     grad_output,
                     weight,
                     symmetric=False,
-                    bwd_neighbor_map=neighbor_cache.bwd_neighbor_map,
+                    bwd_neighbor_map=neighbor_cache.bwd_map,
                     bwd_sorted_idx=neighbor_cache.bwd_sorted_idx,
                     bwd_valid_kernel=neighbor_cache.bwd_valid_kernel_callback,
                     bwd_valid_kernel_seg=neighbor_cache.bwd_valid_kernel_seg_callback,
                 )
+        else:
+            grad_input = None
+
         if weight.requires_grad:
             grad_weight = kernels.triton.sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
                 grad_output,
@@ -323,8 +354,14 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
                 neighbor_cache.fwd_valid_signal_o,
                 neighbor_cache.fwd_valid_signal_seg,
             )
+        else:
+            grad_weight = None
+
         if bias is not None and bias.requires_grad:
             grad_bias = grad_output.sum(dim=0)
+        else:
+            grad_bias = None
+            
         return grad_input, None, grad_weight, grad_bias
 
 

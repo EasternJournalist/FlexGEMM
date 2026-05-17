@@ -21,7 +21,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 import flex_gemm
 from flex_gemm import config
-config.USE_AUTOTUNE_RUNTIME = False
 
 from flex_gemm.ops.neighbor_cache import build_neighbor_cache
 from flex_gemm.ops.pool.index_segment_reduce import index_segment_reduce

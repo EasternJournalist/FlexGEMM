@@ -20,7 +20,7 @@ from typing import Literal
 import torch
 from torch import Tensor
 
-from ...kernels.triton.pool.index_segment_reduce import (
+from ..kernels.triton.index_segment_reduce import (
     index_segment_reduce_sum_mean,
     index_segment_reduce_sum_mean_backward,
     index_segment_reduce_extrema,

@@ -218,7 +218,7 @@ def test_grid_sample_scale():
     # Build a "high-res" grid that maps to the low-res coords via /2.
     grid_hi = _random_grid((16,), D, tuple(s * 2 for s in spatial),
                            torch.float32, DEVICE, seed=8)
-    out_scaled = sparse_grid_sample(feats, coords, grid_hi, mode="linear", scale=(2.0,) * D)
+    out_scaled = sparse_grid_sample(feats, coords, grid_hi, mode="linear", scale_factor=(2.0,) * D)
     out_manual = sparse_grid_sample(feats, coords, grid_hi / 2.0, mode="linear")
     torch.testing.assert_close(out_scaled, out_manual)
 

@@ -3,10 +3,16 @@ from torch import Tensor
 from typing import *
 
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
+from ..utils import _broadcast_dim_arg
 from .functions import _select_function
 
 
-__all__ = ['sparse_conv']
+__all__ = [
+    'sparse_conv',
+    'sparse_conv2d',
+    'sparse_conv3d',
+    'sparse_conv4d',
+]
 
 
 _Algo = Literal[
@@ -191,3 +197,212 @@ def sparse_conv(
         feats, neighbor_cache, weight_v, bias,
     )
     return output_feats, output_coords, output_shape, neighbor_cache
+
+
+# ---------------------------------------------------------------------------
+# Fixed-spatial-dim aliases.
+#
+# Compared with :func:`sparse_conv`, dim-related args (``stride`` /
+# ``dilation`` / ``padding`` / ``offset``) accept either a scalar ``int``
+# (broadcast to length ``D``) or a length-``D`` sequence. ``coords.shape[1]``
+# may exceed ``D``; the leading columns are batch dims.
+#
+# ``@overload`` declarations don't transfer through ``functools.wraps`` (they
+# live in ``typing._overload_registry`` per fully-qualified name), so we
+# re-declare both overloads (kernel_size mode / kernel_delta mode) per alias.
+# ---------------------------------------------------------------------------
+
+
+def _sparse_conv_nd(
+    D, feats, coords, shape, weight, bias,
+    kernel_delta, stride, dilation, padding, offset,
+    output_coords, output_shape, neighbor_cache, algorithm,
+):
+    stride   = _broadcast_dim_arg(stride,   D, "stride")
+    dilation = _broadcast_dim_arg(dilation, D, "dilation")
+    padding  = _broadcast_dim_arg(padding,  D, "padding")
+    offset   = _broadcast_dim_arg(offset,   D, "offset")
+    return sparse_conv(
+        feats, coords, shape, weight, bias,
+        kernel_delta=kernel_delta,
+        stride=stride, dilation=dilation, padding=padding, offset=offset,
+        output_coords=output_coords, output_shape=output_shape,
+        neighbor_cache=neighbor_cache, algorithm=algorithm,
+    )
+
+
+# --- 2-D ---------------------------------------------------------------------
+@overload
+def sparse_conv2d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None,
+    *,
+    stride: int | tuple[int, int] | None = None,
+    dilation: int | tuple[int, int] | None = None,
+    padding: int | tuple[int, int] | None = None,
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """2-D spatial alias of :func:`sparse_conv` (kernel_size mode).
+
+    ``stride`` / ``dilation`` / ``padding`` may each be a scalar ``int``
+    (broadcast to length 2) or a length-2 tuple. ``coords.shape[1]`` may
+    exceed 2; the leading columns are batch dims. All other args/semantics
+    match :func:`sparse_conv`.
+    """
+    ...
+@overload
+def sparse_conv2d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None,
+    *,
+    kernel_delta: Tensor,
+    stride: int | tuple[int, int] | None = None,
+    offset: int | tuple[int, int] | None = None,
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """2-D spatial alias of :func:`sparse_conv` (kernel_delta mode).
+
+    ``stride`` / ``offset`` may each be a scalar ``int`` (broadcast to length
+    2) or a length-2 tuple. All other args/semantics match :func:`sparse_conv`.
+    """
+    ...
+def sparse_conv2d(
+    feats, coords, shape, weight, bias, *,
+    kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
+    output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+):
+    return _sparse_conv_nd(
+        2, feats, coords, shape, weight, bias,
+        kernel_delta, stride, dilation, padding, offset,
+        output_coords, output_shape, neighbor_cache, algorithm,
+    )
+
+
+# --- 3-D ---------------------------------------------------------------------
+@overload
+def sparse_conv3d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None,
+    *,
+    stride: int | tuple[int, int, int] | None = None,
+    dilation: int | tuple[int, int, int] | None = None,
+    padding: int | tuple[int, int, int] | None = None,
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """3-D spatial alias of :func:`sparse_conv` (kernel_size mode).
+
+    ``stride`` / ``dilation`` / ``padding`` may each be a scalar ``int``
+    (broadcast to length 3) or a length-3 tuple. ``coords.shape[1]`` may
+    exceed 3; the leading columns are batch dims. All other args/semantics
+    match :func:`sparse_conv`.
+    """
+    ...
+@overload
+def sparse_conv3d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None,
+    *,
+    kernel_delta: Tensor,
+    stride: int | tuple[int, int, int] | None = None,
+    offset: int | tuple[int, int, int] | None = None,
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """3-D spatial alias of :func:`sparse_conv` (kernel_delta mode).
+
+    ``stride`` / ``offset`` may each be a scalar ``int`` (broadcast to length
+    3) or a length-3 tuple. All other args/semantics match :func:`sparse_conv`.
+    """
+    ...
+def sparse_conv3d(
+    feats, coords, shape, weight, bias, *,
+    kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
+    output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+):
+    return _sparse_conv_nd(
+        3, feats, coords, shape, weight, bias,
+        kernel_delta, stride, dilation, padding, offset,
+        output_coords, output_shape, neighbor_cache, algorithm,
+    )
+
+
+# --- 4-D ---------------------------------------------------------------------
+@overload
+def sparse_conv4d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None,
+    *,
+    stride: int | tuple[int, int, int, int] | None = None,
+    dilation: int | tuple[int, int, int, int] | None = None,
+    padding: int | tuple[int, int, int, int] | None = None,
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """4-D spatial alias of :func:`sparse_conv` (kernel_size mode).
+
+    ``stride`` / ``dilation`` / ``padding`` may each be a scalar ``int``
+    (broadcast to length 4) or a length-4 tuple. ``coords.shape[1]`` may
+    exceed 4; the leading columns are batch dims. All other args/semantics
+    match :func:`sparse_conv`.
+    """
+    ...
+@overload
+def sparse_conv4d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None,
+    *,
+    kernel_delta: Tensor,
+    stride: int | tuple[int, int, int, int] | None = None,
+    offset: int | tuple[int, int, int, int] | None = None,
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """4-D spatial alias of :func:`sparse_conv` (kernel_delta mode).
+
+    ``stride`` / ``offset`` may each be a scalar ``int`` (broadcast to length
+    4) or a length-4 tuple. All other args/semantics match :func:`sparse_conv`.
+    """
+    ...
+def sparse_conv4d(
+    feats, coords, shape, weight, bias, *,
+    kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
+    output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+):
+    return _sparse_conv_nd(
+        4, feats, coords, shape, weight, bias,
+        kernel_delta, stride, dilation, padding, offset,
+        output_coords, output_shape, neighbor_cache, algorithm,
+    )

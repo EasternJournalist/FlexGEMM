@@ -29,7 +29,6 @@ Two pieces live here:
 """
 
 from typing import *
-from abc import abstractmethod
 
 import torch
 from torch import Tensor
@@ -37,56 +36,136 @@ from torch import Tensor
 
 from .. import config
 from .. import kernels
+from ..kernels.triton.utils import _lengths_to_offsets
 from .utils import make_conv_kernel_delta, init_hashmap, lookup_pytorch
-from .index_cache import IndexCache, IndexCacheT, _INDEX_CACHE_INTERNAL_TOKEN
 from . import spconv
 
-__all__ = ["NeighborCache", "NeighborCacheT", "build_neighbor_cache"]
+__all__ = [
+    "NeighborCache",
+    "NeighborCacheT",
+    "build_neighbor_cache",
+    "compute_strided_kernel_size_output_shape",
+    "compute_strided_kernel_size_transpose_output_shape",
+    "compute_strided_kernel_delta_output_shape",
+    "compute_strided_kernel_delta_transpose_output_shape",
+]
+
+
+# Sentinel that authorizes constructing a NeighborCacheT directly. The only
+# legitimate entry points are :attr:`NeighborCache.T` / :meth:`NeighborCache.transpose`
+# and the ``transpose=True`` branch of :func:`build_neighbor_cache` (which
+# routes through ``NeighborCache.T``).
+_NCT_INTERNAL_TOKEN: Final = object()
+
+
+def _swap_fwd_bwd_key(key: str) -> str:
+    """Translate a cached-buffer key between fwd / bwd namespaces.
+
+    Keys starting with ``_fwd_`` become ``_bwd_`` and vice versa; the two
+    direction-agnostic edge endpoints ``_edge_in`` / ``_edge_out`` swap
+    with each other (transposing the adjacency swaps the roles of edge
+    endpoints); other attribute names (topology fields, ``_original``,
+    ``_edge_kernel`` etc.) are returned unchanged.
+    """
+    if key.startswith("_fwd_"):
+        return "_bwd_" + key[len("_fwd_"):]
+    if key.startswith("_bwd_"):
+        return "_fwd_" + key[len("_bwd_"):]
+    if key == "_edge_in":
+        return "_edge_out"
+    if key == "_edge_out":
+        return "_edge_in"
+    return key
 
 
 # ====================================================================== #
 # NeighborCache
+#
+# Three equivalent representations of the (i, o) adjacency are supported,
+# and the cache materializes whichever is missing on demand:
+#
+#   rep-a — ``*_map``  (rows, V) int32, -1 padded. Natural output of
+#     hashmap / Triton coord-aware kernels. *Scarce*: rep-a can only be
+#     reconstructed from rep-b / rep-c when ``num_kernels`` is known
+#     (then a single scatter / ``transpose_neighbor_map`` kernel suffices);
+#     otherwise the row-width V' is unbounded and the property raises.
+#
+#   rep-b — ``*_seg_indices`` + ``*_seg_offsets`` (CSR). Best for
+#     one-directional ``segment_reduce`` / ``segment_gather``.
+#
+#   rep-c — ``edge_in`` + ``edge_out`` (COO, direction-agnostic), plus an
+#     optional per-edge ``edge_kernel`` slot label for the conv flavour.
+#     Cheap to derive from a (mask select) or b (``repeat_interleave``),
+#     and **zero-copy** under transpose (:class:`NeighborCacheT` just
+#     swaps ``edge_in`` ↔ ``edge_out``). This makes c the canonical
+#     bridge for any cross-direction derivation of b.
+#
+# When ``num_kernels is None`` the cache degenerates to a plain (i, o)
+# incidence cache (the use case formerly served by :class:`IndexCache`):
+# rep-a is no longer derivable from rep-b / rep-c, and rep-a's columns
+# carry no kernel-slot semantics (a ``symmetric`` flip becomes a plain
+# alias rather than a ``.flip(1)``).
 # ====================================================================== #
 
-# Sentinel that authorizes constructing a NeighborCacheT. Direct
-# instantiation is disallowed — legitimate entry points are
-# :attr:`NeighborCache.T` / :meth:`NeighborCache.transpose` and the
-# ``transpose=True`` branch of :func:`build_neighbor_cache` (which routes
-# through ``NeighborCache.T``).
-_NCT_INTERNAL_TOKEN: Final = object()
 
+class NeighborCache:
+    """Lazy fwd / bwd index-map cache for a sparse ``(i, o)`` adjacency.
 
-class NeighborCache(IndexCache):
-    """Lazy fwd / bwd neighbor-map cache for sparse convolutions.
-
-    Specializes :class:`flex_gemm.ops.IndexCache` for the convolution case:
-    the ``(M, V)`` neighbor map is an ``index_map`` whose ``V`` columns
-    additionally carry kernel-slot semantics (column ``v`` corresponds to
-    the ``v``-th kernel offset). Because ``V`` is constant across both
-    directions, the cache uses the much cheaper ``transpose_neighbor_map``
-    Triton kernel for fwd ↔ bwd derivation instead of the generic
-    ``scatter_to_segment``-based path inherited from :class:`IndexCache`.
-
-    The cache deliberately does **not** remember the kernel parameters
-    (``kernel_size`` / ``kernel_delta`` / ``stride`` / ``dilation`` /
-    ``offset`` / ``padding``) it was built from. Ops always re-receive
-    those from the caller and trust the cache to match — passing a stale
-    cache is the caller's responsibility. Only ``input_coords`` /
-    ``output_coords`` / ``is_transposed`` are checked.
-
-    Storage keys are the same as :class:`IndexCache`
-    (``_fwd_index_map`` / ``_fwd_seg_indices`` / …); the
-    ``fwd_neighbor_map`` / ``bwd_neighbor_map`` etc. properties are kept
-    as backward-compatible aliases for the corresponding
-    ``*_index_map`` accessors.
+    Carries three equivalent representations (see the module-level
+    comment) and lazily materializes whichever is missing on demand. The
+    cache deliberately does **not** remember the parameters it was built
+    from. Ops always re-receive those from the caller and trust the cache
+    to match — passing a stale cache is the caller's responsibility. Only
+    ``input_coords`` / ``output_coords`` / ``is_transposed`` are checked.
     """
+
+    # --- topology --------------------------------------------------------
+    input_coords: Tensor
+    output_coords: Tensor
+    input_shape: torch.Size | None
+    output_shape: torch.Size | None
+    symmetric: bool
+    """When True, ``input_coords`` and ``output_coords`` coincide and the
+    adjacency is invariant under swapping (i, o), so backward derivations
+    can reuse forward buffers verbatim (with a ``.flip(1)`` on maps when
+    ``num_kernels is not None`` to reverse kernel-slot order).
+    """
+
+    num_input_coords: int
+    "Number of input coordinates (rows of the bwd map)."
+
+    num_output_coords: int
+    "Number of output coordinates (rows of the fwd map)."
+
+    num_kernels: int | None
+    """Kernel volume V (number of kernel slots = column count of any map).
+    Required whenever ``edge_kernel`` is supplied (it sets the column
+    count of the scatter-reconstructed map) and to enable rep-a
+    reconstruction from rep-b / rep-c. May be ``None`` for the plain
+    incidence-cache use case (no kernel semantics) — then rep-a can only
+    come from construction or a symmetric sibling."""
+
+    # Direction flag. ``True`` only on :class:`NeighborCacheT` views.
+    is_transposed: ClassVar[bool] = False
 
     def __init__(
         self,
         *,
-        # neighbor maps
-        fwd_neighbor_map: Tensor | None = None,
-        bwd_neighbor_map: Tensor | None = None,
+        # rep-a — (rows, V) -1-padded maps
+        fwd_map: Tensor | None = None,
+        bwd_map: Tensor | None = None,
+        # rep-b — CSR segments
+        fwd_seg_indices: Tensor | None = None,
+        fwd_seg_offsets: Tensor | None = None,
+        bwd_seg_indices: Tensor | None = None,
+        bwd_seg_offsets: Tensor | None = None,
+        # rep-c — COO edges. ``edge_kernel`` is the conv-flavour per-edge
+        # kernel-slot label used (together with ``num_kernels``) to
+        # reconstruct rep-a via a direct scatter, see ``fwd_map`` override.
+        edge_in: Tensor | None = None,
+        edge_out: Tensor | None = None,
+        edge_kernel: Tensor | None = None,
+        num_kernels: int | None = None,
         # topology (all keyword-only)
         input_coords: Tensor,
         output_coords: Tensor,
@@ -94,73 +173,404 @@ class NeighborCache(IndexCache):
         output_shape: torch.Size | None = None,
         symmetric: bool = False,
     ):
-        super().__init__(
-            fwd_index_map=fwd_neighbor_map,
-            bwd_index_map=bwd_neighbor_map,
-            input_coords=input_coords,
-            output_coords=output_coords,
-            input_shape=input_shape,
-            output_shape=output_shape,
-            symmetric=symmetric,
+        has_fwd = fwd_map is not None or (
+            fwd_seg_indices is not None and fwd_seg_offsets is not None
         )
+        has_bwd = bwd_map is not None or (
+            bwd_seg_indices is not None and bwd_seg_offsets is not None
+        )
+        has_edges = edge_in is not None and edge_out is not None
+        assert (edge_in is None) == (edge_out is None), \
+            "NeighborCache: edge_in and edge_out must be provided together."
+        assert has_fwd or has_bwd or has_edges, (
+            "NeighborCache: at least one representation must be supplied "
+            "(map / (seg_indices, seg_offsets) / (edge_in, edge_out))."
+        )
+        if edge_kernel is not None:
+            assert has_edges, "NeighborCache: edge_kernel requires edge_in and edge_out."
+            assert num_kernels is not None, (
+                "NeighborCache: edge_kernel requires num_kernels (the kernel "
+                "volume V used to scatter into the (rows, V) map)."
+            )
+            assert edge_kernel.shape == edge_in.shape and edge_kernel.ndim == 1, (
+                f"edge_kernel must be 1D and match edge_in shape, got "
+                f"{edge_kernel.shape} vs {edge_in.shape}"
+            )
+
+        self.input_coords = input_coords
+        self.output_coords = output_coords
+        self.input_shape = input_shape
+        self.output_shape = output_shape
+        self.symmetric = bool(symmetric)
+        self.num_kernels = num_kernels
+
+        self.num_input_coords = input_coords.shape[0]
+        self.num_output_coords = output_coords.shape[0]
+        if symmetric:
+            assert self.num_input_coords == self.num_output_coords, \
+                "symmetric=True implies num_input_coords == num_output_coords"
+
+        if fwd_map is not None:
+            assert fwd_map.shape[0] == self.num_output_coords, \
+                f"fwd_map.shape[0]={fwd_map.shape[0]} but num_output_coords={self.num_output_coords}"
+            if num_kernels is not None:
+                assert fwd_map.shape[1] == num_kernels, \
+                    f"fwd_map.shape[1]={fwd_map.shape[1]} but num_kernels={num_kernels}"
+            self['_fwd_map'] = fwd_map
+        if bwd_map is not None:
+            assert bwd_map.shape[0] == self.num_input_coords, \
+                f"bwd_map.shape[0]={bwd_map.shape[0]} but num_input_coords={self.num_input_coords}"
+            if num_kernels is not None:
+                assert bwd_map.shape[1] == num_kernels, \
+                    f"bwd_map.shape[1]={bwd_map.shape[1]} but num_kernels={num_kernels}"
+            self['_bwd_map'] = bwd_map
+        if fwd_seg_indices is not None and fwd_seg_offsets is not None:
+            assert fwd_seg_offsets.shape[0] == self.num_output_coords + 1, \
+                f"fwd_seg_offsets.shape[0]={fwd_seg_offsets.shape[0]} but num_output_coords+1={self.num_output_coords + 1}"
+            self['_fwd_seg_indices'] = fwd_seg_indices
+            self['_fwd_seg_offsets'] = fwd_seg_offsets
+        if bwd_seg_indices is not None and bwd_seg_offsets is not None:
+            assert bwd_seg_offsets.shape[0] == self.num_input_coords + 1, \
+                f"bwd_seg_offsets.shape[0]={bwd_seg_offsets.shape[0]} but num_input_coords+1={self.num_input_coords + 1}"
+            self['_bwd_seg_indices'] = bwd_seg_indices
+            self['_bwd_seg_offsets'] = bwd_seg_offsets
+        if has_edges:
+            assert edge_in.shape == edge_out.shape and edge_in.ndim == 1, (
+                f"edge_in / edge_out must be 1D and same shape, got "
+                f"{edge_in.shape} vs {edge_out.shape}"
+            )
+            self['_edge_in'] = edge_in
+            self['_edge_out'] = edge_out
+        if edge_kernel is not None:
+            self['_edge_kernel'] = edge_kernel
 
     # ------------------------------------------------------------------ #
-    # neighbor_map aliases — index_map columns carry kernel-slot semantics
-    # for conv consumers; the storage / properties live on IndexCache.
+    # Signature validation
+    # ------------------------------------------------------------------ #
+    def assert_match(
+        self,
+        *,
+        input_coords: Tensor | None = None,
+        output_coords: Tensor | None = None,
+        is_transposed: bool | None = None,
+    ) -> None:
+        """Verify the cache matches the given input / output coords."""
+        for name, expected in (("input_coords", input_coords),
+                               ("output_coords", output_coords)):
+            if expected is None:
+                continue
+            stored = getattr(self, name)
+            if expected is stored:
+                continue
+            ok = (
+                expected.shape == stored.shape
+                and expected.dtype == stored.dtype
+                and expected.device == stored.device
+                and expected.data_ptr() == stored.data_ptr()
+            )
+            assert ok, f"NeighborCache signature mismatch on {name!r}"
+        if is_transposed is not None:
+            assert bool(is_transposed) == bool(self.is_transposed), \
+                f"NeighborCache is_transposed mismatch: cache={self.is_transposed}, op={is_transposed}"
+
+    # ------------------------------------------------------------------ #
+    # Dict-like access for cached tensors
+    # ------------------------------------------------------------------ #
+    def __getitem__(self, key):
+        return getattr(self, key)
+
+    def __setitem__(self, key, value):
+        setattr(self, key, value)
+
+    def __contains__(self, key):
+        return hasattr(self, key)
+
+    # ------------------------------------------------------------------ #
+    # Static rep-converters (used by both fwd and bwd lazy properties).
+    # ------------------------------------------------------------------ #
+    @staticmethod
+    def _compute_mask(map: Tensor) -> Tensor:
+        return map.view(dtype=torch.int32) != -1
+
+    @staticmethod
+    def _map_to_seg(map: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        """(rows, V) -1-padded map + mask → (seg_indices, seg_offsets)."""
+        seg_lengths = mask.sum(dim=1, dtype=torch.int32)
+        seg_offsets = _lengths_to_offsets(seg_lengths)
+        seg_indices = map[mask]
+        return seg_indices, seg_offsets
+
+    @staticmethod
+    def _map_to_edges(map: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
+        """(rows, V) map → (rows_per_edge, payload_per_edge).
+
+        ``rows_per_edge[e]`` is the row of the source ``map`` that edge
+        ``e`` lives on; ``payload_per_edge[e]`` is the corresponding
+        ``map`` entry (the other endpoint of the edge).
+        """
+        mask_pos_flat = mask.view(-1).nonzero(as_tuple=True)[0].to(torch.int32)
+        rows_per_edge = torch.div(mask_pos_flat, map.shape[1], rounding_mode='floor')
+        payload_per_edge = map.view(-1)[mask_pos_flat]
+        return rows_per_edge, payload_per_edge
+
+    @staticmethod
+    def _seg_to_edges(
+        seg_indices: Tensor, seg_offsets: Tensor, num_rows: int,
+    ) -> tuple[Tensor, Tensor]:
+        """(seg_indices, seg_offsets) → (rows_per_edge, payload_per_edge).
+
+        ``payload_per_edge`` is just an alias for ``seg_indices`` (no copy);
+        ``rows_per_edge = repeat_interleave(arange(num_rows), lengths)``.
+        """
+        lengths = torch.diff(seg_offsets)
+        rows_per_edge = torch.repeat_interleave(
+            torch.arange(num_rows, dtype=seg_indices.dtype, device=seg_indices.device),
+            lengths,
+        )
+        return rows_per_edge, seg_indices
+
+    @staticmethod
+    def _edges_to_seg(
+        owner_per_edge: Tensor, other_per_edge: Tensor, num_rows: int,
+    ) -> tuple[Tensor, Tensor]:
+        """Group edges by ``owner_per_edge`` → (seg_indices, seg_offsets)."""
+        perm, seg_offsets = kernels.triton.scatter_to_segment(owner_per_edge, num_rows)
+        seg_indices = other_per_edge[perm]
+        return seg_indices, seg_offsets
+
+    def _scatter_edges_to_map(
+        self, owner_per_edge: Tensor, payload_per_edge: Tensor, num_rows: int,
+    ) -> Tensor:
+        """Scatter (owner, edge_kernel) → payload into a (num_rows, V) -1-padded map.
+
+        Requires ``num_kernels`` and ``_edge_kernel`` to be set (asserted at
+        construction). Used by :meth:`fwd_map` / :meth:`bwd_map` when rep-c
+        is the only rep available.
+        """
+        map = torch.full(
+            (num_rows, self.num_kernels), -1,
+            dtype=torch.int32, device=self.input_coords.device,
+        )
+        map[owner_per_edge, self['_edge_kernel']] = payload_per_edge
+        return map
+
+    # ------------------------------------------------------------------ #
+    # rep-c (edges) materialization — the cross-direction bridge.
+    # ------------------------------------------------------------------ #
+    def _ensure_edges(self) -> None:
+        """Materialize ``_edge_in`` and ``_edge_out`` if not already cached.
+
+        Picks the cheapest available source in priority order
+        (rep-a fwd → rep-a bwd → rep-b fwd → rep-b bwd). At least one of
+        these is guaranteed to exist by the :meth:`__init__` contract.
+        """
+        if '_edge_in' in self and '_edge_out' in self:
+            return
+        if '_fwd_map' in self:
+            self['_edge_out'], self['_edge_in'] = self._map_to_edges(
+                self['_fwd_map'], self.fwd_mask,
+            )
+        elif '_bwd_map' in self:
+            self['_edge_in'], self['_edge_out'] = self._map_to_edges(
+                self['_bwd_map'], self.bwd_mask,
+            )
+        elif '_fwd_seg_indices' in self and '_fwd_seg_offsets' in self:
+            self['_edge_out'], self['_edge_in'] = self._seg_to_edges(
+                self['_fwd_seg_indices'], self['_fwd_seg_offsets'],
+                self.num_output_coords,
+            )
+        elif '_bwd_seg_indices' in self and '_bwd_seg_offsets' in self:
+            self['_edge_in'], self['_edge_out'] = self._seg_to_edges(
+                self['_bwd_seg_indices'], self['_bwd_seg_offsets'],
+                self.num_input_coords,
+            )
+        else:
+            raise RuntimeError(
+                "NeighborCache: no representation available to materialize edges."
+            )
+
+    @property
+    def edge_in(self) -> Tensor:
+        """Input-side endpoint of each edge. Shape ``(E,)``."""
+        if '_edge_in' not in self:
+            self._ensure_edges()
+        return self['_edge_in']
+
+    @property
+    def edge_out(self) -> Tensor:
+        """Output-side endpoint of each edge. Shape ``(E,)``."""
+        if '_edge_out' not in self:
+            self._ensure_edges()
+        return self['_edge_out']
+
+    @property
+    def edge_kernel(self) -> Tensor:
+        """Per-edge kernel-slot label. Shape ``(E,)``. Raises if not supplied."""
+        if '_edge_kernel' not in self:
+            raise RuntimeError(
+                "NeighborCache.edge_kernel is unavailable: it must be supplied "
+                "at construction (it cannot be recovered from maps alone "
+                "without re-running the coord-aware kernel that produced the edges)."
+            )
+        return self['_edge_kernel']
+
+    # ------------------------------------------------------------------ #
+    # rep-a (maps) lazy properties.
+    #
+    # Priority chain:
+    #   ① already cached
+    #   ② symmetric: ``.flip(1)`` of the other dir if ``num_kernels`` is
+    #      known (kernel slots reverse under transpose); plain alias
+    #      otherwise (no column-order semantics).
+    #   ③ scatter from rep-c when ``edge_kernel`` + ``num_kernels`` are
+    #      known: ``map[owner, edge_kernel] = payload`` is a single scatter
+    #      (no Triton launch, no ``.max().item()`` sync).
+    #   ④ ``transpose_neighbor_map`` Triton kernel from the other dir when
+    #      ``num_kernels`` is known but no edge data is available.
+    #   ⑤ raise: rep-a's row width V' is unbounded without kernel info.
     # ------------------------------------------------------------------ #
     @property
-    def fwd_neighbor_map(self) -> Tensor:
-        return self.fwd_index_map
-
-    @property
-    def bwd_neighbor_map(self) -> Tensor:
-        return self.bwd_index_map
-
-    @property
-    def fwd_neighbor_mask(self) -> Tensor:
-        return self.fwd_index_mask
-
-    @property
-    def bwd_neighbor_mask(self) -> Tensor:
-        return self.bwd_index_mask
-
-    # ------------------------------------------------------------------ #
-    # fwd / bwd index_map overrides: V is constant across directions, so
-    # use the dedicated ``transpose_neighbor_map`` kernel instead of the
-    # generic scatter-based path inherited from IndexCache.
-    # ------------------------------------------------------------------ #
-    @property
-    def fwd_index_map(self) -> Tensor:
-        if '_fwd_index_map' not in self:
-            if self.symmetric:
-                self['_fwd_index_map'] = self.bwd_index_map.flip(1)
-            else:
-                self['_fwd_index_map'] = kernels.triton.transpose_neighbor_map(
-                    self.bwd_index_map, self.num_output_coords,
+    def fwd_map(self) -> Tensor:
+        if '_fwd_map' not in self:
+            if self.symmetric and '_bwd_map' in self:
+                self['_fwd_map'] = (
+                    self['_bwd_map'].flip(1) if self.num_kernels is not None
+                    else self['_bwd_map']
                 )
-        return self['_fwd_index_map']
+            elif self.num_kernels is not None and '_edge_kernel' in self:
+                self['_fwd_map'] = self._scatter_edges_to_map(
+                    self.edge_out, self.edge_in, self.num_output_coords,
+                )
+            elif self.num_kernels is not None and '_bwd_map' in self:
+                self['_fwd_map'] = kernels.triton.transpose_neighbor_map(
+                    self['_bwd_map'], self.num_output_coords,
+                )
+            else:
+                raise RuntimeError(
+                    "NeighborCache.fwd_map is unavailable: it was not supplied "
+                    "at construction and cannot be reconstructed (num_kernels "
+                    "is None, so the row width V' is unbounded). Provide "
+                    "`fwd_map=` to the constructor if downstream consumers need it."
+                )
+        return self['_fwd_map']
 
     @property
-    def bwd_index_map(self) -> Tensor:
-        if '_bwd_index_map' not in self:
-            if self.symmetric:
-                self['_bwd_index_map'] = self.fwd_index_map.flip(1)
-            else:
-                self['_bwd_index_map'] = kernels.triton.transpose_neighbor_map(
-                    self.fwd_index_map, self.num_input_coords,
+    def fwd_mask(self) -> Tensor:
+        if '_fwd_mask' not in self:
+            self['_fwd_mask'] = self._compute_mask(self.fwd_map)
+        return self['_fwd_mask']
+
+    @property
+    def bwd_map(self) -> Tensor:
+        if '_bwd_map' not in self:
+            if self.symmetric and '_fwd_map' in self:
+                self['_bwd_map'] = (
+                    self['_fwd_map'].flip(1) if self.num_kernels is not None
+                    else self['_fwd_map']
                 )
-        return self['_bwd_index_map']
+            elif self.num_kernels is not None and '_edge_kernel' in self:
+                self['_bwd_map'] = self._scatter_edges_to_map(
+                    self.edge_in, self.edge_out, self.num_input_coords,
+                )
+            elif self.num_kernels is not None and '_fwd_map' in self:
+                self['_bwd_map'] = kernels.triton.transpose_neighbor_map(
+                    self['_fwd_map'], self.num_input_coords,
+                )
+            else:
+                raise RuntimeError(
+                    "NeighborCache.bwd_map is unavailable: it was not supplied "
+                    "at construction and cannot be reconstructed (num_kernels "
+                    "is None, so the row width V' is unbounded). Provide "
+                    "`bwd_map=` to the constructor if downstream consumers need it."
+                )
+        return self['_bwd_map']
+
+    @property
+    def bwd_mask(self) -> Tensor:
+        if '_bwd_mask' not in self:
+            self['_bwd_mask'] = self._compute_mask(self.bwd_map)
+        return self['_bwd_mask']
+
+    # ------------------------------------------------------------------ #
+    # rep-b (CSR segments) lazy properties.
+    #
+    # Priority chain:
+    #   ① already cached
+    #   ② symmetric + other-dir seg cached: alias (no copy)
+    #   ③ own-dir map cached: ``_map_to_seg``
+    #   ④ symmetric + other-dir map cached: ``_map_to_seg`` on that map
+    #      (column order is destroyed by mask-select, so no flip needed)
+    #   ⑤ c-bridge: ``_ensure_edges`` + ``_edges_to_seg`` grouped by the
+    #      own-direction owner side.
+    # ------------------------------------------------------------------ #
+    @property
+    def fwd_seg_indices(self) -> Tensor:
+        "Concatenated input indices per output segment. Shape (nnz,)."
+        if '_fwd_seg_indices' not in self:
+            if self.symmetric and '_bwd_seg_indices' in self:
+                self['_fwd_seg_indices'] = self['_bwd_seg_indices']
+                self['_fwd_seg_offsets'] = self['_bwd_seg_offsets']
+            elif '_fwd_map' in self:
+                self['_fwd_seg_indices'], self['_fwd_seg_offsets'] = \
+                    self._map_to_seg(self['_fwd_map'], self.fwd_mask)
+            elif self.symmetric and '_bwd_map' in self:
+                self['_fwd_seg_indices'], self['_fwd_seg_offsets'] = \
+                    self._map_to_seg(self['_bwd_map'], self.bwd_mask)
+            else:
+                self._ensure_edges()
+                self['_fwd_seg_indices'], self['_fwd_seg_offsets'] = \
+                    self._edges_to_seg(
+                        self['_edge_out'], self['_edge_in'],
+                        self.num_output_coords,
+                    )
+        return self['_fwd_seg_indices']
+
+    @property
+    def fwd_seg_offsets(self) -> Tensor:
+        "Forward segment offsets. Shape (num_output_coords + 1,)."
+        if '_fwd_seg_offsets' not in self:
+            _ = self.fwd_seg_indices
+        return self['_fwd_seg_offsets']
+
+    @property
+    def bwd_seg_indices(self) -> Tensor:
+        "Concatenated output indices per input segment. Shape (nnz,)."
+        if '_bwd_seg_indices' not in self:
+            if self.symmetric and '_fwd_seg_indices' in self:
+                self['_bwd_seg_indices'] = self['_fwd_seg_indices']
+                self['_bwd_seg_offsets'] = self['_fwd_seg_offsets']
+            elif '_bwd_map' in self:
+                self['_bwd_seg_indices'], self['_bwd_seg_offsets'] = \
+                    self._map_to_seg(self['_bwd_map'], self.bwd_mask)
+            elif self.symmetric and '_fwd_map' in self:
+                self['_bwd_seg_indices'], self['_bwd_seg_offsets'] = \
+                    self._map_to_seg(self['_fwd_map'], self.fwd_mask)
+            else:
+                self._ensure_edges()
+                self['_bwd_seg_indices'], self['_bwd_seg_offsets'] = \
+                    self._edges_to_seg(
+                        self['_edge_in'], self['_edge_out'],
+                        self.num_input_coords,
+                    )
+        return self['_bwd_seg_indices']
+
+    @property
+    def bwd_seg_offsets(self) -> Tensor:
+        "Backward segment offsets. Shape (num_input_coords + 1,)."
+        if '_bwd_seg_offsets' not in self:
+            _ = self.bwd_seg_indices
+        return self['_bwd_seg_offsets']
 
     # ------------------------------------------------------------------ #
     # Conv-specific forward post-processing
     # ------------------------------------------------------------------ #
     def _fwd_post_process_gray_code_sort(self) -> None:
         self['_fwd_gray_code'], self['_fwd_sorted_idx'] = \
-            kernels.triton.neighbor_map_gray_code_sort(self.fwd_neighbor_mask)
+            kernels.triton.neighbor_map_gray_code_sort(self.fwd_mask)
 
     def _fwd_post_process_valid_signal(self) -> None:
         self['_fwd_valid_signal_i'], self['_fwd_valid_signal_o'], self['_fwd_valid_signal_seg'] = \
-            kernels.triton.neighbor_map_valid_signal(self.fwd_neighbor_map, self.fwd_neighbor_mask)
+            kernels.triton.neighbor_map_valid_signal(self.fwd_map, self.fwd_mask)
 
     def _fwd_post_process_valid_kernel(self, block_size: int) -> None:
         self[f'_fwd_valid_kernel_{block_size}'], self[f'_fwd_valid_kernel_seg_{block_size}'] = \
@@ -211,11 +621,11 @@ class NeighborCache(IndexCache):
     # ------------------------------------------------------------------ #
     def _bwd_post_process_gray_code_sort(self) -> None:
         self['_bwd_gray_code'], self['_bwd_sorted_idx'] = \
-            kernels.triton.neighbor_map_gray_code_sort(self.bwd_neighbor_mask)
+            kernels.triton.neighbor_map_gray_code_sort(self.bwd_mask)
 
     def _bwd_post_process_valid_signal(self) -> None:
         self['_bwd_valid_signal_i'], self['_bwd_valid_signal_o'], self['_bwd_valid_signal_seg'] = \
-            kernels.triton.neighbor_map_valid_signal(self.bwd_neighbor_map, self.bwd_neighbor_mask)
+            kernels.triton.neighbor_map_valid_signal(self.bwd_map, self.bwd_mask)
 
     def _bwd_post_process_valid_kernel(self, block_size: int) -> None:
         self[f'_bwd_valid_kernel_{block_size}'], self[f'_bwd_valid_kernel_seg_{block_size}'] = \
@@ -278,24 +688,14 @@ class NeighborCache(IndexCache):
 # NeighborCacheT  (transposed view)
 # ====================================================================== #
 
-class NeighborCacheT(IndexCacheT, NeighborCache):
+class NeighborCacheT(NeighborCache):
     """Zero-copy transposed view of a :class:`NeighborCache`.
 
-    The view re-exposes ``input``/``output`` coords and ``fwd``/``bwd``
-    buffers with their roles swapped. ``NeighborCache``'s ``*_neighbor_*``
-    alias properties (which forward to ``*_index_*`` on the base class)
-    automatically pick up the swap, so consumers see a fully transposed
-    neighbor cache with no extra plumbing.
-
-    Swap rules:
-
-    * ``input_coords`` ↔ ``output_coords``
-    * ``num_input_coords`` ↔ ``num_output_coords``
-    * ``input_shape`` ↔ ``output_shape``
-    * Every cached buffer keyed ``_fwd_*`` ↔ ``_bwd_*`` (index maps,
-      masks, segments, gray codes, valid signals, valid kernels).
-    * ``symmetric`` is unchanged (it's a property of the adjacency).
-    * ``is_transposed`` is ``True``.
+    Re-exposes ``input``/``output`` and ``fwd``/``bwd`` with their roles
+    swapped. All buffer reads/writes are forwarded to the underlying cache
+    after swapping ``_fwd_*`` ↔ ``_bwd_*`` key prefixes (and ``_edge_in``
+    ↔ ``_edge_out``), so lazy-materialized tensors are shared between the
+    view and the original.
 
     ``T.T`` is the original :class:`NeighborCache` (not a doubly-wrapped
     view). A transposed cache can only be obtained indirectly via
@@ -303,11 +703,7 @@ class NeighborCacheT(IndexCacheT, NeighborCache):
     ``transpose=True``.
     """
 
-    # MRO note: ``(IndexCacheT, NeighborCache)``. IndexCacheT first so its
-    # ``__init__`` / ``__getitem__`` / topology properties / ``T`` win;
-    # NeighborCache provides the ``fwd_neighbor_map`` etc. alias properties
-    # and the conv-specific gray_code / valid_signal / valid_kernel
-    # post-processing.
+    is_transposed: ClassVar[bool] = True
 
     def __init__(self, original: "NeighborCache", *, _token: Any = None):
         assert _token is _NCT_INTERNAL_TOKEN, (
@@ -317,8 +713,58 @@ class NeighborCacheT(IndexCacheT, NeighborCache):
         )
         assert not isinstance(original, NeighborCacheT), \
             "NeighborCacheT should wrap a NeighborCache, not another view"
-        # Hand off to IndexCacheT with its expected sentinel.
-        IndexCacheT.__init__(self, original, _token=_INDEX_CACHE_INTERNAL_TOKEN)
+        object.__setattr__(self, "_original", original)
+
+    # Dict-like access — swap fwd/bwd keys, delegate to the original.
+    def __getitem__(self, key):
+        return self._original[_swap_fwd_bwd_key(key)]
+
+    def __setitem__(self, key, value):
+        self._original[_swap_fwd_bwd_key(key)] = value
+
+    def __contains__(self, key):
+        return _swap_fwd_bwd_key(key) in self._original
+
+    # Topology — swap input/output, pass everything else through.
+    @property
+    def input_coords(self) -> Tensor:
+        return self._original.output_coords
+
+    @property
+    def output_coords(self) -> Tensor:
+        return self._original.input_coords
+
+    @property
+    def num_input_coords(self) -> int:
+        return self._original.num_output_coords
+
+    @property
+    def num_output_coords(self) -> int:
+        return self._original.num_input_coords
+
+    @property
+    def input_shape(self) -> torch.Size | None:
+        return self._original.output_shape
+
+    @property
+    def output_shape(self) -> torch.Size | None:
+        return self._original.input_shape
+
+    @property
+    def symmetric(self) -> bool:
+        return self._original.symmetric
+
+    @property
+    def num_kernels(self) -> int | None:
+        return self._original.num_kernels
+
+    # Transpose inverse: ``T.T`` is the original cache.
+    @property
+    def T(self) -> "NeighborCache":
+        return self._original
+
+    def transpose(self) -> "NeighborCache":
+        return self._original
 
 # ====================================================================== #
 # build_neighbor_cache — overloads + dispatcher
@@ -419,7 +865,8 @@ def build_neighbor_cache(
     * ``output_coords is None``: fused *output_coords + fwd_nm + bwd_nm* path.
       Requires ``input_shape``; ``output_shape`` is derived from
       ``(input_shape, kernel_size, stride, padding, dilation)`` if absent
-      (forward only — transposed mode requires an explicit ``output_shape``).
+      (forward formula when ``transpose=False``, conv-transpose formula
+      otherwise).
     * ``output_coords`` supplied: naive path — only the forward neighbor map
       is built (caller owns output coords).
 
@@ -663,8 +1110,8 @@ def _boundary_for_strided(
     each spatial dim ``d`` → ``[0, output_shape[-D_spatial + d])``.
 
     Shared by the two strided-auto Triton helpers below
-    (:func:`_build_strided_neighbor_map_kernel_size_triton` and
-    :func:`_build_strided_neighbor_map_kernel_delta_triton`).
+    (:func:`_build_strided_edges_kernel_size_triton` and
+    :func:`_build_strided_edges_kernel_delta_triton`).
     """
     batch_dims = input_coords.shape[1] - D_spatial
     spatial_out = tuple(output_shape[-D_spatial:]) if D_spatial > 0 else ()
@@ -698,7 +1145,7 @@ def _build_submanifold_kernel_size(
         input_coords, input_shape, kernel_size, dilation,
     )
     return NeighborCache(
-        fwd_neighbor_map=fwd_nm,
+        fwd_map=fwd_nm,
         input_coords=input_coords,
         output_coords=input_coords,
         input_shape=input_shape,
@@ -768,9 +1215,6 @@ def _build_submanifold_kernel_delta(
     symmetric: bool | None,
     input_shape: torch.Size | None,
 ) -> NeighborCache:
-    D_spatial = kernel_delta.shape[1]
-    stride = (1,) * D_spatial
-    offset = (0,) * D_spatial
 
     if symmetric is None:
         symmetric = bool(torch.equal(kernel_delta, (-kernel_delta).flip(0)))
@@ -778,7 +1222,7 @@ def _build_submanifold_kernel_delta(
         input_coords, kernel_delta, symmetric=symmetric,
     )
     return NeighborCache(
-        fwd_neighbor_map=fwd_nm,
+        fwd_map=fwd_nm,
         input_coords=input_coords,
         output_coords=input_coords,
         input_shape=input_shape,
@@ -855,16 +1299,16 @@ def _build_strided_kernel_size_auto(
     offset_t = _resolve_offset_from_padding(kernel_size, dilation, padding, offset)
 
     if output_shape is None:
-        assert not transposed, (
-            "build_neighbor_cache(submanifold=False, output_coords=None, transpose=True) "
-            "requires an explicit `output_shape` (the conv-transpose's large side); "
-            "auto-derivation from `input_shape` is only implemented for the forward formula."
-        )
         if padding is None:
             padding = _padding_from_offset(kernel_size, dilation, offset_t)
-        output_shape = _compute_strided_kernel_size_output_shape(
-            input_shape, kernel_size, stride, padding, dilation,
-        )
+        if transposed:
+            output_shape = compute_strided_kernel_size_transpose_output_shape(
+                input_shape, kernel_size, stride, padding, dilation,
+            )
+        else:
+            output_shape = compute_strided_kernel_size_output_shape(
+                input_shape, kernel_size, stride, padding, dilation,
+            )
 
     # CUDA fused path: forward-only; 3D-spatial / int32 / 4-col / dense-kernel only; needs padding.
     use_cuda_extension = (
@@ -885,64 +1329,102 @@ def _build_strided_kernel_size_auto(
             kernel_size, stride, padding, dilation,
             need_bwd=False,
         )
-    else:
-        bwd_nm, output_coords = _build_strided_neighbor_map_kernel_size_triton(
-            input_coords, input_shape, output_shape,
-            kernel_size, stride, dilation, offset_t,
-            D_spatial,
-            transposed=transposed,
-        )
-        fwd_nm = None
+        if not transposed:
+            return NeighborCache(
+                fwd_map=fwd_nm,
+                bwd_map=bwd_nm,
+                input_coords=input_coords,
+                output_coords=output_coords,
+                input_shape=input_shape,
+                output_shape=output_shape,
+                symmetric=False,
+            )
+        # CUDA path is forward-only (asserted above for transposed=True
+        # via ``not transposed`` in ``use_cuda_extension``), so this branch
+        # is unreachable; left for clarity.
+        raise AssertionError("unreachable")
+
+    # Triton edge-based path (works for both forward and transposed).
+    output_coords, edge_in, edge_out, edge_kernel = _build_strided_edges_kernel_size_triton(
+        input_coords, input_shape, output_shape,
+        kernel_size, stride, dilation, offset_t,
+        D_spatial,
+        transposed=transposed,
+    )
+    num_kernels = 1
+    for k in kernel_size:
+        num_kernels *= k
 
     if not transposed:
         # Forward: user's input/output_shape are also the underlying cache's.
         return NeighborCache(
-            fwd_neighbor_map=fwd_nm,
-            bwd_neighbor_map=bwd_nm,
+            edge_in=edge_in, edge_out=edge_out,
+            edge_kernel=edge_kernel, num_kernels=num_kernels,
             input_coords=input_coords,
             output_coords=output_coords,
             input_shape=input_shape,
             output_shape=output_shape,
             symmetric=False,
         )
-    else:
-        # Transposed: the kernel ran ``coord_out = coord_in * S + offset + delta``
-        # starting from the user's (small) ``input_coords`` and emitted candidate
-        # ``output_coords`` (the large side). From the underlying forward
-        # cache's POV those roles are swapped:
-        #   * underlying.input_coords  = large candidate coords
-        #   * underlying.output_coords = user's input_coords (small)
-        # The kernel's returned ``bwd_nm`` has shape ``(N_small, V)`` indexed by
-        # user-input → which is ``num_output_coords`` on the underlying cache —
-        # i.e. exactly the underlying forward neighbor map.
-        underlying = NeighborCache(
-            fwd_neighbor_map=bwd_nm,
-            input_coords=output_coords,
-            output_coords=input_coords,
-            input_shape=output_shape,
-            output_shape=input_shape,
-            symmetric=False,
-        )
-        return underlying.T
+    # Transposed: kernel ran ``coord_out = coord_in * S + offset + delta``
+    # starting from user's (small) ``input_coords`` and emitted candidate
+    # ``output_coords`` (large). The underlying forward cache has roles
+    # swapped — its ``edge_in`` indexes large coords, ``edge_out`` indexes
+    # small coords — so we swap the kernel's edge_in / edge_out (the kernel
+    # slot semantics are unchanged).
+    underlying = NeighborCache(
+        edge_in=edge_out, edge_out=edge_in,
+        edge_kernel=edge_kernel, num_kernels=num_kernels,
+        input_coords=output_coords,
+        output_coords=input_coords,
+        input_shape=output_shape,
+        output_shape=input_shape,
+        symmetric=False,
+    )
+    return underlying.T
 
 
-def _compute_strided_kernel_size_output_shape(
+def compute_strided_kernel_size_output_shape(
     input_shape: torch.Size,
     kernel_size: tuple[int, ...],
     stride: tuple[int, ...],
     padding: tuple[int, ...],
     dilation: tuple[int, ...],
 ) -> torch.Size:
-    """``Wo = (W + 2P - D(K-1) - 1) // S + 1`` (matching ``torch.nn.functional.conv*``).
+    """Forward conv output shape: ``Wo = (W + 2P - D(K-1) - 1) // S + 1``.
 
-    Only the trailing ``len(kernel_size)`` dims are treated as spatial; leading
-    dims pass through unchanged.
+    Matches ``torch.nn.functional.conv*``. Only the trailing
+    ``len(kernel_size)`` dims are treated as spatial; leading dims pass
+    through unchanged.
     """
     Ds = len(kernel_size)
     prefix = tuple(input_shape[:-Ds]) if Ds > 0 else tuple(input_shape)
     spatial = tuple(input_shape[-Ds:]) if Ds > 0 else ()
     out_spatial = tuple(
         (w + 2 * p - d * (k - 1) - 1) // s + 1
+        for w, k, s, p, d in zip(spatial, kernel_size, stride, padding, dilation)
+    )
+    return torch.Size([*prefix, *out_spatial])
+
+
+def compute_strided_kernel_size_transpose_output_shape(
+    input_shape: torch.Size,
+    kernel_size: tuple[int, ...],
+    stride: tuple[int, ...],
+    padding: tuple[int, ...],
+    dilation: tuple[int, ...],
+) -> torch.Size:
+    """Conv-transpose output shape: ``Wo = (W - 1) * S - 2P + D(K - 1) + 1``.
+
+    Matches ``torch.nn.ConvTransposeNd`` (no ``output_padding``). Only the
+    trailing ``len(kernel_size)`` dims are treated as spatial; leading dims
+    pass through unchanged.
+    """
+    Ds = len(kernel_size)
+    prefix = tuple(input_shape[:-Ds]) if Ds > 0 else tuple(input_shape)
+    spatial = tuple(input_shape[-Ds:]) if Ds > 0 else ()
+    out_spatial = tuple(
+        (w - 1) * s - 2 * p + d * (k - 1) + 1
         for w, k, s, p, d in zip(spatial, kernel_size, stride, padding, dilation)
     )
     return torch.Size([*prefix, *out_spatial])
@@ -959,7 +1441,7 @@ def _build_strided_neighbor_map_kernel_size_cuda(
 ) -> tuple[Tensor, Tensor | None, Tensor]:
     """CUDA fused get_output_coords + neighbor map for the dense-kernel formulation.
 
-    Returns ``(fwd_neighbor_map, bwd_neighbor_map_or_None, output_coords)``.
+    Returns ``(fwd_map, bwd_map_or_None, output_coords)``.
     """
     N, C, W, H, Dd = shape
     if spconv.OUT_COORD_ALGO == 0:  # HASHMAP
@@ -997,7 +1479,7 @@ def _build_strided_neighbor_map_kernel_size_cuda(
     return fwd_nm, bwd_nm, output_coords
 
 
-def _build_strided_neighbor_map_kernel_size_triton(
+def _build_strided_edges_kernel_size_triton(
     input_coords: Tensor,
     shape: torch.Size,
     output_shape: torch.Size,
@@ -1007,11 +1489,15 @@ def _build_strided_neighbor_map_kernel_size_triton(
     offset: tuple[int, ...],
     D_spatial: int,
     transposed: bool = False,
-) -> tuple[Tensor, Tensor]:
-    """Triton fused get_output_coords + bwd neighbor map for the dense-kernel formulation.
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Triton fused get_output_coords + COO edges for the dense-kernel formulation.
 
-    Returns ``(bwd_neighbor_map, output_coords)``. The forward neighbor map is
-    derived lazily by :class:`NeighborCache` from the backward map.
+    Returns ``(output_coords, edge_in, edge_out, edge_kernel)``. ``edge_in``
+    indexes ``input_coords``, ``edge_out`` indexes the returned
+    ``output_coords``, ``edge_kernel`` is the per-edge kernel slot in
+    ``[0, prod(kernel_size))``. The forward / backward neighbor maps are
+    derived lazily by :class:`NeighborCache` (via scatter, see
+    :meth:`NeighborCache.fwd_map`).
 
     When ``transposed=True`` the kernel runs the conv-transpose relation
     ``candidate_out = coord_in * stride + offset + delta`` (see
@@ -1022,16 +1508,17 @@ def _build_strided_neighbor_map_kernel_size_triton(
     boundary = _boundary_for_strided(input_coords, shape, output_shape, D_spatial)
     # NOTE: get_output_coords_kernel_size_dilation takes ``offset``,
     # not ``padding`` (centered-kernel convention).
-    output_coords, bwd_nm = kernels.triton.get_output_coords_kernel_size_dilation(
-        input_coords,
-        kernel_size=kernel_size,
-        stride=stride,
-        dilation=dilation,
-        offset=offset,
-        boundary=boundary,
-        transposed=transposed,
-    )
-    return bwd_nm, output_coords
+    output_coords, edge_in, edge_out, edge_kernel = \
+        kernels.triton.get_output_coords_kernel_size_dilation(
+            input_coords,
+            kernel_size=kernel_size,
+            stride=stride,
+            dilation=dilation,
+            offset=offset,
+            boundary=boundary,
+            transposed=transposed,
+        )
+    return output_coords, edge_in, edge_out, edge_kernel
 
 
 # ====================================================================== #
@@ -1085,7 +1572,7 @@ def _build_strided_kernel_size_custom(
         offset=offset_t,
     )
     underlying = NeighborCache(
-        fwd_neighbor_map=fwd_nm,
+        fwd_map=fwd_nm,
         input_coords=input_coords,
         output_coords=output_coords,
         input_shape=input_shape,
@@ -1123,46 +1610,54 @@ def _build_strided_kernel_delta_auto(
         "stride / offset must match kernel_delta's spatial dimensionality"
 
     if output_shape is None:
-        assert not transposed, (
-            "build_neighbor_cache(submanifold=False, output_coords=None, transpose=True) "
-            "requires an explicit `output_shape` (the conv-transpose's large side)."
-        )
-        output_shape = _compute_strided_delta_output_shape(input_shape, stride)
+        if transposed:
+            output_shape = compute_strided_kernel_delta_transpose_output_shape(
+                input_shape, stride,
+            )
+        else:
+            output_shape = compute_strided_kernel_delta_output_shape(
+                input_shape, stride,
+            )
 
-    bwd_nm, output_coords = _build_strided_neighbor_map_kernel_delta_triton(
+    output_coords, edge_in, edge_out, edge_kernel = _build_strided_edges_kernel_delta_triton(
         input_coords, input_shape, output_shape,
         kernel_delta, stride, offset_t,
         D_spatial,
         transposed=transposed,
     )
+    num_kernels = kernel_delta.shape[0]
 
     if not transposed:
         return NeighborCache(
-            bwd_neighbor_map=bwd_nm,
+            edge_in=edge_in, edge_out=edge_out,
+            edge_kernel=edge_kernel, num_kernels=num_kernels,
             input_coords=input_coords,
             output_coords=output_coords,
             input_shape=input_shape,
             output_shape=output_shape,
             symmetric=False,
         )
-    else:
-        # See `_build_strided_kernel_size_auto` for the role-swap reasoning.
-        underlying = NeighborCache(
-            fwd_neighbor_map=bwd_nm,
-            input_coords=output_coords,
-            output_coords=input_coords,
-            input_shape=output_shape,
-            output_shape=input_shape,
-            symmetric=False,
-        )
-        return underlying.T
+    # See `_build_strided_kernel_size_auto` for the edge-swap reasoning.
+    underlying = NeighborCache(
+        edge_in=edge_out, edge_out=edge_in,
+        edge_kernel=edge_kernel, num_kernels=num_kernels,
+        input_coords=output_coords,
+        output_coords=input_coords,
+        input_shape=output_shape,
+        output_shape=input_shape,
+        symmetric=False,
+    )
+    return underlying.T
 
 
-def _compute_strided_delta_output_shape(
+def compute_strided_kernel_delta_output_shape(
     input_shape: torch.Size,
     stride: tuple[int, ...],
 ) -> torch.Size:
-    """``Wo = W // S``; spatial dims are the trailing ``len(stride)`` of input_shape."""
+    """Forward kernel_delta output shape: ``Wo = W // S``.
+
+    Spatial dims are the trailing ``len(stride)`` of ``input_shape``.
+    """
     Ds = len(stride)
     prefix = tuple(input_shape[:-Ds]) if Ds > 0 else tuple(input_shape)
     spatial = tuple(input_shape[-Ds:]) if Ds > 0 else ()
@@ -1170,7 +1665,24 @@ def _compute_strided_delta_output_shape(
     return torch.Size([*prefix, *out_spatial])
 
 
-def _build_strided_neighbor_map_kernel_delta_triton(
+def compute_strided_kernel_delta_transpose_output_shape(
+    input_shape: torch.Size,
+    stride: tuple[int, ...],
+) -> torch.Size:
+    """Conv-transpose kernel_delta output shape: ``Wo = W * S``.
+
+    Inverse of :func:`compute_strided_kernel_delta_output_shape` (no
+    ``output_padding``). Spatial dims are the trailing ``len(stride)`` of
+    ``input_shape``.
+    """
+    Ds = len(stride)
+    prefix = tuple(input_shape[:-Ds]) if Ds > 0 else tuple(input_shape)
+    spatial = tuple(input_shape[-Ds:]) if Ds > 0 else ()
+    out_spatial = tuple(w * s for w, s in zip(spatial, stride))
+    return torch.Size([*prefix, *out_spatial])
+
+
+def _build_strided_edges_kernel_delta_triton(
     input_coords: Tensor,
     shape: torch.Size,
     output_shape: torch.Size,
@@ -1179,19 +1691,20 @@ def _build_strided_neighbor_map_kernel_delta_triton(
     offset: tuple[int, ...],
     D_spatial: int,
     transposed: bool = False,
-) -> tuple[Tensor, Tensor]:
-    """Triton fused get_output_coords + bwd neighbor map for the kernel_delta formulation.
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Triton fused get_output_coords + COO edges for the kernel_delta formulation.
 
-    Returns ``(bwd_neighbor_map, output_coords)``. The forward neighbor map is
-    derived lazily by :class:`NeighborCache` from the backward map.
+    Returns ``(output_coords, edge_in, edge_out, edge_kernel)``. ``edge_kernel``
+    is in ``[0, kernel_delta.shape[0])``. The forward / backward neighbor
+    maps are derived lazily by :class:`NeighborCache` via scatter.
     """
     boundary = _boundary_for_strided(input_coords, shape, output_shape, D_spatial)
-    output_coords, bwd_nm = kernels.triton.get_output_coords_kernel_delta(
+    output_coords, edge_in, edge_out, edge_kernel = kernels.triton.get_output_coords_kernel_delta(
         input_coords, kernel_delta,
         stride=stride, offset=offset, boundary=boundary,
         transposed=transposed,
     )
-    return bwd_nm, output_coords
+    return output_coords, edge_in, edge_out, edge_kernel
 
 
 # ====================================================================== #
@@ -1224,7 +1737,7 @@ def _build_strided_kernel_delta_custom(
         stride=stride, offset=offset_t,
     )
     underlying = NeighborCache(
-        fwd_neighbor_map=fwd_nm,
+        fwd_map=fwd_nm,
         input_coords=input_coords,
         output_coords=output_coords,
         input_shape=input_shape,

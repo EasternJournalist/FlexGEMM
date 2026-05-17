@@ -3,10 +3,16 @@ from torch import Tensor
 from typing import *
 
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
+from ..utils import _broadcast_dim_arg
 from .functions import _select_function
 
 
-__all__ = ['submanifold_conv']
+__all__ = [
+    'submanifold_conv',
+    'submanifold_conv2d',
+    'submanifold_conv3d',
+    'submanifold_conv4d',
+]
 
 
 _Algo = Literal[
@@ -149,3 +155,179 @@ def submanifold_conv(
         feats, neighbor_cache, weight_v, bias,
     )
     return output_feats, neighbor_cache
+
+
+# ---------------------------------------------------------------------------
+# Fixed-spatial-dim aliases.
+#
+# Compared with :func:`submanifold_conv`, dim-related arguments (``dilation``)
+# accept either a scalar ``int`` (broadcast to length ``D``) or a length-``D``
+# sequence. ``coords.shape[1]`` may exceed ``D``; the leading
+# ``coords.shape[1] - D`` columns are treated as batch dims.
+#
+# ``@overload`` declarations don't transfer through ``functools.wraps`` (they
+# live in ``typing._overload_registry`` per fully-qualified name), so we
+# re-declare both overloads (kernel_size mode / kernel_delta mode) per alias.
+# ---------------------------------------------------------------------------
+
+
+def _submanifold_conv_nd(
+    D: int, feats, coords, shape, weight, bias,
+    dilation, kernel_delta, symmetric, neighbor_cache, algorithm,
+):
+    dilation = _broadcast_dim_arg(dilation, D, "dilation")
+    return submanifold_conv(
+        feats, coords, shape, weight, bias,
+        dilation=dilation, kernel_delta=kernel_delta, symmetric=symmetric,
+        neighbor_cache=neighbor_cache, algorithm=algorithm,
+    )
+
+
+# --- 2-D ---------------------------------------------------------------------
+@overload
+def submanifold_conv2d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size | None,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    dilation: int | tuple[int, int] | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """2-D spatial alias of :func:`submanifold_conv` (kernel_size mode).
+
+    ``dilation`` may be a scalar ``int`` (broadcast to length 2) or a
+    length-2 tuple. ``coords.shape[1]`` may exceed 2; the leading columns are
+    batch dims. All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+@overload
+def submanifold_conv2d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size | None,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    kernel_delta: Tensor,
+    symmetric: bool | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """2-D spatial alias of :func:`submanifold_conv` (kernel_delta mode).
+
+    ``coords.shape[1]`` may exceed 2; the leading columns are batch dims.
+    All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+def submanifold_conv2d(
+    feats, coords, shape, weight, bias=None, *,
+    dilation=None, kernel_delta=None, symmetric=None,
+    neighbor_cache=None, algorithm=None,
+):
+    return _submanifold_conv_nd(
+        2, feats, coords, shape, weight, bias,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm,
+    )
+
+
+# --- 3-D ---------------------------------------------------------------------
+@overload
+def submanifold_conv3d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size | None,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    dilation: int | tuple[int, int, int] | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """3-D spatial alias of :func:`submanifold_conv` (kernel_size mode).
+
+    ``dilation`` may be a scalar ``int`` (broadcast to length 3) or a
+    length-3 tuple. ``coords.shape[1]`` may exceed 3; the leading columns are
+    batch dims. All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+@overload
+def submanifold_conv3d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size | None,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    kernel_delta: Tensor,
+    symmetric: bool | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """3-D spatial alias of :func:`submanifold_conv` (kernel_delta mode).
+
+    ``coords.shape[1]`` may exceed 3; the leading columns are batch dims.
+    All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+def submanifold_conv3d(
+    feats, coords, shape, weight, bias=None, *,
+    dilation=None, kernel_delta=None, symmetric=None,
+    neighbor_cache=None, algorithm=None,
+):
+    return _submanifold_conv_nd(
+        3, feats, coords, shape, weight, bias,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm,
+    )
+
+
+# --- 4-D ---------------------------------------------------------------------
+@overload
+def submanifold_conv4d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size | None,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    dilation: int | tuple[int, int, int, int] | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """4-D spatial alias of :func:`submanifold_conv` (kernel_size mode).
+
+    ``dilation`` may be a scalar ``int`` (broadcast to length 4) or a
+    length-4 tuple. ``coords.shape[1]`` may exceed 4; the leading columns are
+    batch dims. All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+@overload
+def submanifold_conv4d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size | None,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    *,
+    kernel_delta: Tensor,
+    symmetric: bool | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """4-D spatial alias of :func:`submanifold_conv` (kernel_delta mode).
+
+    ``coords.shape[1]`` may exceed 4; the leading columns are batch dims.
+    All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+def submanifold_conv4d(
+    feats, coords, shape, weight, bias=None, *,
+    dilation=None, kernel_delta=None, symmetric=None,
+    neighbor_cache=None, algorithm=None,
+):
+    return _submanifold_conv_nd(
+        4, feats, coords, shape, weight, bias,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm,
+    )

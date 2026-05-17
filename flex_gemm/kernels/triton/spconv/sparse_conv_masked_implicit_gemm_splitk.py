@@ -4,7 +4,7 @@ import torch
 import triton
 import triton.language as tl
 from ..utils import get_num_sm
-from ....utils.autotuner import triton_autotune, autotune
+from ....autotuner import triton_autotune, autotune
 from . import config
 from .sparse_conv_implicit_gemm_splitk import sparse_conv_fwd_implicit_gemm_splitk
 from .sparse_conv_masked_implicit_gemm import (

@@ -1,6 +1,7 @@
 from typing import *
 import torch
 import triton
+import triton.language as tl
 from torch import Tensor
 
 
@@ -79,3 +80,68 @@ def segment_take(data: Tensor, *, offsets: Tensor | None, lengths: Tensor | None
     indices = torch.arange(new_offsets[-1], device=data.device) + torch.repeat_interleave(offsets[taking] - new_offsets[:-1], new_lengths)
     new_data = data.index_select(dim, indices)
     return new_data, new_offsets
+
+
+# -----------------------------------------------------------------------------
+# Fused integer floor-division + remainder.
+# -----------------------------------------------------------------------------
+
+
+@triton.jit
+def _floor_divmod_kernel(
+    x_ptr,            # (N,) input integers
+    q_ptr,            # (N,) output  q = floor(x / d)
+    r_ptr,            # (N,) output  r = x - q * d   ∈ [0, d)  (when d > 0)
+    d,                # scalar divisor (matches x's dtype)
+    N: int,
+    BLOCK: tl.constexpr,
+):
+    pid = tl.program_id(0)
+    offs = pid * BLOCK + tl.arange(0, BLOCK)
+    mask = offs < N
+    x = tl.load(x_ptr + offs, mask=mask)
+    # Triton's ``//`` is truncated toward zero for signed ints; convert to
+    # Python / torch ``rounding_mode='floor'`` semantics.
+    trunc_q = x // d
+    trunc_r = x - trunc_q * d
+    need_adj = (trunc_r != 0) & ((x < 0) ^ (d < 0))
+    adj = need_adj.to(x.dtype)
+    q = trunc_q - adj
+    r = trunc_r + adj * d
+    tl.store(q_ptr + offs, q, mask=mask)
+    tl.store(r_ptr + offs, r, mask=mask)
+
+
+def floor_divmod(x: Tensor, d: int) -> Tuple[Tensor, Tensor]:
+    """Fused integer floor-division and remainder for a 1-D integer tensor.
+
+    Equivalent to::
+
+        q = torch.div(x, d, rounding_mode='floor')
+        r = x - q * d                          # == torch.remainder(x, d)
+
+    but computed in a single Triton kernel (one load + two stores per element)
+    instead of the multi-pass torch implementation.
+
+    Args:
+        x: 1-D integer tensor on CUDA.
+        d: non-zero Python int divisor.
+
+    Returns:
+        ``(q, r)`` — both with the same dtype, shape, and device as ``x``.
+    """
+    assert x.is_cuda, "floor_divmod requires a CUDA tensor"
+    assert x.dtype in (torch.int8, torch.int16, torch.int32, torch.int64), (
+        f"floor_divmod requires an integer tensor, got {x.dtype}"
+    )
+    assert d != 0, "floor_divmod divisor must be non-zero"
+    x = x.contiguous()
+    N = x.numel()
+    q = torch.empty_like(x)
+    r = torch.empty_like(x)
+    if N == 0:
+        return q, r
+    BLOCK = 1024
+    grid = (triton.cdiv(N, BLOCK),)
+    _floor_divmod_kernel[grid](x, q, r, d, N, BLOCK=BLOCK)
+    return q, r

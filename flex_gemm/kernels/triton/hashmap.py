@@ -311,7 +311,7 @@ def _hashmap_unique_kernel_32bit(
         existing_key = _vec_load(keys_ptr_32 + prev_idx * D_32, mask=tag_match, D=D_32)
         full_match = tag_match & _reduce_all(existing_key == key_vec, axis=-1)
         found_idx = tl.where(full_match, prev_idx, found_idx)
-        active = active & ~full_match
+        active &= ~full_match
 
         # Linear-probe advance. Unconditional ``+ 1`` is fine: settled lanes
         # will just do a no-op CAS on the next slot.
@@ -358,7 +358,7 @@ def hashmap_build(keys: Tensor) -> Tensor:
 
     hashmap = torch.full((hashmap_size,), -1, dtype=torch.int32, device=keys.device)
 
-    BLOCK_SIZE = 32
+    BLOCK_SIZE = 64
     grid = (triton.cdiv(n_keys, BLOCK_SIZE), )
     
     _hashmap_build_kernel_32bit[grid](
@@ -405,7 +405,7 @@ def hashmap_lookup(hashmap: Tensor, keys: Tensor, queries: Tensor) -> Tensor:
 
     results = torch.empty((n_queries,), dtype=torch.int32, device=keys.device)
     
-    BLOCK_SIZE = 32
+    BLOCK_SIZE = 64
     grid = (triton.cdiv(n_queries, BLOCK_SIZE), )
     _hashmap_lookup_kernel_32bit[grid](
         queries_ptr=queries_i32,
@@ -491,6 +491,7 @@ def hashmap_unique(
 
     NOTE: this function is like `torch.unique` but much faster at the cost of non-deterministic order of the unique keys. 
     The result order is not even consistent for the same input due to the race condition in hashmap.
+    NOTE: all returned indices are int32
     
     Args:
         keys (Tensor): A tensor of shape `(n_keys, *key_dims)` representing the keys.
@@ -529,7 +530,7 @@ def hashmap_unique(
     indices = torch.empty((n_keys,), dtype=torch.int32, device=keys.device)
     is_canonical = torch.empty((n_keys,), dtype=torch.bool, device=keys.device)
 
-    BLOCK_SIZE = 32
+    BLOCK_SIZE = 64
     grid = (triton.cdiv(n_keys, BLOCK_SIZE),)
     _hashmap_unique_kernel_32bit[grid](
         hashmap_ptr=hashmap,
@@ -560,4 +561,3 @@ def hashmap_unique(
     if len(returns) == 1:
         return returns[0]
     return returns
-

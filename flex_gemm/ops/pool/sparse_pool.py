@@ -5,11 +5,15 @@ from torch import Tensor
 
 from ... import kernels
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
-from .index_segment_reduce import index_segment_reduce
+from ..index_segment_reduce import index_segment_reduce
+from ..utils import _broadcast_dim_arg
 
 
 __all__ = [
     "sparse_pool",
+    "sparse_pool2d",
+    "sparse_pool3d",
+    "sparse_pool4d",
 ]
 
 
@@ -108,58 +112,101 @@ def sparse_pool(
     return output_feats, output_coords, output_shape, neighbor_cache
 
 
-# =====================================================================
-# Specialized fast path (kept separate pending benchmark)
-# =====================================================================
+# ---------------------------------------------------------------------------
+# Fixed-spatial-dim aliases.
+#
+# Compared with :func:`sparse_pool`, dim-related args (``kernel_size`` /
+# ``stride`` / ``padding``) accept either a scalar ``int`` (broadcast to
+# length ``D``) or a length-``D`` sequence. ``input_coords.shape[1]`` may
+# exceed ``D``; the leading columns are batch dims.
+# ---------------------------------------------------------------------------
 
-def _sparse_pool_perfect_partition(
+
+def _sparse_pool_nd(
+    D, feats, input_coords, shape,
+    kernel_size, stride, padding, reduce,
+    output_coords, output_shape, neighbor_cache,
+):
+    kernel_size = _broadcast_dim_arg(kernel_size, D, "kernel_size")
+    stride      = _broadcast_dim_arg(stride,      D, "stride")
+    padding     = _broadcast_dim_arg(padding,     D, "padding")
+    return sparse_pool(
+        feats, input_coords, shape, kernel_size, stride, padding, reduce,
+        output_coords, output_shape, neighbor_cache,
+    )
+
+
+def sparse_pool2d(
     feats: Tensor,
     input_coords: Tensor,
-    kernel_size: tuple[int, ...],
+    shape: torch.Size,
+    kernel_size: int | tuple[int, int],
+    stride: int | tuple[int, int] | None = None,
+    padding: int | tuple[int, int] | None = None,
     reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
-) -> Tuple[Tensor, Tensor]:
-    """Fast path for the *perfect partition* case: ``stride == kernel_size``,
-    ``padding == 0``. Each input lands in exactly one output window, so we
-    skip neighbor-map construction entirely: compute ``out_coord = c // stride``
-    per input, dedupe via ``hashmap_unique``, and feed the inverse mapping
-    into ``scatter_to_segment`` directly.
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """2-D spatial alias of :func:`sparse_pool`.
 
-    Returns ``(output_feats, output_coords)``. ``output_shape`` is not produced
-    here because no dense ``shape`` is consulted in this path; callers that
-    need it can derive it externally.
-
-    Note:
-        This specialization bypasses :class:`NeighborCache`. Whether it
-        actually beats the general path is an open question — benchmark
-        before promoting it back into the main dispatch.
+    ``kernel_size`` / ``stride`` / ``padding`` may each be a scalar ``int``
+    (broadcast to length 2) or a length-2 tuple. ``input_coords.shape[1]``
+    may exceed 2; the leading columns are batch dims. All other
+    args/semantics match :func:`sparse_pool`.
     """
-    if reduce not in _REDUCE_MODES:
-        raise ValueError(f"reduce must be one of {_REDUCE_MODES}, got {reduce!r}")
-    assert input_coords.is_contiguous(), "Coords should be contiguous"
-
-    kernel_size = tuple(kernel_size)
-    D_spatial = len(kernel_size)
-    stride = kernel_size
-
-    batch_dims = input_coords.shape[1] - D_spatial
-
-    # Build per-input output coord. Batch dims pass through; spatial dims are
-    # floor-divided by stride.
-    spatial_part = input_coords[:, batch_dims:]
-    stride_tensor = torch.tensor(stride, dtype=input_coords.dtype, device=input_coords.device)
-    out_spatial = torch.div(spatial_part, stride_tensor, rounding_mode='floor').to(input_coords.dtype)
-    if batch_dims > 0:
-        batch_part = input_coords[:, :batch_dims]
-        out_coords_per_input = torch.cat([batch_part, out_spatial], dim=1).contiguous()
-    else:
-        out_coords_per_input = out_spatial.contiguous()
-
-    # Dedupe to unique output coords + inverse (input idx → output idx).
-    output_coords, unique_inverse = kernels.triton.hashmap_unique(
-        out_coords_per_input, return_inverse=True,
+    return _sparse_pool_nd(
+        2, feats, input_coords, shape, kernel_size, stride, padding, reduce,
+        output_coords, output_shape, neighbor_cache,
     )
-    M = output_coords.shape[0]
 
-    seg_indices, seg_offsets = kernels.triton.scatter_to_segment(unique_inverse, M)
-    output_feats = index_segment_reduce(feats, seg_indices, seg_offsets, reduce)
-    return output_feats, output_coords
+
+def sparse_pool3d(
+    feats: Tensor,
+    input_coords: Tensor,
+    shape: torch.Size,
+    kernel_size: int | tuple[int, int, int],
+    stride: int | tuple[int, int, int] | None = None,
+    padding: int | tuple[int, int, int] | None = None,
+    reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """3-D spatial alias of :func:`sparse_pool`.
+
+    ``kernel_size`` / ``stride`` / ``padding`` may each be a scalar ``int``
+    (broadcast to length 3) or a length-3 tuple. ``input_coords.shape[1]``
+    may exceed 3; the leading columns are batch dims. All other
+    args/semantics match :func:`sparse_pool`.
+    """
+    return _sparse_pool_nd(
+        3, feats, input_coords, shape, kernel_size, stride, padding, reduce,
+        output_coords, output_shape, neighbor_cache,
+    )
+
+
+def sparse_pool4d(
+    feats: Tensor,
+    input_coords: Tensor,
+    shape: torch.Size,
+    kernel_size: int | tuple[int, int, int, int],
+    stride: int | tuple[int, int, int, int] | None = None,
+    padding: int | tuple[int, int, int, int] | None = None,
+    reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
+    output_coords: Tensor | None = None,
+    output_shape: torch.Size | None = None,
+    neighbor_cache: NeighborCache | None = None,
+) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
+    """4-D spatial alias of :func:`sparse_pool`.
+
+    ``kernel_size`` / ``stride`` / ``padding`` may each be a scalar ``int``
+    (broadcast to length 4) or a length-4 tuple. ``input_coords.shape[1]``
+    may exceed 4; the leading columns are batch dims. All other
+    args/semantics match :func:`sparse_pool`.
+    """
+    return _sparse_pool_nd(
+        4, feats, input_coords, shape, kernel_size, stride, padding, reduce,
+        output_coords, output_shape, neighbor_cache,
+    )
+

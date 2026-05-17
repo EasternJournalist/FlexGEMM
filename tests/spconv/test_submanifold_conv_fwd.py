@@ -24,7 +24,6 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 import flex_gemm
 from flex_gemm import config
-config.USE_AUTOTUNE_RUNTIME = False # Disable autotuning during tests to avoid stucking on cache loading
 
 from utils import sphere_coords, calc_err, get_device_max_flops  # noqa: E402
 
@@ -325,7 +324,7 @@ def test_speed(cfg):
         ref_out, nc = flex_gemm.submanifold_conv(
             feats, coords, shape, weight, bias, algorithm="explicit_gemm"
         )
-    L = int((nc.fwd_neighbor_map != -1).sum().item())
+    L = int((nc.fwd_map != -1).sum().item())
     total_flops = 2 * L * cfg["C"] * cfg["C"]
 
     # Reference: explicit_gemm on triton backend.

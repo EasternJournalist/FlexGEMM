@@ -452,6 +452,27 @@ def _spconv_out_dim(W, K, S, P, Dl):
     return (W + 2 * P - Dl * (K - 1) - 1) // S + 1
 
 
+def _canonical_edges(edge_in: torch.Tensor,
+                     edge_out: torch.Tensor,
+                     edge_kernel: torch.Tensor,
+                     out_coords: torch.Tensor) -> torch.Tensor:
+    """Return a lexicographically-sorted ``(E, 2 + D)`` int64 tensor whose rows
+    are ``(edge_in, edge_kernel, *out_coords[edge_out])``. This canonicalises
+    edge sets so two implementations that may order ``output_coords``
+    differently can still be compared row-wise.
+    """
+    if edge_in.numel() == 0:
+        D = out_coords.shape[1]
+        return torch.empty((0, 2 + D), dtype=torch.int64, device=edge_in.device)
+    out_xyz = out_coords[edge_out.long()].to(torch.int64)
+    rows = torch.cat([
+        edge_in.to(torch.int64).unsqueeze(1),
+        edge_kernel.to(torch.int64).unsqueeze(1),
+        out_xyz,
+    ], dim=1)
+    return _sorted_coords(rows)
+
+
 # (kernel_size, stride, dilation, offset, boundary, n_points, coord_range, dtype, tag)
 _OUTPUT_COORDS_CASES = [
     ((3, 3, 3), (1, 1, 1), (1, 1, 1), (0, 0, 0), ((0, 10),) * 3, 20, 10, torch.int32, "3D k=3 s=1 d=1 o=0"),
@@ -487,14 +508,12 @@ def test_get_output_coords_kernel_size_dilation_matches_torch(
 
     # Reference: use a very wide boundary when boundary is None.
     ref_boundary = boundary if boundary is not None else ((-32768, 32767),) * D
-    ref_coords, ref_bwd = get_output_coords_kernel_size_dilation_torch(
+    ref_coords, ref_edge_in, ref_edge_out, ref_edge_kernel = get_output_coords_kernel_size_dilation_torch(
         coords, kernel_size, stride=stride, offset=offset, dilation=dilation, boundary=ref_boundary
     )
-    _ref_fwd = transpose_neighbor_map_torch(ref_bwd, ref_coords.shape[0])
-    tri_coords, tri_bwd = get_output_coords_kernel_size_dilation(
+    tri_coords, tri_edge_in, tri_edge_out, tri_edge_kernel = get_output_coords_kernel_size_dilation(
         coords, kernel_size, stride=stride, dilation=dilation, offset=offset, boundary=boundary
     )
-    tri_fwd = transpose_neighbor_map(tri_bwd, tri_coords.shape[0])
 
     # 1) Same set of unique output coords (order may differ).
     ref_s = torch.unique(_sorted_coords(ref_coords.to(torch.int32)), dim=0)
@@ -502,19 +521,13 @@ def test_get_output_coords_kernel_size_dilation_matches_torch(
     assert ref_s.shape == tri_s.shape, f"[{tag}] coord-set sizes differ: ref={ref_s.shape} tri={tri_s.shape}"
     assert (ref_s == tri_s).all(), f"[{tag}] coord-set contents differ"
 
-    # 2) fwd/bwd self-consistency: tri_bwd[tri_fwd[m,v], v] == m for valid entries.
-    valid_fwd = tri_fwd >= 0
-    m_idx, v_idx = valid_fwd.nonzero(as_tuple=True)
-    if m_idx.numel() > 0:
-        n_vals = tri_fwd[m_idx, v_idx].long()
-        assert (tri_bwd[n_vals, v_idx] == m_idx.to(torch.int32)).all(), (
-            f"[{tag}] fwd/bwd not mutually consistent"
-        )
-
-    # 3) Total valid-entry count must match torch reference.
-    assert (tri_bwd >= 0).sum().item() == (ref_bwd >= 0).sum().item(), (
-        f"[{tag}] valid-entry counts differ"
+    # 2) Same set of edges, canonicalised as (edge_in, edge_kernel, out_coord_tuple).
+    ref_e = _canonical_edges(ref_edge_in, ref_edge_out, ref_edge_kernel, ref_coords.to(torch.int32))
+    tri_e = _canonical_edges(tri_edge_in, tri_edge_out, tri_edge_kernel, tri_coords.to(torch.int32))
+    assert ref_e.shape == tri_e.shape, (
+        f"[{tag}] edge counts differ: ref={ref_e.shape[0]} tri={tri_e.shape[0]}"
     )
+    assert (ref_e == tri_e).all(), f"[{tag}] edge sets differ"
 
     # 4) CUDA backend vs Triton (when applicable). The CUDA extension is restricted
     #    to 3D-spatial / 4-col-int32 coords, the standard dense-conv formulation
@@ -569,28 +582,31 @@ def test_get_output_coords_kernel_size_dilation_matches_torch(
         )
         cuda_s = torch.unique(_sorted_coords(cuda_out_xyz[in_bounds]), dim=0)
         # Re-derive the Triton coord set under the same fixed-shape boundary.
-        _, _, _ = tri_coords, tri_fwd, tri_bwd  # silence unused warnings
-        tri_coords_fix, tri_bwd_fix = get_output_coords_kernel_size_dilation(
-            coords, kernel_size, stride=stride, dilation=dilation, offset=offset,
-            boundary=((0, Wo), (0, Ho), (0, Do)),
+        tri_coords_fix, tri_edge_in_fix, tri_edge_out_fix, tri_edge_kernel_fix = (
+            get_output_coords_kernel_size_dilation(
+                coords, kernel_size, stride=stride, dilation=dilation, offset=offset,
+                boundary=((0, Wo), (0, Ho), (0, Do)),
+            )
         )
-        tri_fwd_fix = transpose_neighbor_map(tri_bwd_fix, tri_coords_fix.shape[0])
         tri_s = torch.unique(_sorted_coords(tri_coords_fix.to(torch.int32)), dim=0)
         assert cuda_s.shape == tri_s.shape and (cuda_s == tri_s).all(), (
             f"[{tag}] cuda vs triton output coord set mismatch"
         )
-        assert (cuda_fwd >= 0).sum().item() == (tri_fwd_fix >= 0).sum().item(), (
+        # CUDA returns dense ``(N, V)`` neighbour maps; total #valid entries
+        # should equal the number of Triton edges.
+        tri_n_edges = tri_edge_in_fix.numel()
+        assert (cuda_fwd >= 0).sum().item() == tri_n_edges, (
             f"[{tag}] cuda vs triton fwd valid-entry count mismatch"
         )
         if cuda_bwd is not None:
-            assert (cuda_bwd >= 0).sum().item() == (tri_bwd_fix >= 0).sum().item(), (
+            assert (cuda_bwd >= 0).sum().item() == tri_n_edges, (
                 f"[{tag}] cuda vs triton bwd valid-entry count mismatch"
             )
 
 
 # (N, D, kernel_size, stride, dilation, offset, coord_range)
 _OUTPUT_COORDS_BENCH_CASES = [
-    (1_000_000, 3, (3, 3, 3), (1, 1, 1), (1, 1, 1), (0, 0, 0), 100),
+    (100_000, 3, (3, 3, 3), (1, 1, 1), (1, 1, 1), (0, 0, 0), 32),
     (1_000_000, 4, (3, 3, 3), (1, 1, 1), (1, 1, 1), (0, 0, 0), 100),
     (1_000_000, 3, (3, 3, 3), (1, 1, 1), (2, 2, 2), (0, 0, 0), 100),
     (1_000_000, 3, (3, 3, 3), (2, 2, 2), (1, 1, 1), (0, 0, 0), 100),
@@ -710,13 +726,12 @@ def test_get_output_coords_kernel_delta_matches_torch(
     )
 
     ref_boundary = boundary if boundary is not None else ((-32768, 32767),) * D
-    ref_coords, ref_bwd = get_output_coords_kernel_delta_torch(
+    ref_coords, ref_edge_in, ref_edge_out, ref_edge_kernel = get_output_coords_kernel_delta_torch(
         coords, delta, stride=stride, offset=offset, boundary=ref_boundary,
     )
-    tri_coords, tri_bwd = get_output_coords_kernel_delta(
+    tri_coords, tri_edge_in, tri_edge_out, tri_edge_kernel = get_output_coords_kernel_delta(
         coords, delta, stride=stride, offset=offset, boundary=boundary,
     )
-    tri_fwd = transpose_neighbor_map(tri_bwd, tri_coords.shape[0])
 
     # 1) Same set of unique output coords.
     ref_s = torch.unique(_sorted_coords(ref_coords.to(torch.int32)), dim=0)
@@ -724,19 +739,13 @@ def test_get_output_coords_kernel_delta_matches_torch(
     assert ref_s.shape == tri_s.shape, f"[{tag}] coord-set sizes differ: ref={ref_s.shape} tri={tri_s.shape}"
     assert (ref_s == tri_s).all(), f"[{tag}] coord-set contents differ"
 
-    # 2) fwd/bwd self-consistency.
-    valid_fwd = tri_fwd >= 0
-    m_idx, v_idx = valid_fwd.nonzero(as_tuple=True)
-    if m_idx.numel() > 0:
-        n_vals = tri_fwd[m_idx, v_idx].long()
-        assert (tri_bwd[n_vals, v_idx] == m_idx.to(torch.int32)).all(), (
-            f"[{tag}] fwd/bwd not mutually consistent"
-        )
-
-    # 3) Total valid-entry count must match torch reference.
-    assert (tri_bwd >= 0).sum().item() == (ref_bwd >= 0).sum().item(), (
-        f"[{tag}] valid-entry counts differ"
+    # 2) Same edge set, canonicalised as (edge_in, edge_kernel, out_coord_tuple).
+    ref_e = _canonical_edges(ref_edge_in, ref_edge_out, ref_edge_kernel, ref_coords.to(torch.int32))
+    tri_e = _canonical_edges(tri_edge_in, tri_edge_out, tri_edge_kernel, tri_coords.to(torch.int32))
+    assert ref_e.shape == tri_e.shape, (
+        f"[{tag}] edge counts differ: ref={ref_e.shape[0]} tri={tri_e.shape[0]}"
     )
+    assert (ref_e == tri_e).all(), f"[{tag}] edge sets differ"
 
 
 # (N, D, kernel_size, stride, dilation, offset, coord_range)

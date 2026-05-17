@@ -11,7 +11,41 @@ import inspect
 import functools
 from filelock import FileLock
 
-from .. import config as pkg_config
+from . import config as pkg_config
+
+
+def _resolve_autotune_mode():
+    """Return the active autotune mode: 'adaptive' | 'always' | 'never'.
+
+    Honors the legacy boolean ``USE_AUTOTUNE_RUNTIME`` attribute for backward
+    compatibility (tests still mutate it at runtime).
+    """
+    if not getattr(pkg_config, 'USE_AUTOTUNE_RUNTIME', True):
+        return 'never'
+    mode = getattr(pkg_config, 'AUTOTUNE_MODE', 'adaptive')
+    if mode not in ('adaptive', 'always', 'never'):
+        raise ValueError(f"Unknown AUTOTUNE_MODE: {mode!r}")
+    return mode
+
+
+def _adaptive_threshold():
+    return int(getattr(pkg_config, 'AUTOTUNE_ADAPTIVE_THRESHOLD', 1000))
+
+
+_ADAPTIVE_NOTIFIED = set()
+
+
+def _notify_adaptive_tune(kernel_name):
+    if kernel_name in _ADAPTIVE_NOTIFIED:
+        return
+    _ADAPTIVE_NOTIFIED.add(kernel_name)
+    import sys
+    print(
+        f"FlexGEMM: autotune started for {kernel_name} after "
+        f"{_adaptive_threshold()} calls, this may take a while...",
+        file=sys.stderr,
+        flush=True,
+    )
 
 
 class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
@@ -47,9 +81,11 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
             do_bench,
         )
         self._cache_key = _get_function_cache_key(fn)
+        self._call_count = 0
         _register_autotuner(self)
 
     def run(self, *args, **kwargs):
+        self._call_count += 1
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
@@ -61,12 +97,20 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
                     key.append(str(arg.dtype))
             key = str(tuple(key))
             if key not in self.cache:
-                if not pkg_config.USE_AUTOTUNE_RUNTIME:
-                    # Fall back to the first config without benchmarking.
-                    self.cache[key] = self.configs[0]
+                mode = _resolve_autotune_mode()
+                do_tune = (
+                    mode == 'always'
+                    or (mode == 'adaptive' and self._call_count >= _adaptive_threshold())
+                )
+                if not do_tune:
+                    # Fall back to the first config without benchmarking and
+                    # do not cache so we can re-evaluate once the threshold is
+                    # crossed (adaptive mode) or the mode is changed.
+                    config = self.configs[0]
                 else:
                     # prune configs
                     used_cached_result = False
+                    _notify_adaptive_tune(self.base_fn.__name__) if mode == 'adaptive' else None
                     pruned_configs = self.prune_configs(kwargs)
                     bench_start = time.time()
                     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
@@ -76,7 +120,9 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
                     full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                     self.pre_hook(full_nargs, reset_only=True)
                     self.configs_timings = timings
-            config = self.cache[key]
+                    config = self.cache[key]
+            else:
+                config = self.cache[key]
         else:
             config = self.configs[0]
         self.best_config = config
@@ -235,6 +281,7 @@ class PersistentCacheAutoTuner:
         self.kernel_arg_names = inspect.getfullargspec(kernel).args
         self.cache = {}
         self._cache_key = _get_function_cache_key(kernel)
+        self._call_count = 0
         _register_autotuner(self)
         
     def _args_to_kwargs(self, args, kwargs):
@@ -245,6 +292,7 @@ class PersistentCacheAutoTuner:
         return arg_dict
     
     def __call__(self, *args, **kwargs):
+        self._call_count += 1
         arg_dict = self._args_to_kwargs(args, kwargs)
         
         # Determine key
@@ -253,29 +301,37 @@ class PersistentCacheAutoTuner:
         
         # If key changes, rerun autotune
         used_cached_result = True
-        if key not in self.cache:
-            if not pkg_config.USE_AUTOTUNE_RUNTIME:
-                configs = self.configs if self.configs else self.config_fn(*args, **kwargs)
-                if not configs:
-                    raise ValueError("autotune configs must be non-empty")
-                self.cache[key] = configs[0]
+        chosen_config = self.cache.get(key)
+        if chosen_config is None:
+            mode = _resolve_autotune_mode()
+            do_tune = (
+                mode == 'always'
+                or (mode == 'adaptive' and self._call_count >= _adaptive_threshold())
+            )
+            configs = self.configs if self.configs else self.config_fn(*args, **kwargs)
+            if not configs:
+                raise ValueError("autotune configs must be non-empty")
+            if not do_tune:
+                # Use fallback without caching so we can re-evaluate later.
+                chosen_config = configs[0]
             else:
                 used_cached_result = False
+                if mode == 'adaptive':
+                    _notify_adaptive_tune(self.kernel.__name__)
                 if self.verbose:
                     print(f"Running autotuning for {self.kernel.__name__} with key {key}")
-                configs = self.configs if self.configs else self.config_fn(*args, **kwargs)
-                if self.verbose:
                     print(f"Configs: {configs}")
                 best_config = self._benchmark(args, kwargs, configs)
                 if self.verbose:
                     print(f"Best config for {self.kernel.__name__} with key {key}: {best_config}")
                 self.cache[key] = best_config
+                chosen_config = best_config
             
         if pkg_config.AUTOSAVE_AUTOTUNE_CACHE and not used_cached_result:
             save_autotune_cache()
         
         # Run the kernel with the best config
-        return self.kernel(*args, **kwargs, **self.cache[key])
+        return self.kernel(*args, **kwargs, **chosen_config)
     
     def _benchmark(self, args, kwargs, configs):
         best_time = float('inf')

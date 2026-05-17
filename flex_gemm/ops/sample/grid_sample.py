@@ -5,6 +5,7 @@ from torch import Tensor
 from torch.autograd import Function
 
 from ... import kernels
+from ..index_select_add import index_select_add
 
 
 __all__ = [
@@ -15,40 +16,6 @@ __all__ = [
 # -----------------------------------------------------------------------------
 # Autograd Functions
 # -----------------------------------------------------------------------------
-
-class _GatherFn(Function):
-    """Sparse nearest-neighbour gather.
-
-    Takes the raw ``[M]`` int32 lookup result (``-1`` for misses) and
-    materialises a zero-padded ``[M, C]`` output. Internally we resolve the
-    miss mask to a positions tensor *once*, so the backward avoids the
-    repeated boolean mask-selects (``indices[valid]``, ``grad_out[valid]``)
-    that bool-indexing would incur.
-    """
-
-    @staticmethod
-    def forward(ctx, feats: Tensor, indices: Tensor, mask: Tensor) -> Tensor:
-        # indices_i32: [M] int32, -1 = miss.
-        mask_pos = mask.nonzero(as_tuple=True)[0]   # [K] long
-        mask_indices = indices.index_select(0, mask_pos)   # [K]
-        M = indices.shape[0]
-        N, C = feats.shape
-        out = torch.zeros((M, C), device=feats.device, dtype=feats.dtype)
-        if mask_pos.numel():
-            out.index_copy_(0, mask_pos, feats.index_select(0, mask_indices))
-        ctx.save_for_backward(mask_pos, mask_indices)
-        ctx.N, ctx.C = N, C
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_out: Tensor) -> Tuple[Optional[Tensor], None]:
-        mask_pos, mask_indices = ctx.saved_tensors
-        grad_feats = torch.zeros((ctx.N, ctx.C), device=grad_out.device, dtype=grad_out.dtype)
-        if mask_pos.numel():
-            grad_feats.index_add_(
-                0, mask_indices, grad_out.index_select(0, mask_pos),
-            )
-        return grad_feats, None, None
 
 
 class _IndexWeightedSumFn(Function):
@@ -61,12 +28,12 @@ class _IndexWeightedSumFn(Function):
     """
 
     @staticmethod
-    def forward(ctx, feats: Tensor, index_map: Tensor, weights: Tensor,
+    def forward(ctx, feats: Tensor, index_map: Tensor, weight_map: Tensor,
                 normalize: bool) -> Tuple[Tensor, Tensor]:
         out, weight_sum = kernels.triton.index_weighted_sum_fwd(
-            feats, index_map, weights, normalize=normalize,
+            feats, index_map, weight_map, normalize=normalize,
         )
-        ctx.save_for_backward(index_map, weights, weight_sum)
+        ctx.save_for_backward(index_map, weight_map, weight_sum)
         ctx.N = feats.shape[0]
         ctx.normalize = normalize
         ctx.mark_non_differentiable(weight_sum)
@@ -74,9 +41,9 @@ class _IndexWeightedSumFn(Function):
 
     @staticmethod
     def backward(ctx, grad_out: Tensor, grad_weight_sum: Tensor):
-        index_map, weights, weight_sum = ctx.saved_tensors
+        index_map, weight_map, weight_sum = ctx.saved_tensors
         grad_feats = kernels.triton.index_weighted_sum_bwd_input(
-            grad_out.contiguous(), index_map, weights, ctx.N,
+            grad_out.contiguous(), index_map, weight_map, ctx.N,
             weight_sum=weight_sum, normalize=ctx.normalize,
         )
         return grad_feats, None, None, None
@@ -91,7 +58,7 @@ def _sparse_grid_sample_nearest(
     coords: Tensor,
     grid_flat: Tensor,
     *,
-    scale: Optional[Union[float, Sequence[float]]],
+    scale_factor: Optional[Union[float, Sequence[float]]],
     return_mask: bool,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Nearest-neighbour sample over a flattened ``[M, D]`` grid.
@@ -99,9 +66,11 @@ def _sparse_grid_sample_nearest(
     ``grid_flat`` may be float (rounded inside the fused kernel) or an
     integer tensor matching ``coords.dtype``.
     """
-    indices = kernels.triton.grid_sample_nearest_lookup(coords, grid_flat, scale)   # [M] int32
+    indices = kernels.triton.grid_sample_nearest_lookup(coords, grid_flat, scale_factor)   # [M] int32
     mask = indices != -1
-    out = _GatherFn.apply(feats, indices, mask)
+    dst = mask.nonzero(as_tuple=True)[0]
+    src = indices.index_select(0, dst)
+    out = index_select_add(feats, src, dst, M=grid_flat.shape[0])
     if return_mask:
         return out, mask
     return out
@@ -112,7 +81,7 @@ def _sparse_grid_sample_linear(
     coords: Tensor,
     grid_flat: Tensor,
     *,
-    scale: Optional[Union[float, Sequence[float]]],
+    scale_factor: Optional[Union[float, Sequence[float]]],
     padding_mode: str,
     return_mask: bool,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
@@ -120,10 +89,10 @@ def _sparse_grid_sample_linear(
     # Lookup is decoupled from normalization: the lookup kernel returns
     # raw geometric weights and ``index_weighted_sum`` handles masking,
     # weight_sum accumulation, and (optional) renormalisation.
-    index_map, weights = kernels.triton.grid_sample_linear_lookup(coords, grid_flat, scale)
-    weights = weights.to(feats.dtype).contiguous()
+    index_map, weight_map = kernels.triton.grid_sample_linear_lookup(coords, grid_flat, scale_factor)
+    weight_map = weight_map.to(feats.dtype).contiguous()
     out, weight_sum = _IndexWeightedSumFn.apply(
-        feats, index_map, weights, padding_mode == "normalize",
+        feats, index_map, weight_map, padding_mode == "normalize",
     )
     if return_mask:
         return out, weight_sum
@@ -143,7 +112,7 @@ def sparse_grid_sample(
     *,
     mode: Literal["nearest"],
     return_mask: Literal[False] = ...,
-    scale: Optional[Sequence[float]] = ...,
+    scale_factor: Optional[Sequence[float]] = ...,
 ) -> Tensor: ...
 @overload
 def sparse_grid_sample(
@@ -153,7 +122,7 @@ def sparse_grid_sample(
     *,
     mode: Literal["nearest"],
     return_mask: Literal[True],
-    scale: Optional[Sequence[float]] = ...,
+    scale_factor: Optional[Sequence[float]] = ...,
 ) -> Tuple[Tensor, Tensor]: ...
 
 # --- linear: padding_mode is meaningful; return_mask -> float occupancy ------
@@ -166,7 +135,7 @@ def sparse_grid_sample(
     mode: Literal["linear"] = ...,
     padding_mode: Literal["zeros", "normalize"] = ...,
     return_mask: Literal[False] = ...,
-    scale: Optional[Sequence[float]] = ...,
+    scale_factor: Optional[Sequence[float]] = ...,
 ) -> Tensor: ...
 @overload
 def sparse_grid_sample(
@@ -177,7 +146,7 @@ def sparse_grid_sample(
     mode: Literal["linear"] = ...,
     padding_mode: Literal["zeros", "normalize"] = ...,
     return_mask: Literal[True],
-    scale: Optional[Sequence[float]] = ...,
+    scale_factor: Optional[Sequence[float]] = ...,
 ) -> Tuple[Tensor, Tensor]: ...
 
 
@@ -189,7 +158,7 @@ def sparse_grid_sample(
     mode: Literal["nearest", "linear"] = "linear",
     padding_mode: Literal["zeros", "normalize"] = "normalize",
     return_mask: bool = False,
-    scale: Optional[Sequence[float]] = None,
+    scale_factor: Optional[Sequence[float]] = None,
 ) -> Union[Tensor, Tuple[Tensor, Tensor]]:
     """Sample sparse features at query points in voxel coordinates.
 
@@ -216,15 +185,15 @@ def sparse_grid_sample(
               exists in ``coords``).
             * ``mode='linear'``   → float ``[...]`` equal to the *raw* sum of
               corner weights (i.e. the un-normalised occupancy, in ``[0, 1]``).
-        scale: optional per-dim divisor applied to ``grid`` before lookup
+        scale_factor: optional per-dim divisor applied to ``grid`` before lookup
             (useful when querying a sub-sampled coord grid). **Must be
             ``None`` or a tuple/sequence** — scalar broadcast is not
-            permitted because it silently scales any unintended leading
-            dims of ``grid``. If ``len(scale) < D`` the sequence is
+            permitted because it silently scale_factors any unintended leading
+            dims of ``grid``. If ``len(scale_factor) < D`` the sequence is
             *left-padded* with ``1.0`` so its trailing entries align with
             the spatial coords (the prefix is effectively treated as
             batch dims that should not be scaled). Integer ``grid`` is
-            promoted to float when ``scale`` is given.
+            promoted to float when ``scale_factor`` is given.
 
     Returns:
         ``feats_out`` of shape ``[..., C]``, or ``(feats_out, mask)`` when
@@ -253,23 +222,23 @@ def sparse_grid_sample(
     if padding_mode not in ("zeros", "normalize"):
         raise ValueError(f"Unsupported padding_mode: {padding_mode!r}")
 
-    # Normalise ``scale``: must be None or a sequence. Disallow scalar
+    # Normalise ``scale_factor``: must be None or a sequence. Disallow scalar
     # broadcast — see docstring for rationale. Left-pad to length D.
-    if scale is not None:
-        if isinstance(scale, (int, float)) or torch.is_tensor(scale):
+    if scale_factor is not None:
+        if isinstance(scale_factor, (int, float)) or torch.is_tensor(scale_factor):
             raise TypeError(
-                "sparse_grid_sample: `scale` must be None or a tuple/sequence "
+                "sparse_grid_sample: `scale_factor` must be None or a tuple/sequence "
                 "of per-dim factors; scalar broadcast is not allowed (it would "
-                "silently scale any leading batch dims of `grid`). Pass e.g. "
-                f"`scale=({float(scale) if not torch.is_tensor(scale) else '...'},) * D` explicitly."
+                "silently scale_factor any leading batch dims of `grid`). Pass e.g. "
+                f"`scale_factor=({float(scale_factor) if not torch.is_tensor(scale_factor) else '...'},) * D` explicitly."
             )
-        scale = tuple(float(s) for s in scale)
-        if len(scale) > D:
+        scale_factor = tuple(float(s) for s in scale_factor)
+        if len(scale_factor) > D:
             raise ValueError(
-                f"sparse_grid_sample: len(scale)={len(scale)} exceeds coord dim D={D}"
+                f"sparse_grid_sample: len(scale_factor)={len(scale_factor)} exceeds coord dim D={D}"
             )
-        if len(scale) < D:
-            scale = (1.0,) * (D - len(scale)) + scale
+        if len(scale_factor) < D:
+            scale_factor = (1.0,) * (D - len(scale_factor)) + scale_factor
 
 
     if grid.requires_grad:
@@ -283,11 +252,11 @@ def sparse_grid_sample(
     out_shape = grid.shape[:-1] + (C,)
     mask_shape = grid.shape[:-1]
 
-    # Flatten queries to [M, D]; the scale is applied inside the kernel.
+    # Flatten queries to [M, D]; the scale_factor is applied inside the kernel.
     grid_flat = grid.reshape(-1, D).contiguous()
 
-    # Integer grid + no scale + linear → degenerate to nearest (exact voxel
-    # centers). When a scale is given the scaled coordinates are generally
+    # Integer grid + no scale_factor + linear → degenerate to nearest (exact voxel
+    # centers). When a scale_factor is given the scaled coordinates are generally
     # fractional, so the linear path must be taken (the fused kernel will
     # promote the grid to float).
     grid_is_int = not grid_flat.dtype.is_floating_point
@@ -297,17 +266,17 @@ def sparse_grid_sample(
                 f"integer grid must have the same dtype as coords; "
                 f"got grid={grid_flat.dtype}, coords={coords.dtype}"
             )
-        if mode == "linear" and scale is None:
+        if mode == "linear" and scale_factor is None:
             mode = "nearest"
 
     if mode == "nearest":
         result = _sparse_grid_sample_nearest(
-            feats, coords, grid_flat, scale=scale, return_mask=return_mask,
+            feats, coords, grid_flat, scale_factor=scale_factor, return_mask=return_mask,
         )
     else:
         result = _sparse_grid_sample_linear(
             feats, coords, grid_flat,
-            scale=scale, padding_mode=padding_mode, return_mask=return_mask,
+            scale_factor=scale_factor, padding_mode=padding_mode, return_mask=return_mask,
         )
 
     if return_mask:

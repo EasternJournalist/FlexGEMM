@@ -1,9 +1,13 @@
 import os
 import sys
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+import pytest
 from tqdm import tqdm
 import torch
-import spconv.pytorch as spconv
+spconv = pytest.importorskip(
+    "spconv.pytorch",
+    reason="strided sparse_conv reference tests require the `spconv` package",
+)
 import flex_gemm
 from flex_gemm.ops.spconv import SparseConv3dFunction
 from utils import sphere_coords, calc_err, benchmark_kernel, lexsort, get_device_max_flops

@@ -19,7 +19,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 
 import flex_gemm
 from flex_gemm import config
-config.USE_AUTOTUNE_RUNTIME = False  # avoid stalls on cache load
+
 
 from utils import sphere_coords  # noqa: E402
 
@@ -157,7 +157,6 @@ def test_sparse_pool_speed(cfg):
     """Benchmark :func:`flex_gemm.ops.sparse_pool` (general path) plus the
     ``_sparse_pool_perfect_partition`` specialization where applicable.
     """
-    from flex_gemm.ops.pool.sparse_pool import _sparse_pool_perfect_partition
 
     torch.manual_seed(0)
     feats, coords, shape = _make_inputs(cfg["RES"], cfg["C"], cfg["B"])
@@ -178,6 +177,7 @@ def test_sparse_pool_speed(cfg):
                 rows.append((name_cold, ms))
             except Exception as e:
                 rows.append((name_cold, f"FAIL: {type(e).__name__}"))
+                raise
 
             # General path, cached neighbor_cache.
             name_cached = f"sparse_pool[k={k}, s={s}, p={p}, reduce={reduce}, cached]"
@@ -201,18 +201,6 @@ def test_sparse_pool_speed(cfg):
             except Exception as e:
                 rows.append((name_cached, f"FAIL: {type(e).__name__}"))
 
-            # Perfect-partition specialization (only when applicable).
-            if s == k and p == 0:
-                name_fast = f"_sparse_pool_perfect_partition[k={k}, reduce={reduce}]"
-                try:
-                    ms = _time_cuda_ms(
-                        lambda kk=k, rr=reduce: _sparse_pool_perfect_partition(
-                            feats, coords, kernel_size=kk, reduce=rr,
-                        )
-                    )
-                    rows.append((name_fast, ms))
-                except Exception as e:
-                    rows.append((name_fast, f"FAIL: {type(e).__name__}"))
 
     _print_table(
         f"Sparse Pool Forward Benchmark | RES={cfg['RES']} C={cfg['C']} B={cfg['B']}",

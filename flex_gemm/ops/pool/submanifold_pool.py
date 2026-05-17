@@ -6,11 +6,15 @@ from torch import Tensor
 from ... import kernels
 from ...kernels.triton.utils import _lengths_to_offsets
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
-from .index_segment_reduce import index_segment_reduce
+from ..index_segment_reduce import index_segment_reduce
+from ..utils import _broadcast_dim_arg
 
 
 __all__ = [
     "submanifold_pool",
+    "submanifold_pool2d",
+    "submanifold_pool3d",
+    "submanifold_pool4d",
 ]
 
 
@@ -40,7 +44,7 @@ def submanifold_pool(
         kernel_size: tuple of length Ds.
         reduce: one of ``sum`` / ``mean`` / ``max`` / ``min`` / ``prod``.
         neighbor_cache (Optional[NeighborCache]): if provided, its
-            ``fwd_neighbor_map`` is reused instead of rebuilding one. Useful for
+            ``fwd_map`` is reused instead of rebuilding one. Useful for
             sharing the neighbor map with a submanifold conv at the same kernel
             size on the same input_coords.
 
@@ -80,7 +84,71 @@ def submanifold_pool(
         reduce
     )
     # NOTE: not sure if convert to segment is faster than direct index_map_reduce:
-    # output_feats = index_map_reduce(feats, neighbor_cache.fwd_neighbor_map)
+    # output_feats = index_map_reduce(feats, neighbor_cache.fwd_map)
     # This way, skip segmentation. leave it to future benchmarking
 
     return output_feats, neighbor_cache
+
+
+# ---------------------------------------------------------------------------
+# Fixed-spatial-dim aliases.
+#
+# Compared with :func:`submanifold_pool`, ``kernel_size`` accepts either a
+# scalar ``int`` (broadcast to length ``D``) or a length-``D`` sequence.
+# ``input_coords.shape[1]`` may exceed ``D``; the leading columns are batch
+# dims.
+# ---------------------------------------------------------------------------
+
+
+def submanifold_pool2d(
+    feats: Tensor,
+    input_coords: Tensor,
+    kernel_size: int | tuple[int, int],
+    reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
+    neighbor_cache: NeighborCache | None = None,
+) -> tuple[Tensor, NeighborCache]:
+    """2-D spatial alias of :func:`submanifold_pool`.
+
+    ``kernel_size`` may be a scalar ``int`` (broadcast to length 2) or a
+    length-2 tuple. ``input_coords.shape[1]`` may exceed 2; the leading
+    columns are batch dims. All other args/semantics match
+    :func:`submanifold_pool`.
+    """
+    kernel_size = _broadcast_dim_arg(kernel_size, 2, "kernel_size")
+    return submanifold_pool(feats, input_coords, kernel_size, reduce, neighbor_cache)
+
+
+def submanifold_pool3d(
+    feats: Tensor,
+    input_coords: Tensor,
+    kernel_size: int | tuple[int, int, int],
+    reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
+    neighbor_cache: NeighborCache | None = None,
+) -> tuple[Tensor, NeighborCache]:
+    """3-D spatial alias of :func:`submanifold_pool`.
+
+    ``kernel_size`` may be a scalar ``int`` (broadcast to length 3) or a
+    length-3 tuple. ``input_coords.shape[1]`` may exceed 3; the leading
+    columns are batch dims. All other args/semantics match
+    :func:`submanifold_pool`.
+    """
+    kernel_size = _broadcast_dim_arg(kernel_size, 3, "kernel_size")
+    return submanifold_pool(feats, input_coords, kernel_size, reduce, neighbor_cache)
+
+
+def submanifold_pool4d(
+    feats: Tensor,
+    input_coords: Tensor,
+    kernel_size: int | tuple[int, int, int, int],
+    reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
+    neighbor_cache: NeighborCache | None = None,
+) -> tuple[Tensor, NeighborCache]:
+    """4-D spatial alias of :func:`submanifold_pool`.
+
+    ``kernel_size`` may be a scalar ``int`` (broadcast to length 4) or a
+    length-4 tuple. ``input_coords.shape[1]`` may exceed 4; the leading
+    columns are batch dims. All other args/semantics match
+    :func:`submanifold_pool`.
+    """
+    kernel_size = _broadcast_dim_arg(kernel_size, 4, "kernel_size")
+    return submanifold_pool(feats, input_coords, kernel_size, reduce, neighbor_cache)

@@ -5,6 +5,26 @@ import torch
 from torch import Tensor
 
 
+def _broadcast_dim_arg(x, D: int, name: str):
+    """Broadcast a per-spatial-dim argument.
+
+    ``None`` passes through. A scalar ``int`` is repeated ``D`` times. A
+    sequence is validated to have exactly length ``D`` and returned as a
+    tuple. Used by the fixed-spatial-dim op aliases (``*2d`` / ``*3d`` /
+    ``*4d``) to let callers pass scalars for ``kernel_size`` / ``stride`` /
+    ``padding`` / ``dilation`` / ``offset`` / ``scale_factor`` etc.
+    """
+    if x is None:
+        return None
+    if isinstance(x, int):
+        return (x,) * D
+    t = tuple(x)
+    assert len(t) == D, (
+        f"{name} must be a scalar int or a length-{D} sequence; got {x!r}"
+    )
+    return t
+
+
 def init_hashmap(spatial_size, hashmap_size, device, with_values=True):
     N, C, W, H, D = spatial_size
     VOL = N * W * H * D
@@ -59,8 +79,66 @@ def pad_to_size_along_dim(x: Tensor, dim: int | tuple[int, ...], size: int | tup
     return x
 
 
+def sparse_to_dense(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    batch_dims: int = 1,
+) -> Tensor:
+    """Scatter sparse ``[M, C]`` features into a dense tensor of shape ``shape``.
+
+    Assumes the workspace-wide layout convention::
+
+        shape  = (*batch_dims, C, S1, ..., SDs)
+        coords = [M, B + Ds]   with columns (*batch, *spatial)
+
+    Positions not present in ``coords`` are zero. Duplicate coordinates
+    overwrite (no accumulation) — callers should dedup upstream if needed.
+
+    Args:
+        feats: ``[M, C]`` sparse features.
+        coords: ``[M, B + Ds]`` integer coordinates; advanced-indexed as-is
+            (int32 is fine, no ``.long()`` cast inserted).
+        shape: dense target shape.
+        batch_dims: number of leading batch dims ``B`` in ``shape``. Defaults
+            to ``1`` (the common ``(N, C, S1, ..., SDs)`` layout). Set to
+            ``0`` for a single un-batched volume.
+
+    Returns:
+        Dense tensor of shape ``shape`` containing ``feats`` scattered to the
+        rows indicated by ``coords`` (channel-broadcast along the ``C`` axis).
+    """
+    M, C = feats.shape
+    D_total = len(shape)
+    D_spatial = D_total - 1 - batch_dims
+    assert batch_dims >= 0 and D_spatial >= 0, (
+        f"sparse_to_dense: invalid layout — len(shape)={D_total}, "
+        f"batch_dims={batch_dims} leaves D_spatial={D_spatial}"
+    )
+    assert coords.shape == (M, batch_dims + D_spatial), (
+        f"sparse_to_dense: coords shape {tuple(coords.shape)} does not match "
+        f"(M={M}, B+Ds={batch_dims + D_spatial})"
+    )
+    assert shape[batch_dims] == C, (
+        f"sparse_to_dense: shape[{batch_dims}]={shape[batch_dims]} != C={C}"
+    )
+
+    # Move the channel axis to the trailing position so per-row advanced
+    # indexing with the (B+Ds) coord columns broadcasts the C-vector
+    # in a single assignment.
+    perm = list(range(batch_dims)) + list(range(batch_dims + 1, D_total)) + [batch_dims]
+    inv_perm = [0] * D_total
+    for i, p in enumerate(perm):
+        inv_perm[p] = i
+    shape_clast = tuple(shape[p] for p in perm)
+    dense_clast = feats.new_zeros(shape_clast)
+    indexers = tuple(coords[:, d] for d in range(coords.shape[1]))
+    dense_clast[indexers] = feats
+    return dense_clast.permute(inv_perm).contiguous()
+
+
 def lookup_pytorch(key: Tensor, query: Tensor) -> Tensor:
-    """Look up `query` in `key` like a dictionary. Useful for COO indexing.
+    """Look up `query` in `key` like a dictionary using `torch.unique`
 
     Parameters
     ----
