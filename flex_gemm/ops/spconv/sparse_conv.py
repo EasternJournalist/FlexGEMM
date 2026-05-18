@@ -3,7 +3,7 @@ from torch import Tensor
 from typing import *
 
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
-from ..utils import _broadcast_dim_arg
+from ..utils import _broadcast_dim_arg, split_sparse_shape
 from .functions import _select_function
 
 
@@ -44,9 +44,11 @@ def sparse_conv(
     from ``weight.shape[1:-1]``.
 
     Args:
-        feats (Tensor): [M, Ci] input features.
+        feats (Tensor): ``(M, Ci)`` input features.
         coords (Tensor): [M, B + Ds] input coordinates.
-        shape (torch.Size): input dense shape (*batch_dims, C, S1, ..., SDs).
+        shape (torch.Size): input dense shape ``(*batch_dims, S1, ..., SDs, C)``
+            — channel-last (FlexGEMM convention; mirrors
+            :func:`torch.sparse_coo_tensor`'s sparse-first / dense-last layout).
         weight (Tensor): [Co, K1, ..., KDs, Ci] convolution weights.
         bias (Optional[Tensor]): [Co] bias.
         stride / dilation / padding: tuples of length Ds. Default all-1 / all-1 / all-0.
@@ -82,7 +84,7 @@ def sparse_conv(
     Computes ``output[coord_out] = sum_v input[coord_out * stride + offset + kernel_delta[v]] * weight[v]``.
 
     Args:
-        feats (Tensor): [M, Ci] input features.
+        feats (Tensor): ``(M, Ci)`` input features.
         coords (Tensor): [M, B + Ds] input coordinates.
         shape (torch.Size): input dense shape.
         weight (Tensor): [Co, V, Ci] convolution weights.
@@ -119,6 +121,14 @@ def sparse_conv(
     """Dispatch on (kernel parameterization). See the two overloads above."""
     assert coords.is_contiguous(), "Coords should be contiguous"
 
+    # ---- channel-last shape book-keeping ------------------------------
+    # The neighbor cache lives in sparse-shape land (no C). The op-layer
+    # ``shape`` / ``output_shape`` are full channel-last shapes
+    # ``(*sparse_shape, C)`` aligned with :func:`torch.sparse_coo_tensor`.
+    sparse_dim = coords.shape[1]
+    sparse_in_shape  = split_sparse_shape(shape,        sparse_dim)
+    sparse_out_shape = split_sparse_shape(output_shape, sparse_dim)
+
     # When a neighbor_cache is supplied, ``input_shape`` / ``output_shape`` /
     # ``output_coords`` are filled in from it. Kernel topology (kernel_size,
     # stride, dilation, ...) is *not* stored on the cache — the caller must
@@ -126,10 +136,10 @@ def sparse_conv(
     if neighbor_cache is not None:
         if output_coords is None:
             output_coords = neighbor_cache.output_coords
-        if output_shape is None:
-            output_shape = neighbor_cache.output_shape
-        if shape is None:
-            shape = neighbor_cache.input_shape
+        if sparse_out_shape is None:
+            sparse_out_shape = neighbor_cache.output_sparse_shape
+        if sparse_in_shape is None:
+            sparse_in_shape = neighbor_cache.input_sparse_shape
 
     if kernel_delta is None:
         # kernel_size mode: weight is [Co, K1, ..., KDs, Ci]; infer kernel_size.
@@ -150,11 +160,11 @@ def sparse_conv(
                 stride=stride,
                 dilation=dilation,
                 padding=padding,
-                input_shape=shape,
-                output_shape=output_shape,
+                input_sparse_shape=sparse_in_shape,
+                output_sparse_shape=sparse_out_shape,
             )
             output_coords = neighbor_cache.output_coords
-            output_shape = neighbor_cache.output_shape
+            sparse_out_shape = neighbor_cache.output_sparse_shape
         else:
             neighbor_cache.assert_match(
                 input_coords=coords,
@@ -180,11 +190,11 @@ def sparse_conv(
                 kernel_delta=kernel_delta,
                 stride=stride,
                 offset=offset,
-                input_shape=shape,
-                output_shape=output_shape,
+                input_sparse_shape=sparse_in_shape,
+                output_sparse_shape=sparse_out_shape,
             )
             output_coords = neighbor_cache.output_coords
-            output_shape = neighbor_cache.output_shape
+            sparse_out_shape = neighbor_cache.output_sparse_shape
         else:
             neighbor_cache.assert_match(
                 input_coords=coords,
@@ -196,6 +206,9 @@ def sparse_conv(
     output_feats, neighbor_cache = SparseConvFunc.apply(
         feats, neighbor_cache, weight_v, bias,
     )
+    # Reassemble the full channel-last output shape: sparse prefix from the
+    # cache + C_out tail from the output features.
+    output_shape = torch.Size([*sparse_out_shape, *output_feats.shape[1:]])
     return output_feats, output_coords, output_shape, neighbor_cache
 
 

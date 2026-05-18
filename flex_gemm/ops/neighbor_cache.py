@@ -5,7 +5,7 @@ Two pieces live here:
 * :class:`NeighborCache` — the lazy fwd / bwd neighbor-map + post-processing
   cache. It also carries the topology that produced it (``input_coords``,
   ``output_coords``, ``kernel_size`` / ``kernel_delta``, ``stride``,
-  ``dilation``, ``offset``, ``input_shape`` / ``output_shape``) so downstream code
+  ``dilation``, ``offset``, ``input_sparse_shape`` / ``output_sparse_shape``) so downstream code
   can both verify a user-supplied cache (via :meth:`assert_match`) and read
   any of those fields directly.
 
@@ -122,8 +122,10 @@ class NeighborCache:
     # --- topology --------------------------------------------------------
     input_coords: Tensor
     output_coords: Tensor
-    input_shape: torch.Size | None
-    output_shape: torch.Size | None
+    input_sparse_shape: torch.Size | None
+    """Sparse shape aligned with ``input_coords`` columns (one entry per coord column). """
+    output_sparse_shape: torch.Size | None
+    """Sparse shape aligned with ``output_coords`` columns (one entry per coord column). """
     symmetric: bool
     """When True, ``input_coords`` and ``output_coords`` coincide and the
     adjacency is invariant under swapping (i, o), so backward derivations
@@ -169,8 +171,8 @@ class NeighborCache:
         # topology (all keyword-only)
         input_coords: Tensor,
         output_coords: Tensor,
-        input_shape: torch.Size | None = None,
-        output_shape: torch.Size | None = None,
+        input_sparse_shape: torch.Size | None = None,
+        output_sparse_shape: torch.Size | None = None,
         symmetric: bool = False,
     ):
         has_fwd = fwd_map is not None or (
@@ -199,8 +201,8 @@ class NeighborCache:
 
         self.input_coords = input_coords
         self.output_coords = output_coords
-        self.input_shape = input_shape
-        self.output_shape = output_shape
+        self.input_sparse_shape = input_sparse_shape
+        self.output_sparse_shape = output_sparse_shape
         self.symmetric = bool(symmetric)
         self.num_kernels = num_kernels
 
@@ -743,12 +745,12 @@ class NeighborCacheT(NeighborCache):
         return self._original.num_input_coords
 
     @property
-    def input_shape(self) -> torch.Size | None:
-        return self._original.output_shape
+    def input_sparse_shape(self) -> torch.Size | None:
+        return self._original.output_sparse_shape
 
     @property
-    def output_shape(self) -> torch.Size | None:
-        return self._original.input_shape
+    def output_sparse_shape(self) -> torch.Size | None:
+        return self._original.input_sparse_shape
 
     @property
     def symmetric(self) -> bool:
@@ -803,7 +805,7 @@ def build_neighbor_cache(
     submanifold: Literal[True],
     kernel_size: tuple[int, ...],
     dilation: tuple[int, ...] | None = None,
-    input_shape: torch.Size | None = None,
+    input_sparse_shape: torch.Size | None = None,
 ) -> "NeighborCache":
     """Submanifold cache, dense ``(kernel_size, dilation)`` kernel.
 
@@ -815,8 +817,9 @@ def build_neighbor_cache(
         input_coords: ``(N, B + Ds)`` int input coordinates (contiguous).
         kernel_size: spatial kernel shape, length ``Ds``.
         dilation: per-dim dilation. Default all-ones.
-        input_shape: optional ambient dense shape (enables CUDA fast path for
-            ``3D / 3x3x3 / int32 / 4-col`` inputs).
+        input_sparse_shape: optional ambient sparse shape (one entry per
+            coord column). Enables the CUDA fast path for ``3D / 3x3x3 /
+            int32 / 4-col`` inputs.
     """
     ...
 
@@ -828,7 +831,7 @@ def build_neighbor_cache(
     submanifold: Literal[True],
     kernel_delta: Tensor,
     symmetric: bool | None = None,
-    input_shape: torch.Size | None = None,
+    input_sparse_shape: torch.Size | None = None,
 ) -> "NeighborCache":
     """Submanifold cache, arbitrary-``kernel_delta`` kernel.
 
@@ -837,8 +840,8 @@ def build_neighbor_cache(
         kernel_delta: ``(V, Ds)`` int tensor of per-tap offsets.
         symmetric: forward-only fast-path hint; auto-detected from
             ``kernel_delta == flip(-kernel_delta)`` if ``None``.
-        input_shape: optional ambient dense shape (currently unused for the
-            kernel_delta submanifold path; carried on the cache).
+        input_sparse_shape: optional ambient sparse shape (currently unused for
+            the kernel_delta submanifold path; carried on the cache).
     """
     ...
 
@@ -854,8 +857,8 @@ def build_neighbor_cache(
     stride: tuple[int, ...] | None = None,
     padding: tuple[int, ...] | None = None,
     offset: tuple[int, ...] | None = None,
-    input_shape: torch.Size | None = None,
-    output_shape: torch.Size | None = None,
+    input_sparse_shape: torch.Size | None = None,
+    output_sparse_shape: torch.Size | None = None,
     transpose: bool = False,
 ) -> "NeighborCache":
     """Strided (non-submanifold) cache, dense ``(kernel_size, dilation)`` kernel.
@@ -863,8 +866,8 @@ def build_neighbor_cache(
     Two sub-modes, picked by whether ``output_coords`` is provided:
 
     * ``output_coords is None``: fused *output_coords + fwd_nm + bwd_nm* path.
-      Requires ``input_shape``; ``output_shape`` is derived from
-      ``(input_shape, kernel_size, stride, padding, dilation)`` if absent
+      Requires ``input_sparse_shape``; ``output_sparse_shape`` is derived from
+      ``(input_sparse_shape, kernel_size, stride, padding, dilation)`` if absent
       (forward formula when ``transpose=False``, conv-transpose formula
       otherwise).
     * ``output_coords`` supplied: naive path — only the forward neighbor map
@@ -878,8 +881,8 @@ def build_neighbor_cache(
     When ``transpose=True``, the neighbor map is built under the
     *sparse conv-transpose* relation ``coord_out = coord_in * stride + offset
     + delta`` and the function returns a :class:`NeighborCacheT`. In that
-    mode ``input_coords`` / ``input_shape`` are the conv-transpose's *small*
-    side and ``output_coords`` / ``output_shape`` are the *large* side.
+    mode ``input_coords`` / ``input_sparse_shape`` are the conv-transpose's *small*
+    side and ``output_coords`` / ``output_sparse_shape`` are the *large* side.
     ``transpose=True`` is incompatible with ``submanifold=True``.
 
     Args:
@@ -893,8 +896,10 @@ def build_neighbor_cache(
             is not given.
         offset: per-dim centered-kernel offset. Wins over ``padding`` if both
             are provided (asserts they agree).
-        input_shape: ambient input dense shape. Required by the fused path.
-        output_shape: dense output shape. Computed if missing and needed.
+        input_sparse_shape: ambient input sparse shape (one entry per coord
+            column). Required by the fused path.
+        output_sparse_shape: output sparse shape (one entry per output-coord
+            column). Computed if missing and needed.
         transpose: when ``True``, return a :class:`NeighborCacheT` built
             under the conv-transpose relation.
     """
@@ -910,8 +915,8 @@ def build_neighbor_cache(
     kernel_delta: Tensor,
     stride: tuple[int, ...] | None = None,
     offset: tuple[int, ...] | None = None,
-    input_shape: torch.Size | None = None,
-    output_shape: torch.Size | None = None,
+    input_sparse_shape: torch.Size | None = None,
+    output_sparse_shape: torch.Size | None = None,
     transpose: bool = False,
 ) -> "NeighborCache":
     """Strided (non-submanifold) cache, arbitrary-``kernel_delta`` kernel.
@@ -929,7 +934,7 @@ def build_neighbor_cache(
         kernel_delta: ``(V, Ds)`` int tensor of per-tap offsets.
         stride: per-dim stride. Default all-ones.
         offset: per-dim offset added to every tap. Default all-zeros.
-        input_shape / output_shape: same role as in the strided ``kernel_size``
+        input_sparse_shape / output_sparse_shape: same role as in the strided ``kernel_size``
             overload.
         transpose: when ``True``, return a :class:`NeighborCacheT`.
     """
@@ -947,15 +952,15 @@ def build_neighbor_cache(
     dilation: tuple[int, ...] | None = None,
     padding: tuple[int, ...] | None = None,
     offset: tuple[int, ...] | None = None,
-    input_shape: torch.Size | None = None,
-    output_shape: torch.Size | None = None,
+    input_sparse_shape: torch.Size | None = None,
+    output_sparse_shape: torch.Size | None = None,
     symmetric: bool | None = None,
     transpose: bool = False,
 ) -> NeighborCache:
     """Multi-level dispatcher.
 
     Routes first on **output-coords mode** — submanifold (output == input) /
-    strided-auto (output_coords derived from input_shape) / strided-custom
+    strided-auto (output_coords derived from input_sparse_shape) / strided-custom
     (caller-supplied output_coords) — and then within each mode on
     ``kernel_size`` vs ``kernel_delta`` to one of six single-purpose leaf
     builders.
@@ -989,7 +994,7 @@ def build_neighbor_cache(
                 input_coords,
                 kernel_size=kernel_size,
                 dilation=dilation,
-                input_shape=input_shape,
+                input_sparse_shape=input_sparse_shape,
             )
         else:
             # ------------- submanifold & kernel_delta ------------- #
@@ -997,7 +1002,7 @@ def build_neighbor_cache(
                 input_coords,
                 kernel_delta=kernel_delta,
                 symmetric=symmetric,
-                input_shape=input_shape,
+                input_sparse_shape=input_sparse_shape,
             )
 
     elif output_coords is None:
@@ -1011,8 +1016,8 @@ def build_neighbor_cache(
                 stride=stride,
                 padding=padding,
                 offset=offset,
-                input_shape=input_shape,
-                output_shape=output_shape,
+                input_sparse_shape=input_sparse_shape,
+                output_sparse_shape=output_sparse_shape,
                 transposed=transpose,
             )
         else:
@@ -1022,8 +1027,8 @@ def build_neighbor_cache(
                 kernel_delta=kernel_delta,
                 stride=stride,
                 offset=offset,
-                input_shape=input_shape,
-                output_shape=output_shape,
+                input_sparse_shape=input_sparse_shape,
+                output_sparse_shape=output_sparse_shape,
                 transposed=transpose,
             )
 
@@ -1038,8 +1043,8 @@ def build_neighbor_cache(
                 stride=stride,
                 padding=padding,
                 offset=offset,
-                input_shape=input_shape,
-                output_shape=output_shape,
+                input_sparse_shape=input_sparse_shape,
+                output_sparse_shape=output_sparse_shape,
                 transposed=transpose,
             )
         else:
@@ -1049,8 +1054,8 @@ def build_neighbor_cache(
                 kernel_delta=kernel_delta,
                 stride=stride,
                 offset=offset,
-                input_shape=input_shape,
-                output_shape=output_shape,
+                input_sparse_shape=input_sparse_shape,
+                output_sparse_shape=output_sparse_shape,
                 transposed=transpose,
             )
 
@@ -1101,20 +1106,20 @@ def _padding_from_offset(
 def _boundary_for_strided(
     input_coords: Tensor,
     shape: torch.Size,
-    output_shape: torch.Size,
+    output_sparse_shape: torch.Size,
     D_spatial: int,
 ) -> tuple[tuple[int, int], ...]:
     """Per-dim ``[min, max)`` boundary for Triton's output-coord builders.
 
     Leftmost batch dim → ``[0, N)``, any additional batch dims → ``[0, 1)``,
-    each spatial dim ``d`` → ``[0, output_shape[-D_spatial + d])``.
+    each spatial dim ``d`` → ``[0, output_sparse_shape[-D_spatial + d])``.
 
     Shared by the two strided-auto Triton helpers below
     (:func:`_build_strided_edges_kernel_size_triton` and
     :func:`_build_strided_edges_kernel_delta_triton`).
     """
     batch_dims = input_coords.shape[1] - D_spatial
-    spatial_out = tuple(output_shape[-D_spatial:]) if D_spatial > 0 else ()
+    spatial_out = tuple(output_sparse_shape[-D_spatial:]) if D_spatial > 0 else ()
     batch_bounds: list[tuple[int, int]] = []
     for i in range(batch_dims):
         batch_bounds.append((0, shape[0]) if i == 0 else (0, 1))
@@ -1130,7 +1135,7 @@ def _build_submanifold_kernel_size(
     *,
     kernel_size: tuple[int, ...],
     dilation: tuple[int, ...] | None,
-    input_shape: torch.Size | None,
+    input_sparse_shape: torch.Size | None,
 ) -> NeighborCache:
     kernel_size = tuple(kernel_size)
     D_spatial = len(kernel_size)
@@ -1142,14 +1147,14 @@ def _build_submanifold_kernel_size(
     kernel_symmetric = all(k % 2 == 1 for k in kernel_size)
 
     fwd_nm = _build_submanifold_neighbor_map_kernel_size(
-        input_coords, input_shape, kernel_size, dilation,
+        input_coords, input_sparse_shape, kernel_size, dilation,
     )
     return NeighborCache(
         fwd_map=fwd_nm,
         input_coords=input_coords,
         output_coords=input_coords,
-        input_shape=input_shape,
-        output_shape=input_shape,
+        input_sparse_shape=input_sparse_shape,
+        output_sparse_shape=input_sparse_shape,
         symmetric=kernel_symmetric,
     )
 
@@ -1179,7 +1184,7 @@ def _build_submanifold_neighbor_map_kernel_size(
         neighbor_map = lookup_pytorch(input_coords, neighbor_coords).to(torch.int32)
 
     elif use_cuda_extension:
-        N, C, W, H, D = shape
+        N, W, H, D = shape
         hashmap_keys, hashmap_vals = init_hashmap(
             shape, int(spconv.HASHMAP_RATIO * input_coords.shape[0]), input_coords.device,
         )
@@ -1213,7 +1218,7 @@ def _build_submanifold_kernel_delta(
     *,
     kernel_delta: Tensor,
     symmetric: bool | None,
-    input_shape: torch.Size | None,
+    input_sparse_shape: torch.Size | None,
 ) -> NeighborCache:
 
     if symmetric is None:
@@ -1225,8 +1230,8 @@ def _build_submanifold_kernel_delta(
         fwd_map=fwd_nm,
         input_coords=input_coords,
         output_coords=input_coords,
-        input_shape=input_shape,
-        output_shape=input_shape,
+        input_sparse_shape=input_sparse_shape,
+        output_sparse_shape=input_sparse_shape,
         symmetric=symmetric,
     )
 
@@ -1271,8 +1276,8 @@ def _build_strided_kernel_size_auto(
     stride: tuple[int, ...] | None,
     padding: tuple[int, ...] | None,
     offset: tuple[int, ...] | None,
-    input_shape: torch.Size | None,
-    output_shape: torch.Size | None,
+    input_sparse_shape: torch.Size | None,
+    output_sparse_shape: torch.Size | None,
     transposed: bool = False,
 ) -> NeighborCache:
     """Strided + no caller-supplied output_coords: auto-derive output coords.
@@ -1284,8 +1289,8 @@ def _build_strided_kernel_size_auto(
     cache is built with those roles swapped, and ``.T`` re-exposes the user's
     perspective.
     """
-    assert input_shape is not None, \
-        "build_neighbor_cache(submanifold=False, output_coords=None) requires `input_shape`."
+    assert input_sparse_shape is not None, \
+        "build_neighbor_cache(submanifold=False, output_coords=None) requires `input_sparse_shape`."
     kernel_size = tuple(kernel_size)
     D_spatial = len(kernel_size)
     dilation = tuple(dilation) if dilation is not None else (1,) * D_spatial
@@ -1298,16 +1303,16 @@ def _build_strided_kernel_size_auto(
 
     offset_t = _resolve_offset_from_padding(kernel_size, dilation, padding, offset)
 
-    if output_shape is None:
+    if output_sparse_shape is None:
         if padding is None:
             padding = _padding_from_offset(kernel_size, dilation, offset_t)
         if transposed:
-            output_shape = compute_strided_kernel_size_transpose_output_shape(
-                input_shape, kernel_size, stride, padding, dilation,
+            output_sparse_shape = compute_strided_kernel_size_transpose_output_shape(
+                input_sparse_shape, kernel_size, stride, padding, dilation,
             )
         else:
-            output_shape = compute_strided_kernel_size_output_shape(
-                input_shape, kernel_size, stride, padding, dilation,
+            output_sparse_shape = compute_strided_kernel_size_output_shape(
+                input_sparse_shape, kernel_size, stride, padding, dilation,
             )
 
     # CUDA fused path: forward-only; 3D-spatial / int32 / 4-col / dense-kernel only; needs padding.
@@ -1319,13 +1324,14 @@ def _build_strided_kernel_size_auto(
         and input_coords.shape[1] == 4
         and input_coords.dtype == torch.int32
         and D_spatial == 3
-        and len(input_shape) == 5
+        # 4 = 1 batch dim + 3 spatial dims.
+        and len(input_sparse_shape) == 4
     )
     if use_cuda_extension:
         if padding is None:
             padding = _padding_from_offset(kernel_size, dilation, offset_t)
         fwd_nm, bwd_nm, output_coords = _build_strided_neighbor_map_kernel_size_cuda(
-            input_coords, input_shape,
+            input_coords, input_sparse_shape,
             kernel_size, stride, padding, dilation,
             need_bwd=False,
         )
@@ -1335,8 +1341,8 @@ def _build_strided_kernel_size_auto(
                 bwd_map=bwd_nm,
                 input_coords=input_coords,
                 output_coords=output_coords,
-                input_shape=input_shape,
-                output_shape=output_shape,
+                input_sparse_shape=input_sparse_shape,
+                output_sparse_shape=output_sparse_shape,
                 symmetric=False,
             )
         # CUDA path is forward-only (asserted above for transposed=True
@@ -1346,7 +1352,7 @@ def _build_strided_kernel_size_auto(
 
     # Triton edge-based path (works for both forward and transposed).
     output_coords, edge_in, edge_out, edge_kernel = _build_strided_edges_kernel_size_triton(
-        input_coords, input_shape, output_shape,
+        input_coords, input_sparse_shape, output_sparse_shape,
         kernel_size, stride, dilation, offset_t,
         D_spatial,
         transposed=transposed,
@@ -1356,14 +1362,14 @@ def _build_strided_kernel_size_auto(
         num_kernels *= k
 
     if not transposed:
-        # Forward: user's input/output_shape are also the underlying cache's.
+        # Forward: user's input/output_sparse_shape are also the underlying cache's.
         return NeighborCache(
             edge_in=edge_in, edge_out=edge_out,
             edge_kernel=edge_kernel, num_kernels=num_kernels,
             input_coords=input_coords,
             output_coords=output_coords,
-            input_shape=input_shape,
-            output_shape=output_shape,
+            input_sparse_shape=input_sparse_shape,
+            output_sparse_shape=output_sparse_shape,
             symmetric=False,
         )
     # Transposed: kernel ran ``coord_out = coord_in * S + offset + delta``
@@ -1377,15 +1383,15 @@ def _build_strided_kernel_size_auto(
         edge_kernel=edge_kernel, num_kernels=num_kernels,
         input_coords=output_coords,
         output_coords=input_coords,
-        input_shape=output_shape,
-        output_shape=input_shape,
+        input_sparse_shape=output_sparse_shape,
+        output_sparse_shape=input_sparse_shape,
         symmetric=False,
     )
     return underlying.T
 
 
 def compute_strided_kernel_size_output_shape(
-    input_shape: torch.Size,
+    input_sparse_shape: torch.Size,
     kernel_size: tuple[int, ...],
     stride: tuple[int, ...],
     padding: tuple[int, ...],
@@ -1398,8 +1404,8 @@ def compute_strided_kernel_size_output_shape(
     through unchanged.
     """
     Ds = len(kernel_size)
-    prefix = tuple(input_shape[:-Ds]) if Ds > 0 else tuple(input_shape)
-    spatial = tuple(input_shape[-Ds:]) if Ds > 0 else ()
+    prefix = tuple(input_sparse_shape[:-Ds]) if Ds > 0 else tuple(input_sparse_shape)
+    spatial = tuple(input_sparse_shape[-Ds:]) if Ds > 0 else ()
     out_spatial = tuple(
         (w + 2 * p - d * (k - 1) - 1) // s + 1
         for w, k, s, p, d in zip(spatial, kernel_size, stride, padding, dilation)
@@ -1408,7 +1414,7 @@ def compute_strided_kernel_size_output_shape(
 
 
 def compute_strided_kernel_size_transpose_output_shape(
-    input_shape: torch.Size,
+    input_sparse_shape: torch.Size,
     kernel_size: tuple[int, ...],
     stride: tuple[int, ...],
     padding: tuple[int, ...],
@@ -1421,8 +1427,8 @@ def compute_strided_kernel_size_transpose_output_shape(
     pass through unchanged.
     """
     Ds = len(kernel_size)
-    prefix = tuple(input_shape[:-Ds]) if Ds > 0 else tuple(input_shape)
-    spatial = tuple(input_shape[-Ds:]) if Ds > 0 else ()
+    prefix = tuple(input_sparse_shape[:-Ds]) if Ds > 0 else tuple(input_sparse_shape)
+    spatial = tuple(input_sparse_shape[-Ds:]) if Ds > 0 else ()
     out_spatial = tuple(
         (w - 1) * s - 2 * p + d * (k - 1) + 1
         for w, k, s, p, d in zip(spatial, kernel_size, stride, padding, dilation)
@@ -1443,7 +1449,7 @@ def _build_strided_neighbor_map_kernel_size_cuda(
 
     Returns ``(fwd_map, bwd_map_or_None, output_coords)``.
     """
-    N, C, W, H, Dd = shape
+    N, W, H, Dd = shape
     if spconv.OUT_COORD_ALGO == 0:  # HASHMAP
         output_coords = kernels.cuda.hashmap_build_sparse_conv_out_coords(
             input_coords, spconv.OUT_COORD_HASHMAP_RATIO, spconv.SERIALIZATION_MODE,
@@ -1482,7 +1488,7 @@ def _build_strided_neighbor_map_kernel_size_cuda(
 def _build_strided_edges_kernel_size_triton(
     input_coords: Tensor,
     shape: torch.Size,
-    output_shape: torch.Size,
+    output_sparse_shape: torch.Size,
     kernel_size: tuple[int, ...],
     stride: tuple[int, ...],
     dilation: tuple[int, ...],
@@ -1503,9 +1509,9 @@ def _build_strided_edges_kernel_size_triton(
     ``candidate_out = coord_in * stride + offset + delta`` (see
     :func:`get_output_coords_kernel_size_dilation`). ``shape`` is still the
     ambient shape of ``input_coords`` (the conv-transpose's *small* side) and
-    ``output_shape`` is the candidate / boundary side (the *large* side).
+    ``output_sparse_shape`` is the candidate / boundary side (the *large* side).
     """
-    boundary = _boundary_for_strided(input_coords, shape, output_shape, D_spatial)
+    boundary = _boundary_for_strided(input_coords, shape, output_sparse_shape, D_spatial)
     # NOTE: get_output_coords_kernel_size_dilation takes ``offset``,
     # not ``padding`` (centered-kernel convention).
     output_coords, edge_in, edge_out, edge_kernel = \
@@ -1534,8 +1540,8 @@ def _build_strided_kernel_size_custom(
     stride: tuple[int, ...] | None,
     padding: tuple[int, ...] | None,
     offset: tuple[int, ...] | None,
-    input_shape: torch.Size | None,
-    output_shape: torch.Size | None,
+    input_sparse_shape: torch.Size | None,
+    output_sparse_shape: torch.Size | None,
     transposed: bool = False,
 ) -> NeighborCache:
     """Strided + caller-supplied output_coords: only the fwd neighbor map is built.
@@ -1562,7 +1568,7 @@ def _build_strided_kernel_size_custom(
     if transposed:
         # User's (small in, large out) becomes underlying (large in, small out).
         input_coords, output_coords = output_coords, input_coords
-        input_shape, output_shape = output_shape, input_shape
+        input_sparse_shape, output_sparse_shape = output_sparse_shape, input_sparse_shape
 
     fwd_nm = kernels.triton.build_neighbor_map_from_kernel_size_dilation(
         input_coords, output_coords,
@@ -1575,8 +1581,8 @@ def _build_strided_kernel_size_custom(
         fwd_map=fwd_nm,
         input_coords=input_coords,
         output_coords=output_coords,
-        input_shape=input_shape,
-        output_shape=output_shape,
+        input_sparse_shape=input_sparse_shape,
+        output_sparse_shape=output_sparse_shape,
         symmetric=False,
     )
     return underlying.T if transposed else underlying
@@ -1592,8 +1598,8 @@ def _build_strided_kernel_delta_auto(
     kernel_delta: Tensor,
     stride: tuple[int, ...] | None,
     offset: tuple[int, ...] | None,
-    input_shape: torch.Size | None,
-    output_shape: torch.Size | None,
+    input_sparse_shape: torch.Size | None,
+    output_sparse_shape: torch.Size | None,
     transposed: bool = False,
 ) -> NeighborCache:
     """Strided kernel_delta + no caller-supplied output_coords.
@@ -1601,26 +1607,26 @@ def _build_strided_kernel_delta_auto(
     See :func:`_build_strided_kernel_size_auto` for the transpose semantics
     and the ``.T`` return contract.
     """
-    assert input_shape is not None, \
-        "build_neighbor_cache(submanifold=False, output_coords=None) requires `input_shape`."
+    assert input_sparse_shape is not None, \
+        "build_neighbor_cache(submanifold=False, output_coords=None) requires `input_sparse_shape`."
     D_spatial = kernel_delta.shape[1]
     stride = tuple(stride) if stride is not None else (1,) * D_spatial
     offset_t = tuple(offset) if offset is not None else (0,) * D_spatial
     assert len(stride) == D_spatial and len(offset_t) == D_spatial, \
         "stride / offset must match kernel_delta's spatial dimensionality"
 
-    if output_shape is None:
+    if output_sparse_shape is None:
         if transposed:
-            output_shape = compute_strided_kernel_delta_transpose_output_shape(
-                input_shape, stride,
+            output_sparse_shape = compute_strided_kernel_delta_transpose_output_shape(
+                input_sparse_shape, stride,
             )
         else:
-            output_shape = compute_strided_kernel_delta_output_shape(
-                input_shape, stride,
+            output_sparse_shape = compute_strided_kernel_delta_output_shape(
+                input_sparse_shape, stride,
             )
 
     output_coords, edge_in, edge_out, edge_kernel = _build_strided_edges_kernel_delta_triton(
-        input_coords, input_shape, output_shape,
+        input_coords, input_sparse_shape, output_sparse_shape,
         kernel_delta, stride, offset_t,
         D_spatial,
         transposed=transposed,
@@ -1633,8 +1639,8 @@ def _build_strided_kernel_delta_auto(
             edge_kernel=edge_kernel, num_kernels=num_kernels,
             input_coords=input_coords,
             output_coords=output_coords,
-            input_shape=input_shape,
-            output_shape=output_shape,
+            input_sparse_shape=input_sparse_shape,
+            output_sparse_shape=output_sparse_shape,
             symmetric=False,
         )
     # See `_build_strided_kernel_size_auto` for the edge-swap reasoning.
@@ -1643,41 +1649,41 @@ def _build_strided_kernel_delta_auto(
         edge_kernel=edge_kernel, num_kernels=num_kernels,
         input_coords=output_coords,
         output_coords=input_coords,
-        input_shape=output_shape,
-        output_shape=input_shape,
+        input_sparse_shape=output_sparse_shape,
+        output_sparse_shape=input_sparse_shape,
         symmetric=False,
     )
     return underlying.T
 
 
 def compute_strided_kernel_delta_output_shape(
-    input_shape: torch.Size,
+    input_sparse_shape: torch.Size,
     stride: tuple[int, ...],
 ) -> torch.Size:
     """Forward kernel_delta output shape: ``Wo = W // S``.
 
-    Spatial dims are the trailing ``len(stride)`` of ``input_shape``.
+    Spatial dims are the trailing ``len(stride)`` of ``input_sparse_shape``.
     """
     Ds = len(stride)
-    prefix = tuple(input_shape[:-Ds]) if Ds > 0 else tuple(input_shape)
-    spatial = tuple(input_shape[-Ds:]) if Ds > 0 else ()
+    prefix = tuple(input_sparse_shape[:-Ds]) if Ds > 0 else tuple(input_sparse_shape)
+    spatial = tuple(input_sparse_shape[-Ds:]) if Ds > 0 else ()
     out_spatial = tuple(w // s for w, s in zip(spatial, stride))
     return torch.Size([*prefix, *out_spatial])
 
 
 def compute_strided_kernel_delta_transpose_output_shape(
-    input_shape: torch.Size,
+    input_sparse_shape: torch.Size,
     stride: tuple[int, ...],
 ) -> torch.Size:
     """Conv-transpose kernel_delta output shape: ``Wo = W * S``.
 
     Inverse of :func:`compute_strided_kernel_delta_output_shape` (no
     ``output_padding``). Spatial dims are the trailing ``len(stride)`` of
-    ``input_shape``.
+    ``input_sparse_shape``.
     """
     Ds = len(stride)
-    prefix = tuple(input_shape[:-Ds]) if Ds > 0 else tuple(input_shape)
-    spatial = tuple(input_shape[-Ds:]) if Ds > 0 else ()
+    prefix = tuple(input_sparse_shape[:-Ds]) if Ds > 0 else tuple(input_sparse_shape)
+    spatial = tuple(input_sparse_shape[-Ds:]) if Ds > 0 else ()
     out_spatial = tuple(w * s for w, s in zip(spatial, stride))
     return torch.Size([*prefix, *out_spatial])
 
@@ -1685,7 +1691,7 @@ def compute_strided_kernel_delta_transpose_output_shape(
 def _build_strided_edges_kernel_delta_triton(
     input_coords: Tensor,
     shape: torch.Size,
-    output_shape: torch.Size,
+    output_sparse_shape: torch.Size,
     kernel_delta: Tensor,
     stride: tuple[int, ...],
     offset: tuple[int, ...],
@@ -1698,7 +1704,7 @@ def _build_strided_edges_kernel_delta_triton(
     is in ``[0, kernel_delta.shape[0])``. The forward / backward neighbor
     maps are derived lazily by :class:`NeighborCache` via scatter.
     """
-    boundary = _boundary_for_strided(input_coords, shape, output_shape, D_spatial)
+    boundary = _boundary_for_strided(input_coords, shape, output_sparse_shape, D_spatial)
     output_coords, edge_in, edge_out, edge_kernel = kernels.triton.get_output_coords_kernel_delta(
         input_coords, kernel_delta,
         stride=stride, offset=offset, boundary=boundary,
@@ -1718,8 +1724,8 @@ def _build_strided_kernel_delta_custom(
     kernel_delta: Tensor,
     stride: tuple[int, ...] | None,
     offset: tuple[int, ...] | None,
-    input_shape: torch.Size | None,
-    output_shape: torch.Size | None,
+    input_sparse_shape: torch.Size | None,
+    output_sparse_shape: torch.Size | None,
     transposed: bool = False,
 ) -> NeighborCache:
     D_spatial = kernel_delta.shape[1]
@@ -1730,7 +1736,7 @@ def _build_strided_kernel_delta_custom(
 
     if transposed:
         input_coords, output_coords = output_coords, input_coords
-        input_shape, output_shape = output_shape, input_shape
+        input_sparse_shape, output_sparse_shape = output_sparse_shape, input_sparse_shape
 
     fwd_nm = kernels.triton.build_neighbor_map_from_kernel_delta(
         input_coords, output_coords, kernel_delta,
@@ -1740,8 +1746,8 @@ def _build_strided_kernel_delta_custom(
         fwd_map=fwd_nm,
         input_coords=input_coords,
         output_coords=output_coords,
-        input_shape=input_shape,
-        output_shape=output_shape,
+        input_sparse_shape=input_sparse_shape,
+        output_sparse_shape=output_sparse_shape,
         symmetric=False,
     )
     return underlying.T if transposed else underlying

@@ -2,12 +2,33 @@
 
 For ``nearest`` mode we round the float grid to voxel centers inside the
 kernel and probe the sparse coord hash map. For ``linear`` mode we enumerate
-the ``2**D_orig`` corners of the surrounding voxel cell on the fly, compute
-the multilinear weight for each corner directly from the local fractional
-position, and probe the hash map per corner — all without materialising any
-``[..., D]`` coordinate buffers on the host.
+the ``2**n_spatial_dims`` corners of the surrounding voxel cell on the fly,
+compute the multilinear weight for each corner directly from the local
+fractional position, and probe the hash map per corner — all without
+materialising any ``(..., D)`` coordinate buffers on the host.
+
+Both kernels split the coord columns into a *batch* prefix (the leading
+``D - n_spatial_dims`` columns) and a *spatial* suffix:
+
+* Batch columns must hold integer-valued grid entries; they are passed
+  through unchanged to the lookup (no rounding, no corner enumeration).
+* Spatial columns are interpreted as float and trigger the usual
+  voxel-center rounding (nearest) / 2**n_spatial corner enumeration
+  (linear).
+
+Geometric transforms — ``scale_factor``, ``align_corners`` — are *not*
+handled here; callers are expected to bake those into ``grid`` before
+invoking the kernels (see ``flex_gemm/ops/sample/upsample.py``).
+
+Voxel-center convention: voxel ``i`` is centered at integer location
+``i`` (NOT at the half-integer ``i + 0.5``). A query at ``g = i.float()``
+round-trips exactly to ``feats[i]``. For ``linear`` mode that means
+``lo = floor(g)``, ``frac = g - lo``; for ``nearest`` mode it means
+``q = floor(g + 0.5)``. This is shifted by 0.5 vs PyTorch's pixel-center
+convention (which only makes sense for normalised ``[-1, 1]`` grids
+where round-trip is irrelevant).
 """
-from typing import Optional, Sequence, Tuple, Union
+from typing import Optional, Tuple
 
 import torch
 from torch import Tensor
@@ -48,7 +69,6 @@ def _prod_combine(a, b):
 @triton.jit
 def _grid_sample_nearest_kernel(
     grid_ptr,                      # [M, D_ORIG] float or int (coord dtype)
-    inv_scale_ptr,                 # [D_PACKED] fp32 or None
     hashmap_ptr,
     hashmap_size,
     keys_ptr,                      # padded int32 keys
@@ -58,6 +78,7 @@ def _grid_sample_nearest_kernel(
     D_ORIG: tl.constexpr,
     D_PACKED: tl.constexpr,        # elements per row of ``keys`` after pad,
                                    #   in *coord-dtype* units (not int32)
+    N_BATCH: tl.constexpr,         # leading int (batch) columns
     IS_FLOAT_GRID: tl.constexpr,
     BM: tl.constexpr,
 ):
@@ -67,20 +88,20 @@ def _grid_sample_nearest_kernel(
 
     d_range = tl.arange(0, D_PACKED)
     mask_d = d_range < D_ORIG
+    # Spatial columns are the trailing ``D_ORIG - N_BATCH`` lanes.
+    mask_spatial = (d_range >= N_BATCH) & mask_d
 
     # Load query row. Padding lanes are loaded as 0 (other=0), which matches
     # the zero-padding we apply to ``keys`` host-side.
     g_ptr = grid_ptr + offs_m[:, None] * D_ORIG + d_range[None, :]
     if IS_FLOAT_GRID:
         g_f = tl.load(g_ptr, mask=mask[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
-        if inv_scale_ptr is not None:
-            inv_s = tl.load(inv_scale_ptr + d_range)         # [D_PACKED] fp32
-            g_f = g_f * inv_s[None, :]
-        # Round-half-up; matches torch.round for non-half-integers.
-        q_f = tl.math.floor(g_f + 0.5)
+        # Round-half-up for spatial dims; batch dims pass through as-is.
+        q_spatial = tl.math.floor(g_f + 0.5)
+        q_f = tl.where(mask_spatial[None, :], q_spatial, g_f)
         q = q_f.to(COORD_DTYPE)
     else:
-        # Integer grid path: scale must be None (enforced host-side).
+        # Integer grid path: rounding is a no-op for both batch and spatial.
         q = tl.load(g_ptr, mask=mask[:, None] & mask_d[None, :], other=0)
 
     # Ensure padding lanes are zero so the hash matches the padded keys.
@@ -96,7 +117,6 @@ def _grid_sample_nearest_kernel(
 @triton.jit
 def _grid_sample_linear_kernel(
     grid_ptr,                      # [M, D_ORIG] float
-    inv_scale_ptr,                 # [D_PACKED] fp32 or None
     hashmap_ptr,
     hashmap_size,
     keys_ptr,                      # padded int32 keys
@@ -106,7 +126,8 @@ def _grid_sample_linear_kernel(
     COORD_DTYPE: tl.constexpr,     # original coord dtype (int8/16/32)
     D_ORIG: tl.constexpr,
     D_PACKED: tl.constexpr,
-    V: tl.constexpr,               # = 1 << D_ORIG
+    N_BATCH: tl.constexpr,         # leading int (batch) columns
+    V: tl.constexpr,               # = 1 << (D_ORIG - N_BATCH)
     BM: tl.constexpr,
 ):
     pid = tl.program_id(0)
@@ -115,34 +136,42 @@ def _grid_sample_linear_kernel(
 
     d_range = tl.arange(0, D_PACKED)
     mask_d = d_range < D_ORIG
+    mask_spatial = (d_range >= N_BATCH) & mask_d
+    # Spatial index relative to the spatial-only sub-vector. Outside the
+    # spatial lanes the value is moot (it's only used through
+    # ``mask_spatial``-gated paths).
+    spatial_idx = d_range - N_BATCH
 
     # Load grid; padding lanes -> 0 floats.
     g_ptr = grid_ptr + offs_m[:, None] * D_ORIG + d_range[None, :]
     g = tl.load(g_ptr, mask=mask[:, None] & mask_d[None, :], other=0.0).to(tl.float32)
-    if inv_scale_ptr is not None:
-        inv_s = tl.load(inv_scale_ptr + d_range)              # [D_PACKED] fp32
-        g = g * inv_s[None, :]
 
-    # Voxel-center convention: the 2**D corners around g are
-    #   lo + bits(v),  lo = floor(g - 0.5),  v = 0..V-1.
-    # For padding dims we force lo=0 and frac=0 (so the corner stays at 0
-    # in the padding lanes, matching the zero-padded keys).
-    g_shift = tl.where(mask_d[None, :], g - 0.5, 0.0)
-    lo = tl.math.floor(g_shift)
-    frac = g_shift - lo
+    # Voxel-center convention on spatial dims: voxel ``i`` is centered at
+    # integer location ``i``. The 2**n_spatial corners around g are
+    #   lo + bits(v),   lo = floor(g),   frac = g - lo,   v = 0..V-1.
+    # This makes ``g = i.float()`` round-trip exactly to ``feats[i]``.
+    # Batch dims get lo = g (integer-valued grid entry passes through) and
+    # frac = 0 so every corner agrees on those columns.
+    # Padding dims: lo = 0, frac = 0 (so hash matches the zero-padded keys).
+    lo_spatial = tl.math.floor(g)
+    frac_spatial = g - lo_spatial
+
+    lo = tl.where(mask_spatial[None, :], lo_spatial, g)
     lo = tl.where(mask_d[None, :], lo, 0.0)
-    frac = tl.where(mask_d[None, :], frac, 0.0)
+    frac = tl.where(mask_spatial[None, :], frac_spatial, 0.0)
 
     for v in tl.static_range(V):
-        # Per-dim corner bits. v has only D_ORIG meaningful bits, so for d
-        # in [D_ORIG, D_PACKED) the shift yields 0 — matching our padding.
-        bits = ((v >> d_range) & 1).to(tl.float32)             # [D_PACKED]
-        corner_f = lo + bits[None, :]                          # [BM, D_PACKED]
+        # Per-spatial-lane corner bit. v has only n_spatial meaningful bits;
+        # batch / padding lanes are forced to 0 below via ``mask_spatial``.
+        bits_raw = ((v >> spatial_idx) & 1).to(tl.float32)
+        bits = tl.where(mask_spatial, bits_raw, 0.0)            # [D_PACKED]
+        corner_f = lo + bits[None, :]                            # [BM, D_PACKED]
         corner = corner_f.to(COORD_DTYPE)
 
-        # Multilinear weight: prod over d of (bit==1 ? frac : 1 - frac).
-        # Padding dims have bit=0, frac=0 → factor = 1 (no contribution).
+        # Multilinear weight: prod over spatial dims of (bit==1 ? frac : 1-frac).
+        # Batch / padding lanes contribute a factor of 1.
         w_per = tl.where(bits[None, :] == 1, frac, 1.0 - frac)
+        w_per = tl.where(mask_spatial[None, :], w_per, 1.0)
         weight = tl.reduce(w_per, axis=1, combine_fn=_prod_combine)   # [BM]
 
         idx = _hashmap_lookup_inline_32bit(
@@ -193,68 +222,58 @@ def _build_hashmap_and_pad(coords: Tensor) -> Tuple[Tensor, Tensor, int, int]:
     return hashmap, keys_i32, hashmap_size, D_packed
 
 
-def _build_inv_scale(
-    scale: Optional[Union[float, Sequence[float]]],
-    D_orig: int,
-    D_packed: int,
-    device: torch.device,
-) -> Optional[Tensor]:
-    """Materialise a ``[D_PACKED]`` fp32 tensor of ``1/scale`` per dim (padded
-    with 1.0). Returns ``None`` when ``scale is None`` so the kernel branch
-    can be statically eliminated."""
-    if scale is None:
-        return None
-    if isinstance(scale, (int, float)):
-        vals = [float(scale)] * D_orig
-    else:
-        vals = list(scale)
-        assert len(vals) == D_orig, f"scale must have length {D_orig}, got {len(vals)}"
-    inv = torch.ones(D_packed, dtype=torch.float32, device=device)
-    inv[:D_orig] = 1.0 / torch.as_tensor(vals, dtype=torch.float32, device=device)
-    return inv
+def _resolve_n_batch(D_orig: int, n_spatial_dims: Optional[int]) -> int:
+    """Translate user-facing ``n_spatial_dims`` into the kernel's ``N_BATCH``
+    constexpr. ``None`` means "all spatial" (legacy behaviour)."""
+    if n_spatial_dims is None:
+        return 0
+    assert 0 < n_spatial_dims <= D_orig, (
+        f"n_spatial_dims must be in (0, {D_orig}], got {n_spatial_dims}"
+    )
+    return D_orig - n_spatial_dims
 
 
 def grid_sample_nearest_lookup(
     coords: Tensor,
     grid: Tensor,
-    scale: Optional[Union[float, Sequence[float]]] = None,
+    *,
+    n_spatial_dims: Optional[int] = None,
 ) -> Tensor:
     """Build a hashmap from ``coords`` and look up the nearest voxel for
     each row of ``grid`` in one fused kernel.
 
     Args:
-        coords: ``[N, D]`` integer voxel coordinates.
-        grid:   ``[M, D]`` query points. May be float (rounded to the
-                nearest voxel center) or integer (must match ``coords.dtype``).
-        scale:  optional scalar / per-dim divisor applied to ``grid`` inside
-                the kernel. When non-None with an integer grid, the grid is
-                promoted to float on the host since the scaled coordinates
-                are generally fractional.
+        coords: ``(N, D)`` integer voxel coordinates.
+        grid:   ``(M, D)`` query points. May be float (rounded to the
+                nearest voxel center on the spatial columns) or integer
+                (must match ``coords.dtype``).
+        n_spatial_dims: number of trailing spatial columns. The leading
+            ``D - n_spatial_dims`` columns are passed through as integer
+            batch indices (no rounding). ``None`` (default) means "all
+            columns are spatial".
 
     Returns:
-        ``[M]`` int32 tensor of feature indices (``-1`` for unknown voxels).
+        ``(M)`` int32 tensor of feature indices (``-1`` for unknown voxels).
     """
     assert coords.dim() == 2 and grid.dim() == 2
     D_orig = coords.shape[1]
     assert grid.shape[1] == D_orig
-    if scale is not None and not grid.dtype.is_floating_point:
-        grid = grid.float()
     is_float = grid.dtype.is_floating_point
     if not is_float:
         assert grid.dtype == coords.dtype, \
             f"integer grid must match coords dtype ({coords.dtype}); got {grid.dtype}"
 
+    n_batch = _resolve_n_batch(D_orig, n_spatial_dims)
+
     coords = coords.contiguous()
     grid = grid.contiguous()
     hashmap, keys_i32, hashmap_size, D_packed = _build_hashmap_and_pad(coords)
-    inv_scale = _build_inv_scale(scale, D_orig, D_packed, coords.device)
 
     M = grid.shape[0]
     indices = torch.empty((M,), dtype=torch.int32, device=coords.device)
     BM = 64
     _grid_sample_nearest_kernel[(triton.cdiv(M, BM),)](
         grid_ptr=grid,
-        inv_scale_ptr=inv_scale,
         hashmap_ptr=hashmap,
         hashmap_size=hashmap_size,
         keys_ptr=keys_i32,
@@ -263,6 +282,7 @@ def grid_sample_nearest_lookup(
         COORD_DTYPE=_TORCH_TO_TL_DTYPE[coords.dtype],
         D_ORIG=D_orig,
         D_PACKED=D_packed,
+        N_BATCH=n_batch,
         IS_FLOAT_GRID=is_float,
         BM=BM,
     )
@@ -272,44 +292,52 @@ def grid_sample_nearest_lookup(
 def grid_sample_linear_lookup(
     coords: Tensor,
     grid: Tensor,
-    scale: Optional[Union[float, Sequence[float]]] = None,
+    *,
+    n_spatial_dims: Optional[int] = None,
 ) -> Tuple[Tensor, Tensor]:
-    """Build a hashmap from ``coords`` and compute the ``2**D``-corner
-    indices and *raw* multilinear weights for each row of ``grid`` in one
-    fused kernel.
+    """Build a hashmap from ``coords`` and compute the ``2**n_spatial_dims``-
+    corner indices and *raw* multilinear weights for each row of ``grid`` in
+    one fused kernel.
 
     Args:
-        coords: ``[N, D]`` integer voxel coordinates.
-        grid:   ``[M, D]`` float query points.
-        scale:  optional scalar / per-dim divisor applied to ``grid`` inside
-                the kernel.
+        coords: ``(N, D)`` integer voxel coordinates.
+        grid:   ``(M, D)`` float query points. Batch columns must hold
+                integer-valued floats (passed through unchanged).
+        n_spatial_dims: number of trailing spatial columns. The leading
+            ``D - n_spatial_dims`` columns are batch indices and do *not*
+            participate in corner enumeration. ``None`` (default) means
+            "all columns are spatial".
 
     Returns:
-        ``(indices, weights)`` with shapes ``[M, 2**D]``: ``indices`` is
-        int32 (-1 for absent corners); ``weights`` is fp32 holding the
-        *raw geometric* multilinear weights (they sum to 1 per row across
-        *all* corners). Downstream consumers are responsible for masking
-        by ``indices != -1`` and for any renormalisation.
+        ``(indices, weights)`` with shapes ``(M, V)``, ``V = 2 ** n_spatial_dims``.
+        ``indices`` is int32 (``-1`` for absent corners); ``weights`` is
+        fp32 holding the *raw geometric* multilinear weights (they sum to
+        1 per row across all corners). Downstream consumers are responsible
+        for masking by ``indices != -1`` and for any renormalisation.
     """
     assert coords.dim() == 2 and grid.dim() == 2
     assert grid.dtype.is_floating_point, "linear lookup requires a float grid"
     D_orig = coords.shape[1]
     assert grid.shape[1] == D_orig
-    assert D_orig <= 8, f"linear lookup supports D <= 8 (V = 2**D <= 256), got D={D_orig}"
+
+    n_batch = _resolve_n_batch(D_orig, n_spatial_dims)
+    n_spatial = D_orig - n_batch
+    assert n_spatial <= 8, (
+        f"linear lookup supports up to 8 spatial dims (V = 2**n_spatial <= 256), "
+        f"got n_spatial={n_spatial}"
+    )
 
     coords = coords.contiguous()
     grid = grid.contiguous()
     hashmap, keys_i32, hashmap_size, D_packed = _build_hashmap_and_pad(coords)
-    inv_scale = _build_inv_scale(scale, D_orig, D_packed, coords.device)
 
     M = grid.shape[0]
-    V = 1 << D_orig
+    V = 1 << n_spatial
     indices = torch.empty((M, V), dtype=torch.int32, device=coords.device)
     weights = torch.empty((M, V), dtype=torch.float32, device=coords.device)
     BM = 32
     _grid_sample_linear_kernel[(triton.cdiv(M, BM),)](
         grid_ptr=grid,
-        inv_scale_ptr=inv_scale,
         hashmap_ptr=hashmap,
         hashmap_size=hashmap_size,
         keys_ptr=keys_i32,
@@ -319,6 +347,7 @@ def grid_sample_linear_lookup(
         COORD_DTYPE=_TORCH_TO_TL_DTYPE[coords.dtype],
         D_ORIG=D_orig,
         D_PACKED=D_packed,
+        N_BATCH=n_batch,
         V=V,
         BM=BM,
     )

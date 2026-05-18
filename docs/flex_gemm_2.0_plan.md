@@ -1,5 +1,38 @@
 > 本 Issue 汇总了 FlexGEMM 2.0 版本的改进方向，包含代码层的分析与具体任务拆解，欢迎讨论。
 
+## 〇、Channel-Last 是 FlexGEMM 的基本特征
+
+FlexGEMM 2.0 把 **channel-last** 作为整个库的基础不变量，对齐 `torch.sparse_coo_tensor` 的 "sparse 在前、dense 在后" 布局：
+
+| 量                                          | 形状                                          | 备注                                               |
+| ------------------------------------------ | ------------------------------------------- | ------------------------------------------------ |
+| `coords`                                   | `[M, Db + Ds]`，`int32`                      | 列顺序 `(*batch_dims, *spatial_idx)`                |
+| `feats`                                    | `[M, *dense_shape]`                         | channel 维度（以及任何 extra dense 维）一律放在 voxel 索引之后    |
+| 算子 `shape` 参数                              | `(*batch_dims, *spatial_dims, *dense_shape)` | **完整 channel-last 形状**，与 `torch.sparse_coo_tensor` 一致 |
+| `NeighborCache.input_shape` / `output_shape` | `(*batch_dims, *spatial_dims)`              | **仅稀疏部分**，cache 完全不感知 channel                    |
+| 卷积权重 `weight`                              | `(C_out, *kernel_size, C_in)`               | channel-last                                     |
+
+为什么作为基本特征：
+
+1. **零歧义**：旧版本存在 "C-sandwich" `(*batch, C, *spatial)` 与 channel-last 混用，每个算子都要硬编码 `shape[:-D_spatial - 1]` 这类切片，且在 pixel_shuffle / upsample 这样的算子里反复出过 bug。统一为 channel-last 后所有边界处都用 `shape[:sparse_dim]` / `shape[sparse_dim:]` 即可，再没有"插在中间"的特例。
+2. **与 PyTorch 生态对齐**：`torch.sparse_coo_tensor(indices, values, size)` 的 size 即 `(*sparse_shape, *dense_shape)`，FlexGEMM 算子的 `shape` 参数完全镜像它，方便互转。
+3. **Cache 解耦**：`NeighborCache` 只保存稀疏拓扑（不含 channel），可以跨不同 channel 数复用——这与第二节"neighbor map 与 GEMM 解耦"的方向一致。
+4. **CUDA / Triton 统一**：两条后端路径都按 channel-last 假设接收坐标和形状，CUDA 内核本就只读取 `(*batch, *spatial)` 部分，channel-last 的 Python 端表示更贴近底层实际行为。
+
+### API 行为约定
+
+- 所有面向用户的算子 (`sparse_submanifold_conv*`, `sparse_conv*`, `sparse_conv_transpose*`, `sparse_upsample`, `sparse_pixel_shuffle`, `sparse_*_pool`) 的 `shape` 参数**必须**是完整 channel-last 形状；算子在边界处通过 `split_sparse_shape(shape, sparse_dim)` 切出 sparse_shape 传给 cache，再在返回时把输出 feats 的 dense 尾部拼回去得到 `output_shape`。
+- `sparse_to_dense(feats, coords, shape)` 也按 channel-last 解释 `shape`，直接 `feats.new_zeros(shape)` + 高级索引，不再有 `batch_dims` 参数。
+- `NeighborCache` 的 `input_shape` / `output_shape` 仅存 sparse 部分；用户构造 cache 时如果显式给 `input_shape`，必须传 sparse-only 形状。
+
+### 文档与示例
+
+- `README.md` 顶部新增 "Layout Convention (Channel-Last)" 节作为整个库的入口说明。
+- `tests/utils.py` / `examples/utils.py` 中的 `sphere_coords` 返回 `(N, R, R, R, C)`。
+- 与 dense PyTorch 算子对比的测试（如 `tests/sample/test_upsample_pixel_shuffle.py`）在 sparse-channel-last 与 torch-channel-first 之间显式 `permute`，并在文件头标注 layout 约定。
+
+---
+
 ## 一、合并 `dev/all_triton` 分支 —— 纯 Triton 替代
 
 ### 背景

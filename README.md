@@ -19,7 +19,28 @@ It implements **Explicit**, **Implicit**, and **Masked Implicit** algorithm vari
 
 - **Triton-First Architecture**: Built entirely on [Triton](https://github.com/triton-lang/triton), ensuring high-performance kernel execution and cross-platform compatibility.
 - **Sparse-Optimized**: Specifically tailored for 3D sparse tensors, efficiently handling highly irregular sparsity patterns.
+- **Channel-Last Native**: All sparse tensors follow a **channel-last** layout, mirroring `torch.sparse_coo_tensor`. See [Layout Convention](#-layout-convention-channel-last) below — this is a fundamental, library-wide invariant.
 - **Blazing Fast**: Consistently outperforms standard sparse convolution libraries (such as `spconv`, `torchsparse`) in training throughput.
+
+## 🧭 Layout Convention (Channel-Last)
+
+FlexGEMM standardises on a **channel-last** sparse layout across every op, module, and cache. This mirrors the layout used by [`torch.sparse_coo_tensor`](https://pytorch.org/docs/stable/generated/torch.sparse_coo_tensor.html) and removes the C-axis ambiguity that plagues many sparse-tensor libraries.
+
+For a sparse tensor with `Db` batch dims, `Ds` spatial dims, and `Dd` dense (channel) dims:
+
+| Quantity            | Shape                                                 | Notes                                                       |
+| ------------------- | ----------------------------------------------------- | ----------------------------------------------------------- |
+| `coords`            | `[M, Db + Ds]`, `int32`                               | One row per active voxel; columns = `(*batch_dims, *spatial_idx)`. |
+| `feats`             | `[M, *dense_shape]`                                   | Channels (and any extra dense dims) trail the voxel index.  |
+| `shape` (op arg)    | `(*batch_dims, *spatial_dims, *dense_shape)`          | Full channel-last shape, matches `torch.sparse_coo_tensor`. |
+| `NeighborCache.input_shape` / `output_shape` | `(*batch_dims, *spatial_dims)`        | Sparse-only — channels are deliberately omitted from caches. |
+
+**Practical implications**
+
+1. Pass shapes to every op as the full channel-last shape, e.g. `shape = (N, H, W, D, C)` for 3D voxel grids.
+2. Weights for sparse convolutions are stored channel-last as well: `weight.shape == (C_out, *kernel_size, C_in)`.
+3. When you need a dense tensor for visualisation or comparison against `torch.nn.functional`, use `sparse_to_dense(feats, coords, shape)` — the result is channel-last; permute as needed.
+4. The CUDA extension, Triton backends, and the Python API all agree on this convention; there is no internal C-sandwich layout to be aware of.
 
 ## 🛠️ Installation
 

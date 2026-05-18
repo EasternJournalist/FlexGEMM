@@ -40,6 +40,12 @@ from .sample.pixel_shuffle import (
     sparse_pixel_shuffle3d,
     sparse_pixel_shuffle4d,
 )
+from .sample.pixel_unshuffle import (
+    sparse_pixel_unshuffle,
+    sparse_pixel_unshuffle2d,
+    sparse_pixel_unshuffle3d,
+    sparse_pixel_unshuffle4d,
+)
 from .pool.submanifold_pool import (
     submanifold_pool,
     submanifold_pool2d,
@@ -54,6 +60,8 @@ from .pool.sparse_pool import (
 )
 from .utils import (
     sparse_to_dense,
+    sort_coords,
+    coalesce_coords,
 )
 
 __all__ = [
@@ -85,6 +93,10 @@ __all__ = [
     "sparse_pixel_shuffle2d",
     "sparse_pixel_shuffle3d",
     "sparse_pixel_shuffle4d",
+    "sparse_pixel_unshuffle",
+    "sparse_pixel_unshuffle2d",
+    "sparse_pixel_unshuffle3d",
+    "sparse_pixel_unshuffle4d",
     "sparse_pool",
     "sparse_pool2d",
     "sparse_pool3d",
@@ -94,4 +106,6 @@ __all__ = [
     "submanifold_pool3d",
     "submanifold_pool4d",
     "sparse_to_dense",
+    "sort_coords",
+    "coalesce_coords",
 ]

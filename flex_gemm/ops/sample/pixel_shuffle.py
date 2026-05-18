@@ -3,7 +3,7 @@ from torch import Tensor
 
 from ..index_select_add import index_select_add
 from ..neighbor_cache import NeighborCacheT, build_neighbor_cache
-from ..utils import _broadcast_dim_arg
+from ..utils import _broadcast_dim_arg, split_sparse_shape
 
 
 __all__ = [
@@ -40,10 +40,11 @@ def sparse_pixel_shuffle(
     accumulation; every output voxel has exactly one parent edge).
 
     Args:
-        feats: ``[M, V * C_out]`` low-resolution features. ``feats.shape[1]``
+        feats: ``(M, V * C_out)`` low-resolution features. ``feats.shape[1]``
             must be divisible by ``V = prod(upscale_factor)``.
-        coords: ``[M, B + Ds]`` low-resolution integer coordinates.
-        shape: low-resolution dense shape ``(*batch_dims, C, S1, ..., SDs)``.
+        coords: ``(M, B + Ds)`` low-resolution integer coordinates.
+        shape: low-resolution dense shape
+            ``(*batch_dims, S1, ..., SDs, C)`` — channel-last convention.
         upscale_factor: per-spatial-dim upscale factor; ``len(upscale_factor)``
             defines the spatial dimensionality (no batch-dim assumption).
         output_coords / output_shape / neighbor_cache: see
@@ -75,43 +76,38 @@ def sparse_pixel_shuffle(
     if neighbor_cache is None:
         # ``padding=0`` resolves the centered-kernel offset to
         # ``(r-1)//2`` so taps tile exactly ``c_in*r + {0, .., r-1}``;
-        # see :func:`sparse_upsample` for details. Let the cache derive
-        # ``output_shape`` itself (it only consults spatial dims; the
-        # channel slot it reports back is ``C_in`` — we patch that to
-        # ``C_out`` after the call).
+        # see :func:`sparse_upsample` for details. The cache works in
+        # sparse-shape land (no C); the op truncates the channel-last
+        # ``shape`` / ``output_shape`` before delegation.
+        sparse_dim = coords.shape[1]
+        sparse_in_shape  = split_sparse_shape(shape,        sparse_dim)
+        sparse_out_shape = split_sparse_shape(output_shape, sparse_dim)
         neighbor_cache = build_neighbor_cache(
             coords, output_coords,
             submanifold=False,
             kernel_size=upscale_factor,
             stride=upscale_factor,
             padding=(0,) * D_spatial,
-            input_shape=shape,
-            output_shape=output_shape,
+            input_sparse_shape=sparse_in_shape,
+            output_sparse_shape=sparse_out_shape,
             transpose=True,
         )
-        output_coords = neighbor_cache.output_coords
-        output_shape = neighbor_cache.output_shape
     else:
         neighbor_cache.assert_match(
             input_coords=coords,
             output_coords=output_coords,
             is_transposed=True,
         )
-        if output_coords is None:
-            output_coords = neighbor_cache.output_coords
-        if output_shape is None:
-            output_shape = neighbor_cache.output_shape
+    output_coords = neighbor_cache.output_coords
+    sparse_out_shape = neighbor_cache.output_sparse_shape
 
-    # The cache only knows spatial topology; its ``output_shape`` carries
-    # the *input* channel count ``C_in`` in the channel slot. Patch to
-    # the post-shuffle ``C_out`` for the value returned to the caller.
-    output_shape = torch.Size(
-        [*output_shape[:-D_spatial - 1], C_out, *output_shape[-D_spatial:]]
-    )
+    # Reassemble the full channel-last output shape: sparse prefix from the
+    # cache + the post-shuffle channel count ``C_out``.
+    output_shape = torch.Size([*sparse_out_shape, C_out])
 
     # The cache's COO edges encode the parent (low-res voxel + sub-pixel
     # slot) of every high-res voxel. Flatten ``feats`` to
-    # ``[M * V, C_out]`` and form a flat source index
+    # ``(M * V, C_out)`` and form a flat source index
     # ``src = edge_in * V + edge_kernel`` so a single ``index_select_add``
     # performs the entire scatter without any kernel-aware reshape.
     assert neighbor_cache.num_kernels == V, (

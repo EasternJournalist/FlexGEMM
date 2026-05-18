@@ -167,18 +167,18 @@ def index_weighted_sum_fwd(
     """Forward of sparse weighted-sum gather.
 
     Args:
-        input:   ``[N, C]`` feature tensor.
-        indices: ``[M, V]`` int32 index tensor; ``-1`` (``0xffffffff``)
+        input:   ``(N, C)`` feature tensor.
+        indices: ``(M, V)`` int32 index tensor; ``-1`` (``0xffffffff``)
                  marks an absent neighbour.
-        weight:  ``[M, V]`` *raw* weights (caller need not pre-mask absent
+        weight:  ``(M, V)`` *raw* weights (caller need not pre-mask absent
                  entries; this kernel gates them).
         normalize: when True, divides each row of the output by its
                    per-row weight_sum (sum of weights of *present*
                    neighbours). Rows with no present neighbour stay zero.
 
     Returns:
-        ``(output, weight_sum)`` — ``output`` is ``[M, C]`` of
-        ``input.dtype``; ``weight_sum`` is ``[M]`` fp32 holding the raw
+        ``(output, weight_sum)`` — ``output`` is ``(M, C)`` of
+        ``input.dtype``; ``weight_sum`` is ``(M)`` fp32 holding the raw
         per-row sum of present weights (always returned regardless of
         ``normalize``, so callers can use it as an occupancy / mask signal).
     """

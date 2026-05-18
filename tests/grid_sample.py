@@ -62,9 +62,8 @@ def _oracle_linear(
     D = grid.shape[-1]
     V = 1 << D
     spatial = dense.shape[:D]
-    g_shift = grid - 0.5
-    lo = g_shift.floor().long()                                  # [..., D]
-    frac = g_shift - lo.to(g_shift.dtype)                        # [..., D]
+    lo = grid.floor().long()                                     # [..., D]
+    frac = grid - lo.to(grid.dtype)                              # [..., D]
 
     accum = torch.zeros(grid.shape[:-1] + (dense.shape[-1],),
                         device=grid.device, dtype=dense.dtype)
@@ -211,16 +210,9 @@ def test_grid_sample_integer_grid_matches_nearest():
     torch.testing.assert_close(out_int, out_near)
 
 
-def test_grid_sample_scale():
-    D, spatial, C = 3, (8, 8, 8), 4
-    feats, coords = _random_sparse(D, spatial, C, 0.5, torch.int32, torch.float32,
-                                   device=DEVICE, seed=6)
-    # Build a "high-res" grid that maps to the low-res coords via /2.
-    grid_hi = _random_grid((16,), D, tuple(s * 2 for s in spatial),
-                           torch.float32, DEVICE, seed=8)
-    out_scaled = sparse_grid_sample(feats, coords, grid_hi, mode="linear", scale_factor=(2.0,) * D)
-    out_manual = sparse_grid_sample(feats, coords, grid_hi / 2.0, mode="linear")
-    torch.testing.assert_close(out_scaled, out_manual)
+# NOTE: scale_factor was removed from sparse_grid_sample (geometric
+# transforms are now caller responsibility — see sparse_upsample). The
+# manual-divide path remains exercised by other tests.
 
 
 def _dense_oracle_grad(feats, coords, spatial, grid, mode, padding_mode):
@@ -311,9 +303,8 @@ def _torch_sparse_grid_sample(
 
     # linear
     V = 1 << D
-    g_shift = g.float() - 0.5
-    lo = g_shift.floor()
-    frac = (g_shift - lo)                                                    # [M, D]
+    lo = g.float().floor()
+    frac = (g.float() - lo)                                                  # [M, D]
     offsets = _ref_corner_offsets(D, g.device, lo.dtype)                     # [V, D]
     corners = (lo.unsqueeze(1) + offsets.unsqueeze(0)).to(coords.dtype)      # [M, V, D]
     queries = corners.reshape(M * V, D).contiguous()

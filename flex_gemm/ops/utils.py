@@ -1,5 +1,6 @@
 import itertools
 from numbers import Number
+from typing import Literal
 
 import torch
 from torch import Tensor
@@ -25,8 +26,34 @@ def _broadcast_dim_arg(x, D: int, name: str):
     return t
 
 
+def split_sparse_shape(
+    shape: torch.Size | None, sparse_dim: int,
+) -> torch.Size | None:
+    """Slice the leading ``sparse_dim`` entries of a channel-last full shape.
+
+    FlexGEMM's library-wide convention is sparse-first, dense-last
+    (mirroring :func:`torch.sparse_coo_tensor`): the op-layer ``shape`` is
+    ``(*sparse_shape, *dense_shape)`` with ``len(sparse_shape) == coords.shape[1]``.
+    The neighbor cache only ever stores the sparse prefix, so ops call this
+    helper before delegating to :func:`build_neighbor_cache`.
+
+    ``None`` passes through unchanged (the cache treats a missing shape as
+    "derive lazily").
+    """
+    if shape is None:
+        return None
+    assert sparse_dim <= len(shape), (
+        f"split_sparse_shape: sparse_dim={sparse_dim} exceeds "
+        f"len(shape)={len(shape)}"
+    )
+    return torch.Size(tuple(shape[:sparse_dim]))
+
+
 def init_hashmap(spatial_size, hashmap_size, device, with_values=True):
-    N, C, W, H, D = spatial_size
+    # `spatial_size` is the *sparse* shape (channel-last convention): for the
+    # 3-D fused CUDA path this is exactly `(N, W, H, D)` — no channel axis.
+    # The hashmap only needs the total volume of indexable positions.
+    N, W, H, D = spatial_size
     VOL = N * W * H * D
         
     # If the number of elements in the tensor is less than 2^32, use uint32 as the hashmap type, otherwise use uint64.
@@ -83,58 +110,135 @@ def sparse_to_dense(
     feats: Tensor,
     coords: Tensor,
     shape: torch.Size,
-    batch_dims: int = 1,
 ) -> Tensor:
-    """Scatter sparse ``[M, C]`` features into a dense tensor of shape ``shape``.
+    """Scatter sparse features into a dense channel-last tensor.
 
-    Assumes the workspace-wide layout convention::
+    Follows FlexGEMM's channel-last convention (mirroring
+    :func:`torch.sparse_coo_tensor`): sparse dims come first, dense dims
+    come last, and the two are not interleaved::
 
-        shape  = (*batch_dims, C, S1, ..., SDs)
-        coords = [M, B + Ds]   with columns (*batch, *spatial)
+        coords      = [N, sparse_dim]     with sparse_dim == len(sparse_shape)
+        feats       = [N, *dense_shape]   (typically [N, C])
+        sparse_shape = (*batch_dims, *spatial_dims)        # aligned with coords cols
+        shape       = (*sparse_shape, *dense_shape)        # full channel-last shape
+        return.shape == shape
 
     Positions not present in ``coords`` are zero. Duplicate coordinates
     overwrite (no accumulation) — callers should dedup upstream if needed.
 
     Args:
-        feats: ``[M, C]`` sparse features.
-        coords: ``[M, B + Ds]`` integer coordinates; advanced-indexed as-is
-            (int32 is fine, no ``.long()`` cast inserted).
-        shape: dense target shape.
-        batch_dims: number of leading batch dims ``B`` in ``shape``. Defaults
-            to ``1`` (the common ``(N, C, S1, ..., SDs)`` layout). Set to
-            ``0`` for a single un-batched volume.
+        feats: ``(N, *dense_shape)`` sparse features.
+        coords: ``(N, sparse_dim)`` integer coordinates; advanced-indexed
+            as-is (int32 is fine, no ``.long()`` cast inserted).
+        shape: full channel-last dense target shape
+            ``(*sparse_shape, *dense_shape)``. The split point between
+            sparse and dense dims is ``coords.shape[1]``.
 
     Returns:
-        Dense tensor of shape ``shape`` containing ``feats`` scattered to the
-        rows indicated by ``coords`` (channel-broadcast along the ``C`` axis).
+        Dense tensor of shape ``shape``.
     """
-    M, C = feats.shape
-    D_total = len(shape)
-    D_spatial = D_total - 1 - batch_dims
-    assert batch_dims >= 0 and D_spatial >= 0, (
-        f"sparse_to_dense: invalid layout — len(shape)={D_total}, "
-        f"batch_dims={batch_dims} leaves D_spatial={D_spatial}"
+    N = feats.shape[0]
+    sparse_dim = coords.shape[1]
+    assert coords.shape[0] == N, (
+        f"sparse_to_dense: feats / coords row count mismatch ({N} vs {coords.shape[0]})"
     )
-    assert coords.shape == (M, batch_dims + D_spatial), (
-        f"sparse_to_dense: coords shape {tuple(coords.shape)} does not match "
-        f"(M={M}, B+Ds={batch_dims + D_spatial})"
+    assert sparse_dim <= len(shape), (
+        f"sparse_to_dense: coords.shape[1]={sparse_dim} exceeds len(shape)={len(shape)}"
     )
-    assert shape[batch_dims] == C, (
-        f"sparse_to_dense: shape[{batch_dims}]={shape[batch_dims]} != C={C}"
+    dense_shape = tuple(shape[sparse_dim:])
+    assert tuple(feats.shape[1:]) == dense_shape, (
+        f"sparse_to_dense: feats.shape[1:]={tuple(feats.shape[1:])} "
+        f"does not match dense suffix of shape={dense_shape}"
     )
 
-    # Move the channel axis to the trailing position so per-row advanced
-    # indexing with the (B+Ds) coord columns broadcasts the C-vector
-    # in a single assignment.
-    perm = list(range(batch_dims)) + list(range(batch_dims + 1, D_total)) + [batch_dims]
-    inv_perm = [0] * D_total
-    for i, p in enumerate(perm):
-        inv_perm[p] = i
-    shape_clast = tuple(shape[p] for p in perm)
-    dense_clast = feats.new_zeros(shape_clast)
-    indexers = tuple(coords[:, d] for d in range(coords.shape[1]))
-    dense_clast[indexers] = feats
-    return dense_clast.permute(inv_perm).contiguous()
+    dense = feats.new_zeros(shape)
+    indexers = tuple(coords[:, d] for d in range(sparse_dim))
+    dense[indexers] = feats
+    return dense
+
+
+def sort_coords(coords: Tensor, num_keys: int | None = None) -> Tensor:
+    """Return a permutation that sorts the rows of ``coords`` column-major.
+
+    Column-major order: the first column is the most-significant key, the
+    last column is the least-significant. Implemented as a chain of stable
+    ``torch.argsort`` passes from the least-significant key up, so rows
+    that tie on the sort keys keep their original relative order.
+
+    Args:
+        coords: ``(M, K)`` integer coordinate matrix.
+        num_keys: optional number of leading columns to sort by. ``None``
+            (default) uses all ``K`` columns; values ``< K`` sort by only
+            the first ``num_keys`` columns and leave ties in input order.
+
+    Returns:
+        perm: ``(M)`` int64 permutation, suitable for ``coords[perm]`` / ``feats[perm]``. 
+            Empty input produces an empty permutation.
+    """
+    assert coords.ndim == 2, f"sort_coords: expected 2-D coords, got {coords.shape!r}"
+    M, K = coords.shape
+    if num_keys is None:
+        num_keys = K
+    assert 0 <= num_keys <= K, f"num_keys={num_keys} out of [0, {K}]"
+    perm = torch.arange(M, device=coords.device)
+    for j in reversed(range(num_keys)):
+        order = torch.argsort(coords[perm, j], stable=True)
+        perm = perm[order]
+    return perm
+
+
+def coalesce_coords(
+    feats: Tensor,
+    coords: Tensor,
+    reduce: Literal["sum", "mean", "amax", "amin", "prod"] = "sum",
+    sort: bool = False,
+) -> tuple[Tensor, Tensor]:
+    """Merge duplicate-coord rows by reducing their features.
+
+    Groups rows of ``feats`` whose ``coords`` rows are identical and
+    reduces each group into a single output row.
+
+    Args:
+        feats: ``(M, *dense_shape)`` features.
+        coords: ``(M, K)`` integer coordinates (any int dtype; not cast).
+        reduce: one of ``"sum"`` / ``"mean"`` / ``"amax"`` / ``"amin"`` /
+            ``"prod"`` — forwarded to :meth:`Tensor.scatter_reduce_` with
+            ``include_self=False``. ``"sum"`` (default) is the only choice
+            that makes the op the left-inverse of duplicating rows.
+        sort: when ``True``, dedup with :func:`torch.unique` (O(M log M),
+            deterministic column-major sorted ``coords_out``). When
+            ``False`` (default), dedup with the Triton ``hashmap_unique``
+            kernel (O(M) amortized, **non-deterministic** row order due to
+            hashmap race conditions). Compose with :func:`sort_coords`
+            after the fact if a canonical order is needed only sometimes.
+
+    Returns:
+        ``(feats_out, coords_out)`` with ``coords_out.shape[0] == U`` (the
+        number of unique coord rows) and
+        ``feats_out.shape == (U, *dense_shape)``.
+
+    Notes:
+        Differentiable w.r.t. ``feats`` for all supported reductions
+        (PyTorch's ``scatter_reduce`` backward).
+    """
+    assert feats.shape[0] == coords.shape[0], (
+        f"coalesce_coords: row-count mismatch ({feats.shape[0]} vs {coords.shape[0]})"
+    )
+    assert coords.ndim == 2, f"coalesce_coords: expected 2-D coords, got {coords.shape!r}"
+    allowed = ("sum", "mean", "amax", "amin", "prod")
+    assert reduce in allowed, f"coalesce_coords: reduce={reduce!r} not in {allowed}"
+
+    if sort:
+        uniq, inverse = torch.unique(coords, dim=0, return_inverse=True)
+    else:
+        from ..kernels.triton.hashmap import hashmap_unique
+        uniq, inverse = hashmap_unique(coords, return_inverse=True)
+    U = uniq.shape[0]
+    # ``scatter_reduce_`` requires int64 index broadcast to feats' shape.
+    idx = inverse.to(torch.int64).view(-1, *([1] * (feats.ndim - 1))).expand_as(feats)
+    out = feats.new_zeros((U, *feats.shape[1:]))
+    out.scatter_reduce_(0, idx, feats, reduce=reduce, include_self=False)
+    return out, uniq
 
 
 def lookup_pytorch(key: Tensor, query: Tensor) -> Tensor:

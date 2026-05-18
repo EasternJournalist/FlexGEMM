@@ -3,7 +3,7 @@ from torch import Tensor
 from typing import *
 
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
-from ..utils import _broadcast_dim_arg
+from ..utils import _broadcast_dim_arg, split_sparse_shape
 from .functions import _select_function
 
 
@@ -41,8 +41,9 @@ def submanifold_conv(
     Args:
         feats (Tensor): [N, Ci] input features.
         coords (Tensor): [N, B + Ds] input coordinates.
-        shape (Optional[torch.Size]): input dense shape in NCWHD order; only
-            consulted by the CUDA extension's hashmap path.
+        shape (Optional[torch.Size]): input dense shape in channel-last layout
+            ``(*batch_dims, S1, ..., SDs, C)``; only consulted by the CUDA
+            extension's hashmap path (which uses the sparse prefix only).
         weight (Tensor): [Co, K1, ..., KDs, Ci] convolution weights.
         bias (Optional[Tensor]): [Co] bias.
         dilation: tuple of length Ds. Defaults to all-1.
@@ -106,6 +107,8 @@ def submanifold_conv(
     algorithm: _Algo = None,
 ) -> tuple[Tensor, NeighborCache]:
     """Dispatch on (kernel parameterization). See the two overloads above."""
+    # Channel-last: cache only stores the sparse prefix of ``shape``.
+    sparse_in_shape = split_sparse_shape(shape, coords.shape[1])
     if kernel_delta is None:
         # kernel_size mode: weight is [Co, K1, ..., KDs, Ci]; infer kernel_size.
         kernel_size = tuple(weight.shape[1:-1])
@@ -118,7 +121,7 @@ def submanifold_conv(
             neighbor_cache = build_neighbor_cache(
                 coords,
                 submanifold=True,
-                input_shape=shape,
+                input_sparse_shape=sparse_in_shape,
                 kernel_size=kernel_size,
                 dilation=dilation,
             )

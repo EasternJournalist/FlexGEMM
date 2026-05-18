@@ -136,7 +136,8 @@ def test_build_neighbor_map_from_kernel_size_dilation_matches_reference(
             [torch.zeros(coords.shape[0], 1, dtype=torch.int32, device=device), coords],
             dim=1,
         ).contiguous()
-        shape = (1, 1, W, H, D)
+        # Channel-last sparse_shape: (N=1, W, H, D), no C axis.
+        shape = (1, W, H, D)
         hk, hv = init_hashmap(shape, max(int(2.0 * coords4.shape[0]), 16), device)
         cuda_nm = _kernels.cuda.hashmap_build_submanifold_conv_neighbour_map(
             hk, hv, coords4, W, H, D, *kernel_size, *dilation,
@@ -289,7 +290,8 @@ def test_neighbor_map_triton_sparse_speed_benchmark(method: str, dtype: torch.dt
         Kw, Kh, Kd = kernel_size[1:]
         Dw, Dh, Dd = dilation[1:]
         W = H = D = int(coords4[:, 1:].max().item()) + 1
-        shape = (1, 1, W, H, D)
+        # Channel-last sparse_shape: (N=1, W, H, D), no C axis.
+        shape = (1, W, H, D)
         hk, hv = init_hashmap(shape, int(2.0 * n_coords), device)
         cuda_ms = _time_cuda_ms(
             lambda: _kernels.cuda.hashmap_build_submanifold_conv_neighbour_map(

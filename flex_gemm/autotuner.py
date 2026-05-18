@@ -399,23 +399,41 @@ _AUTOTUNE_REGISTRY = {}
 _PENDING_AUTOTUNE_CACHE = None
 
 
+def _unwrap_to_user_fn(fn):
+    """Walk wrapper attributes (Heuristics.fn, JITFunction.fn, etc.) until we
+    reach the innermost user-defined function. Returns the original ``fn`` if
+    no wrapping is detected."""
+    seen = set()
+    current = fn
+    while True:
+        # Stop once we've reached a plain Python function defined in user code
+        # (i.e. not living under triton.* or functools.*).
+        mod = getattr(current, "__module__", None)
+        if mod and not mod.startswith("triton.") and mod != "triton":
+            return current
+        inner = None
+        for attr in ("fn", "f", "kernel", "_fn"):
+            cand = getattr(current, attr, None)
+            if cand is not None and id(cand) not in seen:
+                inner = cand
+                break
+        if inner is None:
+            return current
+        seen.add(id(current))
+        current = inner
+
+
 def _get_callable_name(fn):
+    fn = _unwrap_to_user_fn(fn)
     for attr in ("__name__", "__qualname__"):
         name = getattr(fn, attr, None)
         if name:
             return name
-    for inner_attr in ("fn", "f", "kernel", "_fn"):
-        inner = getattr(fn, inner_attr, None)
-        if inner is None:
-            continue
-        for attr in ("__name__", "__qualname__"):
-            name = getattr(inner, attr, None)
-            if name:
-                return name
     return fn.__class__.__name__
 
 
 def _get_function_cache_key(fn):
+    fn = _unwrap_to_user_fn(fn)
     module = getattr(fn, "__module__", None) or getattr(fn.__class__, "__module__", "unknown")
     name = _get_callable_name(fn)
     return f"{module}.{name}"

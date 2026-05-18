@@ -5,7 +5,7 @@ from torch import Tensor
 
 from ..index_select_add import index_select_add
 from ..neighbor_cache import NeighborCacheT, build_neighbor_cache
-from ..utils import _broadcast_dim_arg
+from ..utils import _broadcast_dim_arg, split_sparse_shape
 from .grid_sample import _sparse_grid_sample_linear
 
 
@@ -32,7 +32,7 @@ def sparse_upsample(
 ) -> tuple[Tensor, Tensor, torch.Size, NeighborCacheT]: ...
 
 
-# --- bilinear: padding_mode is meaningful ------------------------------------
+# --- bilinear: padding_mode + align_corners are meaningful -------------------
 @overload
 def sparse_upsample(
     feats: Tensor,
@@ -42,6 +42,7 @@ def sparse_upsample(
     *,
     mode: Literal["bilinear"],
     padding_mode: Literal["zeros", "normalize"] = ...,
+    align_corners: bool = ...,
     output_coords: Tensor | None = ...,
     output_shape: torch.Size | None = ...,
     neighbor_cache: NeighborCacheT | None = ...,
@@ -56,6 +57,7 @@ def sparse_upsample(
     *,
     mode: Literal["nearest", "bilinear"] = "nearest",
     padding_mode: Literal["zeros", "normalize"] = "normalize",
+    align_corners: bool = False,
     output_coords: Tensor | None = None,
     output_shape: torch.Size | None = None,
     neighbor_cache: NeighborCacheT | None = None,
@@ -79,17 +81,31 @@ def sparse_upsample(
       conv-transpose cache.
 
     Args:
-        feats: ``[M, C]`` low-resolution features.
-        coords: ``[M, B + Ds]`` low-resolution integer coordinates (contiguous).
-        shape: low-resolution dense shape ``(*batch_dims, C, S1, ..., SDs)``.
+        feats: ``(M, C)`` low-resolution features.
+        coords: ``(M, B + Ds)`` low-resolution integer coordinates (contiguous).
+        shape: low-resolution dense shape
+            ``(*batch_dims, S1, ..., SDs, C)`` — channel-last convention.
         scale_factor: per-spatial-dim upscale factor. Must be a tuple aligned
             with the spatial dims (``len(scale_factor) == Ds``).
         mode: ``"nearest"`` or ``"bilinear"`` (multilinear) interpolation.
         padding_mode: ``"zeros"`` / ``"normalize"`` — only consulted in
             ``"bilinear"`` mode (see :func:`sparse_grid_sample`).
+        align_corners: only meaningful in ``"bilinear"`` mode. Mirrors the
+            convention of :func:`torch.nn.functional.interpolate` (in the
+            input's voxel-center coordinate space, where voxel ``i`` is
+            centered at integer location ``i``):
+
+            * ``False`` (default) — output voxel ``j`` maps to input coord
+              ``x = (j + 0.5) / s - 0.5``. Shape-independent; for ``s=1``
+              this is the identity ``x = j``.
+            * ``True`` — output voxel ``j`` maps to ``x = j * (W - 1) / (s*W - 1)``
+              per spatial dim, where ``W`` is the low-res spatial extent.
+              Requires ``s*W > 1`` for the transform to be well-defined.
+
+            Must be ``False`` for ``mode='nearest'``.
         output_coords: optional precomputed high-res coordinates.
-        output_shape: optional high-res dense shape; derived from ``shape *
-            scale_factor`` along the spatial dims when ``None``.
+        output_shape: optional high-res full channel-last shape (sparse_shape + dense C); 
+            Used to trim customized out-of-bound ``output_coords``.
         neighbor_cache: optional precomputed :class:`NeighborCacheT`.
 
     Returns:
@@ -109,6 +125,8 @@ def sparse_upsample(
         raise ValueError(f"Unsupported mode: {mode!r}")
     if padding_mode not in ("zeros", "normalize"):
         raise ValueError(f"Unsupported padding_mode: {padding_mode!r}")
+    if mode == "nearest" and align_corners:
+        raise ValueError("align_corners=True is only valid for mode='bilinear'.")
 
     # ------------------------------------------------------------------
     # Build / verify neighbor_cache purely to obtain ``output_coords``.
@@ -122,28 +140,27 @@ def sparse_upsample(
         # span exactly ``c_in*r + {0, .., r-1}`` and tile the high-res
         # grid without gaps. Omitting it leaves offset=0, which clips
         # the low / high boundary coords.
+        sparse_dim = coords.shape[1]
+        sparse_in_shape  = split_sparse_shape(shape,        sparse_dim)
+        sparse_out_shape = split_sparse_shape(output_shape, sparse_dim)
         neighbor_cache = build_neighbor_cache(
             coords, output_coords,
             submanifold=False,
             kernel_size=scale_factor,
             stride=scale_factor,
             padding=(0,) * D_spatial,
-            input_shape=shape,
-            output_shape=output_shape,
+            input_sparse_shape=sparse_in_shape,
+            output_sparse_shape=sparse_out_shape,
             transpose=True,
         )
-        output_coords = neighbor_cache.output_coords
-        output_shape = neighbor_cache.output_shape
     else:
         neighbor_cache.assert_match(
             input_coords=coords,
             output_coords=output_coords,
             is_transposed=True,
         )
-        if output_coords is None:
-            output_coords = neighbor_cache.output_coords
-        if output_shape is None:
-            output_shape = neighbor_cache.output_shape
+    output_coords = neighbor_cache.output_coords
+    sparse_out_shape = neighbor_cache.output_sparse_shape
 
     # ------------------------------------------------------------------
     # Interpolate.
@@ -158,6 +175,7 @@ def sparse_upsample(
     # cache is insufficient and we fall back to a fresh hashmap-backed
     # linear lookup.
     # ------------------------------------------------------------------
+    device = output_coords.device
     if mode == "nearest":
         output_feats = index_select_add(
             feats,
@@ -165,11 +183,36 @@ def sparse_upsample(
             neighbor_cache.edge_out,
             neighbor_cache.num_output_coords,
         )
-    else:
+    else:   # mode == "bilinear":
+        # Bake the geometric transform into a float grid in low-res coord
+        # space as a single fused addcmul over the full coord dim:
+        #     grid = output_coords.float() * grid_mul + grid_add
+        # Batch lanes use scale=1, offset=0 (pass-through); 
+        # spatial lanes encode the chosen align_corners formula.
+        sparse_dim = coords.shape[1]
+        B = sparse_dim - D_spatial
+        spatial_in = sparse_in_shape[-D_spatial:]
+        if align_corners:
+            # x_d = j_d * (W_d - 1) / (s_d*W_d - 1) per spatial dim.
+            assert all(s * w > 1 for w, s in zip(spatial_in, scale_factor)), \
+                "align_corners=True requires s*W > 1 per spatial dim."
+            grid_mul = [1.0] * B + [(w - 1) / (s * w - 1) for w, s in zip(spatial_in, scale_factor)]
+            grid = output_coords.to(torch.float32) * torch.tensor(grid_mul, dtype=torch.float32, device=device)
+        else:
+            # x_d = (j_d + 0.5) / s_d - 0.5 
+            grid_mul = [1.0] * B + [1.0 / s for s in scale_factor]
+            grid_add = [0.0] * B + [0.5 / s - 0.5 for s in scale_factor]
+            grid = torch.addcmul(
+                torch.tensor(grid_add, dtype=torch.float32, device=device), 
+                torch.tensor(grid_mul, dtype=torch.float32, device=device),
+                output_coords.to(torch.float32), 
+            )
         output_feats = _sparse_grid_sample_linear(
-            feats, coords, output_coords,
-            scale_factor=scale_factor, padding_mode=padding_mode, return_mask=False,
+            feats, coords, grid,
+            n_spatial_dims=D_spatial, padding_mode=padding_mode, return_mask=False,
         )
+
+    output_shape = torch.Size([*sparse_out_shape, *output_feats.shape[1:]])
 
     return output_feats, output_coords, output_shape, neighbor_cache
 
@@ -189,12 +232,13 @@ def sparse_upsample(
 
 def _sparse_upsample_nd(
     D, feats, coords, shape, scale_factor,
-    mode, padding_mode, output_coords, output_shape, neighbor_cache,
+    mode, padding_mode, align_corners,
+    output_coords, output_shape, neighbor_cache,
 ):
     scale_factor = _broadcast_dim_arg(scale_factor, D, "scale_factor")
     return sparse_upsample(
         feats, coords, shape, scale_factor,
-        mode=mode, padding_mode=padding_mode,
+        mode=mode, padding_mode=padding_mode, align_corners=align_corners,
         output_coords=output_coords, output_shape=output_shape,
         neighbor_cache=neighbor_cache,
     )
@@ -229,6 +273,7 @@ def sparse_upsample2d(
     *,
     mode: Literal["bilinear"],
     padding_mode: Literal["zeros", "normalize"] = ...,
+    align_corners: bool = ...,
     output_coords: Tensor | None = ...,
     output_shape: torch.Size | None = ...,
     neighbor_cache: NeighborCacheT | None = ...,
@@ -241,12 +286,13 @@ def sparse_upsample2d(
     ...
 def sparse_upsample2d(
     feats, coords, shape, scale_factor, *,
-    mode="nearest", padding_mode="normalize",
+    mode="nearest", padding_mode="normalize", align_corners=False,
     output_coords=None, output_shape=None, neighbor_cache=None,
 ):
     return _sparse_upsample_nd(
         2, feats, coords, shape, scale_factor,
-        mode, padding_mode, output_coords, output_shape, neighbor_cache,
+        mode, padding_mode, align_corners,
+        output_coords, output_shape, neighbor_cache,
     )
 
 
@@ -279,6 +325,7 @@ def sparse_upsample3d(
     *,
     mode: Literal["bilinear"],
     padding_mode: Literal["zeros", "normalize"] = ...,
+    align_corners: bool = ...,
     output_coords: Tensor | None = ...,
     output_shape: torch.Size | None = ...,
     neighbor_cache: NeighborCacheT | None = ...,
@@ -291,12 +338,13 @@ def sparse_upsample3d(
     ...
 def sparse_upsample3d(
     feats, coords, shape, scale_factor, *,
-    mode="nearest", padding_mode="normalize",
+    mode="nearest", padding_mode="normalize", align_corners=False,
     output_coords=None, output_shape=None, neighbor_cache=None,
 ):
     return _sparse_upsample_nd(
         3, feats, coords, shape, scale_factor,
-        mode, padding_mode, output_coords, output_shape, neighbor_cache,
+        mode, padding_mode, align_corners,
+        output_coords, output_shape, neighbor_cache,
     )
 
 
@@ -328,6 +376,7 @@ def sparse_upsample4d(
     *,
     mode: Literal["bilinear"],
     padding_mode: Literal["zeros", "normalize"] = ...,
+    align_corners: bool = ...,
     output_coords: Tensor | None = ...,
     output_shape: torch.Size | None = ...,
     neighbor_cache: NeighborCacheT | None = ...,
@@ -340,12 +389,13 @@ def sparse_upsample4d(
     ...
 def sparse_upsample4d(
     feats, coords, shape, scale_factor, *,
-    mode="nearest", padding_mode="normalize",
+    mode="nearest", padding_mode="normalize", align_corners=False,
     output_coords=None, output_shape=None, neighbor_cache=None,
 ):
     return _sparse_upsample_nd(
         4, feats, coords, shape, scale_factor,
-        mode, padding_mode, output_coords, output_shape, neighbor_cache,
+        mode, padding_mode, align_corners,
+        output_coords, output_shape, neighbor_cache,
     )
 
 

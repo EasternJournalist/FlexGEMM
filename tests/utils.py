@@ -22,7 +22,9 @@ def sphere_coords(res, ch, batch_size=1, device='cuda', dtype=torch.float):
     batch_idx = torch.arange(batch_size).repeat_interleave(coords.shape[0]).to(device).int()
     coords = torch.cat([batch_idx.unsqueeze(-1), torch.cat([coords] * batch_size)], dim=-1)
     feats = torch.randn(coords.shape[0], ch, device=device, dtype=dtype)
-    return feats.contiguous(), coords.contiguous(), torch.Size([batch_size, ch, res, res, res])
+    # Channel-last convention: shape is (*sparse_shape, C); sparse_shape
+    # aligns with coord columns (batch, x, y, z).
+    return feats.contiguous(), coords.contiguous(), torch.Size([batch_size, res, res, res, ch])
 
 
 def calc_err(src, ref):

@@ -6,7 +6,7 @@ from torch import Tensor
 from ... import kernels
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
 from ..index_segment_reduce import index_segment_reduce
-from ..utils import _broadcast_dim_arg
+from ..utils import _broadcast_dim_arg, split_sparse_shape
 
 
 __all__ = [
@@ -41,7 +41,8 @@ def sparse_pool(
     Args:
         feats (Tensor): [M, C] input features.
         input_coords (Tensor): [M, B + Ds] input coordinates.
-        shape (torch.Size): input dense shape ``(N, C, S1, ..., SDs)``.
+        shape (torch.Size): input dense shape
+            ``(*batch_dims, S1, ..., SDs, C)`` — channel-last convention.
         kernel_size: tuple of length Ds.
         stride / padding: tuple of length Ds, or ``None``. Defaults:
             ``stride = kernel_size``, ``padding = (0,) * Ds`` (non-overlapping pool).
@@ -83,17 +84,22 @@ def sparse_pool(
     )
 
     if neighbor_cache is None:
+        # Cache lives in sparse-shape land; op truncates the channel-last
+        # ``shape`` / ``output_shape`` before delegating.
+        sparse_dim = input_coords.shape[1]
+        sparse_in_shape  = split_sparse_shape(shape,        sparse_dim)
+        sparse_out_shape = split_sparse_shape(output_shape, sparse_dim)
         neighbor_cache = build_neighbor_cache(
             input_coords, output_coords,
             submanifold=False,
             kernel_size=kernel_size,
             stride=stride,
             padding=padding,
-            input_shape=shape,
-            output_shape=output_shape,
+            input_sparse_shape=sparse_in_shape,
+            output_sparse_shape=sparse_out_shape,
         )
         output_coords = neighbor_cache.output_coords
-        output_shape = neighbor_cache.output_shape
+        sparse_out_shape = neighbor_cache.output_sparse_shape
     else:
         assert output_coords is not None, (
             "When passing a precomputed neighbor_cache, output_coords must also be provided."
@@ -102,6 +108,7 @@ def sparse_pool(
             input_coords=input_coords,
             output_coords=output_coords,
         )
+        sparse_out_shape = neighbor_cache.output_sparse_shape
 
     output_feats = index_segment_reduce(
         feats,
@@ -109,6 +116,8 @@ def sparse_pool(
         neighbor_cache.fwd_seg_offsets,
         reduce,
     )
+    # Reassemble full channel-last output shape from sparse prefix + C.
+    output_shape = torch.Size([*sparse_out_shape, *output_feats.shape[1:]])
     return output_feats, output_coords, output_shape, neighbor_cache
 
 
