@@ -38,7 +38,6 @@ from .. import config
 from .. import kernels
 from ..kernels.triton.utils import _lengths_to_offsets
 from .utils import make_conv_kernel_delta, init_hashmap, lookup_pytorch
-from . import spconv
 
 __all__ = [
     "NeighborCache",
@@ -1186,7 +1185,7 @@ def _build_submanifold_neighbor_map_kernel_size(
     elif use_cuda_extension:
         N, W, H, D = shape
         hashmap_keys, hashmap_vals = init_hashmap(
-            shape, int(spconv.HASHMAP_RATIO * input_coords.shape[0]), input_coords.device,
+            shape, int(config.CUDA_HASHMAP_RATIO * input_coords.shape[0]), input_coords.device,
         )
         neighbor_map = kernels.cuda.hashmap_build_submanifold_conv_neighbour_map_cuda(
             hashmap_keys, hashmap_vals, input_coords,
@@ -1450,18 +1449,21 @@ def _build_strided_neighbor_map_kernel_size_cuda(
     Returns ``(fwd_map, bwd_map_or_None, output_coords)``.
     """
     N, W, H, Dd = shape
-    if spconv.OUT_COORD_ALGO == 0:  # HASHMAP
+    # Map string literals → the int codes the CUDA kernels expect.
+    _SERIALIZATION_MODE_INT = {"bxyz": 0, "z_order": 1, "hilbert": 2}
+    serialization_mode = _SERIALIZATION_MODE_INT[config.CUDA_SERIALIZATION_MODE]
+    if config.CUDA_OUT_COORD_ALGO == "hashmap":
         output_coords = kernels.cuda.hashmap_build_sparse_conv_out_coords(
-            input_coords, spconv.OUT_COORD_HASHMAP_RATIO, spconv.SERIALIZATION_MODE,
+            input_coords, config.CUDA_OUT_COORD_HASHMAP_RATIO, serialization_mode,
             N, W, H, Dd,
             kernel_size[0], kernel_size[1], kernel_size[2],
             stride[0], stride[1], stride[2],
             padding[0], padding[1], padding[2],
             dilation[0], dilation[1], dilation[2],
         )
-    else:  # EXPAND_UNIQUE
+    else:  # "expand_unique"
         output_coords = kernels.cuda.expand_unique_build_sparse_conv_out_coords(
-            input_coords, spconv.SERIALIZATION_MODE,
+            input_coords, serialization_mode,
             N, W, H, Dd,
             kernel_size[0], kernel_size[1], kernel_size[2],
             stride[0], stride[1], stride[2],
@@ -1469,7 +1471,7 @@ def _build_strided_neighbor_map_kernel_size_cuda(
             dilation[0], dilation[1], dilation[2],
         )
     fwd_nm, bwd_nm = kernels.cuda.hashmap_build_sparse_conv_neighbour_map(
-        input_coords, output_coords, spconv.HASHMAP_RATIO, need_bwd,
+        input_coords, output_coords, config.CUDA_HASHMAP_RATIO, need_bwd,
         N, W, H, Dd,
         kernel_size[0], kernel_size[1], kernel_size[2],
         stride[0], stride[1], stride[2],

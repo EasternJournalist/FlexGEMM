@@ -40,7 +40,7 @@ def submanifold_pool(
 
     Args:
         feats (Tensor): [N, C] input features.
-        input_coords (Tensor): [N, B + Ds] coordinates.
+        input_coords (Tensor): ``(N, B + Ds)`` coordinates.
         kernel_size: tuple of length Ds.
         reduce: one of ``sum`` / ``mean`` / ``max`` / ``min`` / ``prod``.
         neighbor_cache (Optional[NeighborCache]): if provided, its

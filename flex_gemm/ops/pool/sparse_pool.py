@@ -40,7 +40,7 @@ def sparse_pool(
 
     Args:
         feats (Tensor): [M, C] input features.
-        input_coords (Tensor): [M, B + Ds] input coordinates.
+        input_coords (Tensor): ``(M, B + Ds)`` input coordinates.
         shape (torch.Size): input dense shape
             ``(*batch_dims, S1, ..., SDs, C)`` — channel-last convention.
         kernel_size: tuple of length Ds.

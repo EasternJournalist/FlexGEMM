@@ -50,10 +50,10 @@ def sparse_conv_transpose(
 
     Args:
         feats (Tensor): ``(M, Ci)`` small-side (input) features.
-        coords (Tensor): [M, B + Ds] small-side coordinates.
+        coords (Tensor): ``(M, B + Ds)`` small-side coordinates.
         shape (torch.Size): small-side dense shape
             ``(*batch_dims, S1, ..., SDs, C)`` — channel-last convention.
-        weight (Tensor): [Co, K1, ..., KDs, Ci] convolution-transpose weights.
+        weight (Tensor): ``(Co, K1, ..., KDs, Ci)`` convolution-transpose weights.
         bias (Optional[Tensor]): [Co] bias.
         stride / dilation / padding: tuples of length Ds. Default all-1 / all-1 / all-0.
         output_coords: optional large-side coordinates. Built by the fused
@@ -94,11 +94,11 @@ def sparse_conv_transpose(
 
     Args:
         feats (Tensor): ``(M, Ci)`` small-side features.
-        coords (Tensor): [M, B + Ds] small-side coordinates.
+        coords (Tensor): ``(M, B + Ds)`` small-side coordinates.
         shape (torch.Size): small-side dense shape.
-        weight (Tensor): [Co, V, Ci] convolution-transpose weights.
+        weight (Tensor): ``(Co, V, Ci)`` convolution-transpose weights.
         bias (Optional[Tensor]): [Co] bias.
-        kernel_delta (Tensor): [V, Ds] kernel offsets.
+        kernel_delta (Tensor): ``(V, Ds)`` kernel offsets.
         stride / offset: tuples of length Ds. Default all-1 / all-0.
         output_coords: optional large-side coordinates. Built by the fused
             output-coords path when ``None``.
@@ -158,7 +158,7 @@ def sparse_conv_transpose(
             sparse_in_shape = neighbor_cache.input_sparse_shape
 
     if kernel_delta is None:
-        # kernel_size mode: weight is [Co, K1, ..., KDs, Ci]; infer kernel_size.
+        # kernel_size mode: weight is ``(Co, K1, ..., KDs, Ci)``; infer kernel_size.
         kernel_size = tuple(weight.shape[1:-1])
         D_spatial = len(kernel_size)
         stride   = tuple(stride)   if stride   is not None else (1,) * D_spatial
@@ -190,7 +190,7 @@ def sparse_conv_transpose(
             )
         weight_v = weight.flatten(1, -2)
     else:
-        # kernel_delta mode: weight is [Co, V, Ci]; used as-is.
+        # kernel_delta mode: weight is ``(Co, V, Ci)``; used as-is.
         assert dilation is None and padding is None, (
             "dilation / padding are only valid in kernel_size mode."
         )

@@ -42,6 +42,12 @@ from .pixel_shuffle import (
     SparsePixelShuffle3d,
     SparsePixelShuffle4d,
 )
+from .pixel_unshuffle import (
+    SparsePixelUnshuffle,
+    SparsePixelUnshuffle2d,
+    SparsePixelUnshuffle3d,
+    SparsePixelUnshuffle4d,
+)
 
 
 __all__ = [
@@ -73,4 +79,8 @@ __all__ = [
     "SparsePixelShuffle2d",
     "SparsePixelShuffle3d",
     "SparsePixelShuffle4d",
+    "SparsePixelUnshuffle",
+    "SparsePixelUnshuffle2d",
+    "SparsePixelUnshuffle3d",
+    "SparsePixelUnshuffle4d",
 ]

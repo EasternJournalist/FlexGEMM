@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from ....autotuner import triton_autotune
 from . import config
+from .... import config as _global_config
 from .sparse_conv_implicit_gemm import sparse_conv_implicit_gemm_kernel
 
 
@@ -48,9 +49,9 @@ def sparse_conv_masked_implicit_gemm_kernel(
         weight (pointer): A pointer to the weight tensor of shape (Co, V, Ci)
         bias (pointer): A pointer to the bias tensor of shape (Co)
         neighbor (pointer): A pointer to the neighbor tensor of shape (M, V)
-        sorted_idx (pointer): A pointer to the sorted index tensor of shape (M)
-        valid_kernel (pointer): A pointer to the valid neighbor index tensor of shape (L)
-        valid_kernel_seg (pointer): A pointer to the valid neighbor index segment tensor of shape (BLOCK_M + 1)
+        sorted_idx (pointer): A pointer to the sorted index tensor of shape (M,)
+        valid_kernel (pointer): A pointer to the valid neighbor index tensor of shape (L,)
+        valid_kernel_seg (pointer): A pointer to the valid neighbor index segment tensor of shape (BLOCK_M + 1,)
         output (pointer): A pointer to the output tensor of shape (M, Co)
     """
     block_id = tl.program_id(axis=0)
@@ -125,7 +126,7 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_kernel(
     # Meta-parameters
     B1: tl.constexpr,   # Block size for Co dimension
     B2: tl.constexpr,   # Block size for Ci dimension
-    BK: tl.constexpr,   # Block size for K dimension (M)
+    BK: tl.constexpr,   # Block size for K dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
 ):
     """
@@ -134,8 +135,8 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_kernel(
     Args:
         grad_output (pointer): A pointer to the gradient of the output tensor of shape (M, Co)
         input (pointer): A pointer to the input tensor of shape (N, Ci)
-        valid_signal_i (pointer): A pointer to the valid input signal tensor of shape (L)
-        valid_signal_o (pointer): A pointer to the valid output signal tensor of shape (L)
+        valid_signal_i (pointer): A pointer to the valid input signal tensor of shape (L,)
+        valid_signal_o (pointer): A pointer to the valid output signal tensor of shape (L,)
         valid_signal_seg (pointer): A pointer to the valid signal index segment tensor of shape (V + 1)
         grad_weight (pointer): A pointer to the gradient of the weight tensor of shape (Co, V, Ci)
     """
@@ -212,7 +213,7 @@ def sparse_conv_fwd_masked_implicit_gemm(
         M, LOGN, LOGM, Ci, Co, V,
         valid_kernel=fwd_valid_kernel,
         valid_kernel_seg=fwd_valid_kernel_seg,
-        allow_tf32=config.allow_tf32,
+        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
     )
     return output
 
@@ -267,7 +268,7 @@ def sparse_conv_bwd_input_masked_implicit_gemm(
         sparse_conv_implicit_gemm_kernel[grid](
             grad_output, weight, None, neighbor_map, grad_input,
             N, int(math.log2(M)), int(math.log2(N)), Co, Ci, V,
-            allow_tf32=config.allow_tf32,
+            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
             TRANSPOSE_WEIGHT=True,
             FLIP_WEIGHT=symmetric,
         )
@@ -277,7 +278,7 @@ def sparse_conv_bwd_input_masked_implicit_gemm(
             N, int(math.log2(M)), int(math.log2(N)), Co, Ci, V,
             valid_kernel=valid_kernel_cb,
             valid_kernel_seg=valid_kernel_seg_cb,
-            allow_tf32=config.allow_tf32,
+            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
             TRANSPOSE_WEIGHT=True,
             FLIP_WEIGHT=symmetric,
         )
@@ -308,6 +309,6 @@ def sparse_conv_bwd_weight_masked_implicit_gemm(
         fwd_valid_signal_seg,
         grad_weight,
         M, LOGN, LOGM, Ci, Co, V,
-        allow_tf32=config.allow_tf32,
+        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
     )
     return grad_weight

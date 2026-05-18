@@ -166,13 +166,13 @@ def sort_coords(coords: Tensor, num_keys: int | None = None) -> Tensor:
     that tie on the sort keys keep their original relative order.
 
     Args:
-        coords: ``(M, K)`` integer coordinate matrix.
+        coords: ``(N, K)`` integer coordinate matrix.
         num_keys: optional number of leading columns to sort by. ``None``
             (default) uses all ``K`` columns; values ``< K`` sort by only
             the first ``num_keys`` columns and leave ties in input order.
 
     Returns:
-        perm: ``(M)`` int64 permutation, suitable for ``coords[perm]`` / ``feats[perm]``. 
+        perm: ``(N,)`` int64 permutation, suitable for ``coords[perm]`` / ``feats[perm]``. 
             Empty input produces an empty permutation.
     """
     assert coords.ndim == 2, f"sort_coords: expected 2-D coords, got {coords.shape!r}"
@@ -199,16 +199,16 @@ def coalesce_coords(
     reduces each group into a single output row.
 
     Args:
-        feats: ``(M, *dense_shape)`` features.
-        coords: ``(M, K)`` integer coordinates (any int dtype; not cast).
+        feats: ``(N, *dense_shape)`` features.
+        coords: ``(N, K)`` integer coordinates (any int dtype; not cast).
         reduce: one of ``"sum"`` / ``"mean"`` / ``"amax"`` / ``"amin"`` /
             ``"prod"`` — forwarded to :meth:`Tensor.scatter_reduce_` with
             ``include_self=False``. ``"sum"`` (default) is the only choice
             that makes the op the left-inverse of duplicating rows.
-        sort: when ``True``, dedup with :func:`torch.unique` (O(M log M),
+        sort: when ``True``, dedup with :func:`torch.unique` (O(N log N),
             deterministic column-major sorted ``coords_out``). When
             ``False`` (default), dedup with the Triton ``hashmap_unique``
-            kernel (O(M) amortized, **non-deterministic** row order due to
+            kernel (O(N) amortized, **non-deterministic** row order due to
             hashmap race conditions). Compose with :func:`sort_coords`
             after the fact if a canonical order is needed only sometimes.
 
@@ -234,7 +234,7 @@ def coalesce_coords(
         from ..kernels.triton.hashmap import hashmap_unique
         uniq, inverse = hashmap_unique(coords, return_inverse=True)
     U = uniq.shape[0]
-    # ``scatter_reduce_`` requires int64 index broadcast to feats' shape.
+    # ``scatter_reduce_`` requires int64 index for old PyTorch versions; 
     idx = inverse.to(torch.int64).view(-1, *([1] * (feats.ndim - 1))).expand_as(feats)
     out = feats.new_zeros((U, *feats.shape[1:]))
     out.scatter_reduce_(0, idx, feats, reduce=reduce, include_self=False)

@@ -8,8 +8,8 @@ from flex_gemm.ops.spconv import SparseConv3dFunction
 from utils import sphere_coords, benchmark_kernel
 
 
-flex_gemm.ops.spconv.OUT_COORD_ALGO = flex_gemm.ops.spconv.SparseConv3dOutCoordAlgorithm.HASHMAP
-flex_gemm.ops.spconv.SERIALIZATION_MODE = flex_gemm.ops.spconv.SerializationMode.BXYZ
+flex_gemm.config.CUDA_OUT_COORD_ALGO = "hashmap"
+flex_gemm.config.CUDA_SERIALIZATION_MODE = "bxyz"
 
 
 def torch_fn(
@@ -55,9 +55,9 @@ def test_out_coords():
         
         # Benchmark
         avg_time_torch, memory_torch, C_torch = benchmark_kernel(torch_fn, **args)
-        flex_gemm.ops.spconv.OUT_COORD_ALGO = flex_gemm.ops.spconv.SparseConv3dOutCoordAlgorithm.HASHMAP
+        flex_gemm.config.CUDA_OUT_COORD_ALGO = "hashmap"
         avg_time_cuda_hasmap, memory_cuda_hasmap, C_cuda_hasmap = benchmark_kernel(cuda_fn, **args)
-        flex_gemm.ops.spconv.OUT_COORD_ALGO = flex_gemm.ops.spconv.SparseConv3dOutCoordAlgorithm.EXPAND_UNIQUE
+        flex_gemm.config.CUDA_OUT_COORD_ALGO = "expand_unique"
         avg_time_cuda_expand, memory_cuda_expand, C_cuda_expand = benchmark_kernel(cuda_fn, **args)
                 
         # Compare results

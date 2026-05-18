@@ -6,6 +6,7 @@ import triton.language as tl
 from ..utils import get_num_sm
 from ....autotuner import triton_autotune, autotune
 from . import config
+from .... import config as _global_config
 from .sparse_conv_implicit_gemm import (
     sparse_conv_implicit_gemm_kernel,
     sparse_conv_bwd_weight_implicit_gemm_kernel,
@@ -121,7 +122,7 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk_kernel(
     # Meta-parameters
     B1: tl.constexpr,   # Block size for Co dimension
     B2: tl.constexpr,   # Block size for V * Ci dimension
-    BK: tl.constexpr,   # Block size for K dimension (M)
+    BK: tl.constexpr,   # Block size for K dimension (M,)
     BV: tl.constexpr,   # Block size for V dimension
     BCi: tl.constexpr,  # Block size for Ci dimension
     SPLITK: tl.constexpr,  # Split K dimension
@@ -225,7 +226,7 @@ def sparse_conv_fwd_implicit_gemm_splitk(
         sparse_conv_implicit_gemm_kernel[grid](
             input, weight, bias, fwd_neighbor_map, output,
             M, LOGN, LOGM, Ci, Co, V,
-            allow_tf32=config.allow_tf32,
+            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
             FLIP_WEIGHT=FLIP_WEIGHT,
         )
@@ -237,7 +238,7 @@ def sparse_conv_fwd_implicit_gemm_splitk(
             input, weight, bias, fwd_neighbor_map, output,
             M, LOGN, LOGM, Ci, Co, V,
             SPLITK=SPLITK,
-            allow_tf32=config.allow_tf32,
+            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
             FLIP_WEIGHT=FLIP_WEIGHT,
         )
@@ -315,7 +316,7 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk(
         sparse_conv_bwd_weight_implicit_gemm_kernel[grid](
             grad_output, input, fwd_neighbor_map, grad_weight,
             M, LOGN, LOGM, Ci, Co, V,
-            allow_tf32=config.allow_tf32,
+            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
         )
         return grad_weight
     else:
@@ -325,7 +326,7 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk(
             grad_output, input, fwd_neighbor_map, grad_weight,
             M, LOGN, LOGM, Ci, Co, V,
             SPLITK=SPLITK,
-            allow_tf32=config.allow_tf32,
+            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
         )
         return grad_weight.sum(0).to(grad_output.dtype)
     

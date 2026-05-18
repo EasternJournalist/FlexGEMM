@@ -4,7 +4,6 @@ import itertools
 import torch
 from torch import Tensor
 from torch.autograd import Function
-from .. import spconv
 from ... import config
 from ... import kernels
 from ..neighbor_cache import NeighborCache
@@ -359,7 +358,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
 def _select_function(algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] | None = None) -> Type[Function]:
     if algorithm is None:
         # Default to the global config algorithm if not specified.
-        algorithm = spconv.ALGORITHM
+        algorithm = config.DEFAULT_SPCONV_ALGORITHM
         
     if algorithm == "explicit_gemm":
         return SparseConvExplicitGemmFunction

@@ -38,3 +38,40 @@ USE_CUDA_EXTENSION = True
 
 _USE_PYTORCH_FOR_TEST = False
 "Internal debugging flag to indicate whether we are using the pure PyTorch implementation for reference testing. "
+
+
+# ---------------------------------------------------------------------------
+# Sparse-convolution defaults
+# ---------------------------------------------------------------------------
+
+DEFAULT_SPCONV_ALGORITHM: Literal[
+    "explicit_gemm",
+    "implicit_gemm",
+    "implicit_gemm_splitk",
+    "masked_implicit_gemm",
+    "masked_implicit_gemm_splitk",
+] = "masked_implicit_gemm_splitk"
+"""Default index-GEMM algorithm used by sparse-conv ops / nn-layers when the
+caller does not pass an explicit ``algorithm=...``. Prefer specifying
+``algorithm`` on the op or nn-layer directly instead of mutating this global."""
+
+CUDA_HASHMAP_RATIO: float = 2.0
+"""(CUDA-only) Ratio of hashmap capacity to input voxel count when building
+neighbor maps via the CUDA hashmap kernels."""
+
+CUDA_OUT_COORD_HASHMAP_RATIO: float = 1.1
+"""(CUDA-only) Ratio of hashmap capacity to the maximum possible output voxel
+count when generating strided sparse-conv output coordinates via hashmap."""
+
+CUDA_OUT_COORD_ALGO: Literal["hashmap", "expand_unique"] = "hashmap"
+"""(CUDA-only) Algorithm used to generate strided sparse-conv output
+coordinates."""
+
+CUDA_SERIALIZATION_MODE: Literal["bxyz", "z_order", "hilbert"] = "bxyz"
+"""(CUDA-only) Serialization mode used when packing 3-D voxel coordinates
+into a hashmap key."""
+
+SPCONV_ALLOW_TF32: bool = True
+"""Whether the Triton sparse-conv matmul kernels are allowed to use TF32
+input precision (``tl.dot(..., input_precision='tf32')``). Set to ``False``
+to force IEEE single-precision accumulation."""

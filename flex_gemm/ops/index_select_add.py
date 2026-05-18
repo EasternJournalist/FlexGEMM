@@ -8,7 +8,7 @@ from torch.autograd import Function
 class _IndexSelectAddFn(Function):
     """Sparse nearest-neighbour gather.
 
-    Takes the raw ``(M)`` int32 lookup result (``-1`` for misses) and
+    Takes the raw ``(M,)`` int32 lookup result (``-1`` for misses) and
     materialises a zero-padded ``(M, C)`` output. Internally we resolve the
     miss mask to a positions tensor *once*, so the backward avoids the
     repeated boolean mask-selects (``indices[valid]``, ``grad_out[valid]``)

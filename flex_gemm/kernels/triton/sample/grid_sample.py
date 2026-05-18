@@ -253,7 +253,7 @@ def grid_sample_nearest_lookup(
             columns are spatial".
 
     Returns:
-        ``(M)`` int32 tensor of feature indices (``-1`` for unknown voxels).
+        ``(M,)`` int32 tensor of feature indices (``-1`` for unknown voxels).
     """
     assert coords.dim() == 2 and grid.dim() == 2
     D_orig = coords.shape[1]

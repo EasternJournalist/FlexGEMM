@@ -29,11 +29,11 @@ def index_weighted_sum_fwd_kernel(
     Forward pass of the weighted sum of the input features using the indices.
     
     Args:
-        input (pointer): A pointer to the input tensor of shape (N, C)
-        indices (pointer): A pointer to the indices tensor of shape (M, V)
-        weight (pointer): A pointer to the weight tensor of shape (M, V)
-        output (pointer): A pointer to the output tensor of shape (M, C)
-        weight_sum (pointer): A pointer to the per-row [M] fp32 sum of
+        input (pointer): A pointer to the input tensor of shape ``(N, C)``
+        indices (pointer): A pointer to the indices tensor of shape ``(M, V)``
+        weight (pointer): A pointer to the weight tensor of shape ``(M, V)``
+        output (pointer): A pointer to the output tensor of shape ``(M, C)``
+        weight_sum (pointer): A pointer to the per-row ``(M,)`` fp32 sum of
             *present* weights (computed inside the kernel; also used as the
             normalisation denominator when ``NORMALIZE`` is True).
     """
@@ -178,7 +178,7 @@ def index_weighted_sum_fwd(
 
     Returns:
         ``(output, weight_sum)`` — ``output`` is ``(M, C)`` of
-        ``input.dtype``; ``weight_sum`` is ``(M)`` fp32 holding the raw
+        ``input.dtype``; ``weight_sum`` is ``(M,)`` fp32 holding the raw
         per-row sum of present weights (always returned regardless of
         ``normalize``, so callers can use it as an occupancy / mask signal).
     """

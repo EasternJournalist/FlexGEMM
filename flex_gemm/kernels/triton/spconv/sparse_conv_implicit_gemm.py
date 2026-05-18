@@ -5,6 +5,7 @@ import triton
 import triton.language as tl
 from ....autotuner import triton_autotune
 from . import config
+from .... import config as _global_config
 
 
 
@@ -113,7 +114,7 @@ def sparse_conv_bwd_weight_implicit_gemm_kernel(
     # Meta-parameters
     B1: tl.constexpr,   # Block size for Co dimension
     B2: tl.constexpr,   # Block size for V * Ci dimension
-    BK: tl.constexpr,   # Block size for K dimension (M)
+    BK: tl.constexpr,   # Block size for K dimension
     BV: tl.constexpr,   # Block size for V dimension
     BCi: tl.constexpr,  # Block size for Ci dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
@@ -186,7 +187,7 @@ def sparse_conv_fwd_implicit_gemm(
     sparse_conv_implicit_gemm_kernel[grid](
         input, weight, bias, fwd_neighbor_map, output,
         M, LOGN, LOGM, Ci, Co, V,
-        allow_tf32=config.allow_tf32,
+        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
     )
     return output
     
@@ -231,7 +232,7 @@ def sparse_conv_bwd_input_implicit_gemm(
     sparse_conv_implicit_gemm_kernel[grid](
         grad_output, weight, None, neighbor_map, grad_input,
         N, LOGM, LOGN, Co, Ci, V,
-        allow_tf32=config.allow_tf32,
+        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
         TRANSPOSE_WEIGHT=True,
         FLIP_WEIGHT=symmetric,
     )
@@ -261,7 +262,7 @@ def sparse_conv_bwd_weight_implicit_gemm(
     sparse_conv_bwd_weight_implicit_gemm_kernel[grid](
         grad_output, input, fwd_neighbor_map, grad_weight,
         M, LOGN, LOGM, Ci, Co, V,
-        allow_tf32=config.allow_tf32,
+        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
     )
     return grad_weight
 

@@ -67,7 +67,7 @@ def spconv_kernel_fn(module, input):
 
 
 def egemm_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Tensor, ksize, stride, padding, dilation, **kwargs):
-    flex_gemm.ops.spconv.set_algorithm(flex_gemm.ops.spconv.Algorithm.EXPLICIT_GEMM)
+    flex_gemm.config.DEFAULT_SPCONV_ALGORITHM = "explicit_gemm"
     out_coords = SparseConv3dFunction._get_output_coords(coords, shape, ksize, stride, padding, dilation)
     neighbor_cache = SparseConv3dFunction._compute_neighbor_cache(coords, out_coords, shape, ksize, stride, padding, dilation, False)
     return {
@@ -79,7 +79,7 @@ def egemm_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Tens
     
     
 def igemm_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Tensor, ksize, stride, padding, dilation, **kwargs):
-    flex_gemm.ops.spconv.set_algorithm(flex_gemm.ops.spconv.Algorithm.IMPLICIT_GEMM)
+    flex_gemm.config.DEFAULT_SPCONV_ALGORITHM = "implicit_gemm"
     out_coords = SparseConv3dFunction._get_output_coords(coords, shape, ksize, stride, padding, dilation)
     neighbor_cache = SparseConv3dFunction._compute_neighbor_cache(coords, out_coords, shape, ksize, stride, padding, dilation, False)
     return {
@@ -91,7 +91,7 @@ def igemm_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Tens
     
 
 def igemmk_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Tensor, ksize, stride, padding, dilation, **kwargs):
-    flex_gemm.ops.spconv.set_algorithm(flex_gemm.ops.spconv.Algorithm.IMPLICIT_GEMM_SPLITK)
+    flex_gemm.config.DEFAULT_SPCONV_ALGORITHM = "implicit_gemm_splitk"
     out_coords = SparseConv3dFunction._get_output_coords(coords, shape, ksize, stride, padding, dilation)
     neighbor_cache = SparseConv3dFunction._compute_neighbor_cache(coords, out_coords, shape, ksize, stride, padding, dilation, False)
     return {
@@ -103,7 +103,7 @@ def igemmk_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Ten
     
 
 def migemm_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Tensor, ksize, stride, padding, dilation, **kwargs):
-    flex_gemm.ops.spconv.set_algorithm(flex_gemm.ops.spconv.Algorithm.MASKED_IMPLICIT_GEMM)
+    flex_gemm.config.DEFAULT_SPCONV_ALGORITHM = "masked_implicit_gemm"
     out_coords = SparseConv3dFunction._get_output_coords(coords, shape, ksize, stride, padding, dilation)
     neighbor_cache = SparseConv3dFunction._compute_neighbor_cache(coords, out_coords, shape, ksize, stride, padding, dilation, False)
     return {
@@ -115,7 +115,7 @@ def migemm_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Ten
     
 
 def migemmk_prepare_fn(coords: torch.Tensor, shape: torch.Size, weight: torch.Tensor, ksize, stride, padding, dilation, **kwargs):
-    flex_gemm.ops.spconv.set_algorithm(flex_gemm.ops.spconv.Algorithm.MASKED_IMPLICIT_GEMM_SPLITK)
+    flex_gemm.config.DEFAULT_SPCONV_ALGORITHM = "masked_implicit_gemm_splitk"
     out_coords = SparseConv3dFunction._get_output_coords(coords, shape, ksize, stride, padding, dilation)
     neighbor_cache = SparseConv3dFunction._compute_neighbor_cache(coords, out_coords, shape, ksize, stride, padding, dilation, False)
     return {

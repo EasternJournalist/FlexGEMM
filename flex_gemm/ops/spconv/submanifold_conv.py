@@ -39,12 +39,12 @@ def submanifold_conv(
     coincide with input coordinates.
 
     Args:
-        feats (Tensor): [N, Ci] input features.
-        coords (Tensor): [N, B + Ds] input coordinates.
+        feats (Tensor): ``(N, Ci)`` input features.
+        coords (Tensor): ``(N, B + Ds)`` input coordinates.
         shape (Optional[torch.Size]): input dense shape in channel-last layout
             ``(*batch_dims, S1, ..., SDs, C)``; only consulted by the CUDA
             extension's hashmap path (which uses the sparse prefix only).
-        weight (Tensor): [Co, K1, ..., KDs, Ci] convolution weights.
+        weight (Tensor): ``(Co, K1, ..., KDs, Ci)`` convolution weights.
         bias (Optional[Tensor]): [Co] bias.
         dilation: tuple of length Ds. Defaults to all-1.
         neighbor_cache: if provided, validated via
@@ -75,13 +75,13 @@ def submanifold_conv(
     Output coordinates coincide with input coordinates.
 
     Args:
-        feats (Tensor): [N, Ci] input features.
-        coords (Tensor): [N, B + Ds] input coordinates.
+        feats (Tensor): ``(N, Ci)`` input features.
+        coords (Tensor): ``(N, B + Ds)`` input coordinates.
         shape (Optional[torch.Size]): unused on the kernel_delta path; kept for
             signature parity with the kernel_size overload.
-        weight (Tensor): [Co, V, Ci] convolution weights.
+        weight (Tensor): ``(Co, V, Ci)`` convolution weights.
         bias (Optional[Tensor]): [Co] bias.
-        kernel_delta (Tensor): [V, Ds] kernel offsets.
+        kernel_delta (Tensor): ``(V, Ds)`` kernel offsets.
         symmetric: if ``None``, auto-detected from ``kernel_delta``.
         neighbor_cache: if provided, validated via
             :meth:`NeighborCache.assert_match`.
@@ -110,7 +110,7 @@ def submanifold_conv(
     # Channel-last: cache only stores the sparse prefix of ``shape``.
     sparse_in_shape = split_sparse_shape(shape, coords.shape[1])
     if kernel_delta is None:
-        # kernel_size mode: weight is [Co, K1, ..., KDs, Ci]; infer kernel_size.
+        # kernel_size mode: weight is ``(Co, K1, ..., KDs, Ci)``; infer kernel_size.
         kernel_size = tuple(weight.shape[1:-1])
         dilation = tuple(dilation) if dilation is not None else (1,) * len(kernel_size)
         assert len(dilation) == len(kernel_size), (
@@ -132,7 +132,7 @@ def submanifold_conv(
             )
         weight_v = weight.flatten(1, -2)
     else:
-        # kernel_delta mode: weight is [Co, V, Ci]; used as-is.
+        # kernel_delta mode: weight is ``(Co, V, Ci)``; used as-is.
         assert dilation is None, "dilation is only valid in kernel_size mode (mutually exclusive with kernel_delta)."
         # Materialize ``symmetric`` here so both the build path and the
         # ``assert_match`` path see the same concrete value.
