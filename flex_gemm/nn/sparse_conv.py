@@ -93,6 +93,7 @@ class SparseConv(nn.Module):
         padding: tuple[int, ...] | None = None,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         super().__init__()
         kernel_size = tuple(int(k) for k in kernel_size)
@@ -111,6 +112,7 @@ class SparseConv(nn.Module):
         self.dilation = dilation
         self.padding = padding
         self.algorithm = algorithm
+        self.allow_tf32 = allow_tf32
 
         _init_conv_params(self, in_channels, out_channels, kernel_size, bias)
 
@@ -134,6 +136,7 @@ class SparseConv(nn.Module):
             stride=self.stride, dilation=self.dilation, padding=self.padding,
             output_coords=output_coords, output_shape=output_shape,
             neighbor_cache=neighbor_cache, algorithm=self.algorithm,
+            allow_tf32=self.allow_tf32,
         )
 
     def extra_repr(self) -> str:
@@ -146,6 +149,8 @@ class SparseConv(nn.Module):
             s += ", bias=False"
         if self.algorithm is not None:
             s += f", algorithm={self.algorithm!r}"
+        if self.allow_tf32 is not None:
+            s += f", allow_tf32={self.allow_tf32!r}"
         return s
 
 
@@ -172,6 +177,7 @@ class SparseConv2d(SparseConv):
         padding: int | tuple[int, int] = 0,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 2, "kernel_size")
         stride      = _broadcast_dim_arg(stride,      2, "stride")
@@ -179,7 +185,7 @@ class SparseConv2d(SparseConv):
         padding     = _broadcast_dim_arg(padding,     2, "padding")
         super().__init__(
             in_channels, out_channels, kernel_size,
-            stride, dilation, padding, bias, algorithm,
+            stride, dilation, padding, bias, algorithm, allow_tf32,
         )
 
 
@@ -196,6 +202,7 @@ class SparseConv3d(SparseConv):
         padding: int | tuple[int, int, int] = 0,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 3, "kernel_size")
         stride      = _broadcast_dim_arg(stride,      3, "stride")
@@ -203,7 +210,7 @@ class SparseConv3d(SparseConv):
         padding     = _broadcast_dim_arg(padding,     3, "padding")
         super().__init__(
             in_channels, out_channels, kernel_size,
-            stride, dilation, padding, bias, algorithm,
+            stride, dilation, padding, bias, algorithm, allow_tf32,
         )
 
 
@@ -220,6 +227,7 @@ class SparseConv4d(SparseConv):
         padding: int | tuple[int, int, int, int] = 0,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 4, "kernel_size")
         stride      = _broadcast_dim_arg(stride,      4, "stride")
@@ -227,7 +235,7 @@ class SparseConv4d(SparseConv):
         padding     = _broadcast_dim_arg(padding,     4, "padding")
         super().__init__(
             in_channels, out_channels, kernel_size,
-            stride, dilation, padding, bias, algorithm,
+            stride, dilation, padding, bias, algorithm, allow_tf32,
         )
 
 
@@ -253,6 +261,7 @@ class SparseConvTranspose(nn.Module):
         padding: tuple[int, ...] | None = None,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         super().__init__()
         kernel_size = tuple(int(k) for k in kernel_size)
@@ -271,6 +280,7 @@ class SparseConvTranspose(nn.Module):
         self.dilation = dilation
         self.padding = padding
         self.algorithm = algorithm
+        self.allow_tf32 = allow_tf32
 
         _init_conv_params(self, in_channels, out_channels, kernel_size, bias)
 
@@ -294,6 +304,7 @@ class SparseConvTranspose(nn.Module):
             stride=self.stride, dilation=self.dilation, padding=self.padding,
             output_coords=output_coords, output_shape=output_shape,
             neighbor_cache=neighbor_cache, algorithm=self.algorithm,
+            allow_tf32=self.allow_tf32,
         )
 
     def extra_repr(self) -> str:
@@ -306,6 +317,8 @@ class SparseConvTranspose(nn.Module):
             s += ", bias=False"
         if self.algorithm is not None:
             s += f", algorithm={self.algorithm!r}"
+        if self.allow_tf32 is not None:
+            s += f", allow_tf32={self.allow_tf32!r}"
         return s
 
 
@@ -328,6 +341,7 @@ class SparseConvTranspose2d(SparseConvTranspose):
         padding: int | tuple[int, int] = 0,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 2, "kernel_size")
         stride      = _broadcast_dim_arg(stride,      2, "stride")
@@ -335,7 +349,7 @@ class SparseConvTranspose2d(SparseConvTranspose):
         padding     = _broadcast_dim_arg(padding,     2, "padding")
         super().__init__(
             in_channels, out_channels, kernel_size,
-            stride, dilation, padding, bias, algorithm,
+            stride, dilation, padding, bias, algorithm, allow_tf32,
         )
 
 
@@ -352,6 +366,7 @@ class SparseConvTranspose3d(SparseConvTranspose):
         padding: int | tuple[int, int, int] = 0,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 3, "kernel_size")
         stride      = _broadcast_dim_arg(stride,      3, "stride")
@@ -359,7 +374,7 @@ class SparseConvTranspose3d(SparseConvTranspose):
         padding     = _broadcast_dim_arg(padding,     3, "padding")
         super().__init__(
             in_channels, out_channels, kernel_size,
-            stride, dilation, padding, bias, algorithm,
+            stride, dilation, padding, bias, algorithm, allow_tf32,
         )
 
 
@@ -376,6 +391,7 @@ class SparseConvTranspose4d(SparseConvTranspose):
         padding: int | tuple[int, int, int, int] = 0,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 4, "kernel_size")
         stride      = _broadcast_dim_arg(stride,      4, "stride")
@@ -383,5 +399,5 @@ class SparseConvTranspose4d(SparseConvTranspose):
         padding     = _broadcast_dim_arg(padding,     4, "padding")
         super().__init__(
             in_channels, out_channels, kernel_size,
-            stride, dilation, padding, bias, algorithm,
+            stride, dilation, padding, bias, algorithm, allow_tf32,
         )

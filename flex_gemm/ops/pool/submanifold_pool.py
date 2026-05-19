@@ -7,7 +7,7 @@ from ... import kernels
 from ...kernels.triton.utils import _lengths_to_offsets
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
 from ..index_segment_reduce import index_segment_reduce
-from ..utils import _broadcast_dim_arg
+from ..utils import _broadcast_dim_arg, split_sparse_shape
 
 
 __all__ = [
@@ -28,6 +28,7 @@ _REDUCE_MODES = ("sum", "mean", "max", "min", "prod")
 def submanifold_pool(
     feats: Tensor,
     input_coords: Tensor,
+    shape: torch.Size,
     kernel_size: tuple[int, ...],
     reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
     neighbor_cache: NeighborCache | None = None,
@@ -41,6 +42,9 @@ def submanifold_pool(
     Args:
         feats (Tensor): [N, C] input features.
         input_coords (Tensor): ``(N, B + Ds)`` coordinates.
+        shape (torch.Size): input dense shape in channel-last layout
+            ``(*batch_dims, S1, ..., SDs, C)``; only consulted by the CUDA
+            extension's hashmap path (which uses the sparse prefix only).
         kernel_size: tuple of length Ds.
         reduce: one of ``sum`` / ``mean`` / ``max`` / ``min`` / ``prod``.
         neighbor_cache (Optional[NeighborCache]): if provided, its
@@ -64,17 +68,22 @@ def submanifold_pool(
 
     # Step 1: neighbor map — reuse cached one if available, else build via the
     # same kernel as submanifold_conv.
+    sparse_in_shape = split_sparse_shape(shape, input_coords.shape[1])
     if neighbor_cache is None:
         neighbor_cache = build_neighbor_cache(
             input_coords,
             submanifold=True,
             kernel_size=kernel_size,
             dilation=dilation,
+            input_sparse_shape=sparse_in_shape,
         )
     else:
         neighbor_cache.assert_match(
             input_coords=input_coords,
             output_coords=input_coords,
+            is_transposed=False,
+            kernel_size=kernel_size,
+            dilation=dilation,
         )
 
     output_feats = index_segment_reduce(
@@ -103,6 +112,7 @@ def submanifold_pool(
 def submanifold_pool2d(
     feats: Tensor,
     input_coords: Tensor,
+    shape: torch.Size,
     kernel_size: int | tuple[int, int],
     reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
     neighbor_cache: NeighborCache | None = None,
@@ -115,12 +125,13 @@ def submanifold_pool2d(
     :func:`submanifold_pool`.
     """
     kernel_size = _broadcast_dim_arg(kernel_size, 2, "kernel_size")
-    return submanifold_pool(feats, input_coords, kernel_size, reduce, neighbor_cache)
+    return submanifold_pool(feats, input_coords, shape, kernel_size, reduce, neighbor_cache)
 
 
 def submanifold_pool3d(
     feats: Tensor,
     input_coords: Tensor,
+    shape: torch.Size,
     kernel_size: int | tuple[int, int, int],
     reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
     neighbor_cache: NeighborCache | None = None,
@@ -133,12 +144,13 @@ def submanifold_pool3d(
     :func:`submanifold_pool`.
     """
     kernel_size = _broadcast_dim_arg(kernel_size, 3, "kernel_size")
-    return submanifold_pool(feats, input_coords, kernel_size, reduce, neighbor_cache)
+    return submanifold_pool(feats, input_coords, shape, kernel_size, reduce, neighbor_cache)
 
 
 def submanifold_pool4d(
     feats: Tensor,
     input_coords: Tensor,
+    shape: torch.Size,
     kernel_size: int | tuple[int, int, int, int],
     reduce: Literal["sum", "mean", "max", "min", "prod"] = "mean",
     neighbor_cache: NeighborCache | None = None,
@@ -151,4 +163,4 @@ def submanifold_pool4d(
     :func:`submanifold_pool`.
     """
     kernel_size = _broadcast_dim_arg(kernel_size, 4, "kernel_size")
-    return submanifold_pool(feats, input_coords, kernel_size, reduce, neighbor_cache)
+    return submanifold_pool(feats, input_coords, shape, kernel_size, reduce, neighbor_cache)

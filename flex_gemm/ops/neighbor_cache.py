@@ -28,6 +28,7 @@ Two pieces live here:
   regardless of which branch produced it.
 """
 
+import math
 from typing import *
 
 import torch
@@ -146,6 +147,22 @@ class NeighborCache:
     incidence-cache use case (no kernel semantics) — then rep-a can only
     come from construction or a symmetric sibling."""
 
+    # --- kernel / conv signature (optional, set by build_neighbor_cache) --
+    # Used by :meth:`assert_match` for full topology validation. All
+    # five fields are direction-agnostic (a forward conv and its
+    # conv-transpose share the same delta / stride / offset), so
+    # :class:`NeighborCacheT` exposes them by simple pass-through.
+    kernel_size: tuple[int, ...] | None
+    "Dense-kernel spatial shape ``(K1, ..., KDs)`` (kernel_size mode) or ``None``."
+    dilation: tuple[int, ...] | None
+    "Per-dim dilation, length ``Ds`` (kernel_size mode) or ``None``."
+    kernel_delta: Tensor | None
+    "``(V, Ds)`` int tensor of per-tap offsets (kernel_delta mode) or ``None``."
+    stride: tuple[int, ...] | None
+    "Per-dim stride, length ``Ds``, or ``None``."
+    offset: tuple[int, ...] | None
+    "Per-dim centered-kernel offset, length ``Ds``, or ``None``."
+
     # Direction flag. ``True`` only on :class:`NeighborCacheT` views.
     is_transposed: ClassVar[bool] = False
 
@@ -173,6 +190,14 @@ class NeighborCache:
         input_sparse_shape: torch.Size | None = None,
         output_sparse_shape: torch.Size | None = None,
         symmetric: bool = False,
+        # kernel / conv signature (optional; usually attached by
+        # ``build_neighbor_cache`` after the cache is constructed, but
+        # exposed here so manually-constructed caches can record them).
+        kernel_size: tuple[int, ...] | None = None,
+        dilation: tuple[int, ...] | None = None,
+        kernel_delta: Tensor | None = None,
+        stride: tuple[int, ...] | None = None,
+        offset: tuple[int, ...] | None = None,
     ):
         has_fwd = fwd_map is not None or (
             fwd_seg_indices is not None and fwd_seg_offsets is not None
@@ -245,6 +270,14 @@ class NeighborCache:
         if edge_kernel is not None:
             self['_edge_kernel'] = edge_kernel
 
+        # Kernel / conv signature (stored verbatim; resolution of
+        # defaults is owned by ``build_neighbor_cache``).
+        self.kernel_size  = tuple(kernel_size)  if kernel_size  is not None else None
+        self.dilation     = tuple(dilation)     if dilation     is not None else None
+        self.kernel_delta = kernel_delta
+        self.stride       = tuple(stride)       if stride       is not None else None
+        self.offset       = tuple(offset)       if offset       is not None else None
+
     # ------------------------------------------------------------------ #
     # Signature validation
     # ------------------------------------------------------------------ #
@@ -254,8 +287,20 @@ class NeighborCache:
         input_coords: Tensor | None = None,
         output_coords: Tensor | None = None,
         is_transposed: bool | None = None,
+        kernel_size: tuple[int, ...] | None = None,
+        dilation: tuple[int, ...] | None = None,
+        kernel_delta: Tensor | None = None,
+        stride: tuple[int, ...] | None = None,
+        offset: tuple[int, ...] | None = None,
     ) -> None:
-        """Verify the cache matches the given input / output coords."""
+        """Verify the cache matches the given (coords, direction, signature).
+
+        Coord tensors are matched by ``data_ptr`` (plus shape / dtype /
+        device sanity). Signature tuples are matched by plain equality.
+        ``kernel_delta`` matches by ``data_ptr`` first (no sync), falling
+        back to elementwise ``torch.equal`` only when pointers differ (a
+        sync — unavoidable when the caller doesn't reuse the same tensor).
+        """
         for name, expected in (("input_coords", input_coords),
                                ("output_coords", output_coords)):
             if expected is None:
@@ -273,6 +318,42 @@ class NeighborCache:
         if is_transposed is not None:
             assert bool(is_transposed) == bool(self.is_transposed), \
                 f"NeighborCache is_transposed mismatch: cache={self.is_transposed}, op={is_transposed}"
+
+        # Tuple-valued signature fields: plain equality.
+        for name, expected in (("kernel_size", kernel_size),
+                               ("dilation", dilation),
+                               ("stride", stride),
+                               ("offset", offset)):
+            if expected is None:
+                continue
+            stored = getattr(self, name)
+            assert stored is not None, (
+                f"NeighborCache.{name} not recorded on cache (cache was "
+                f"built without a signature); cannot validate against op's "
+                f"{name}={expected!r}."
+            )
+            assert tuple(expected) == tuple(stored), (
+                f"NeighborCache signature mismatch on {name!r}: "
+                f"cache={stored!r}, op={expected!r}"
+            )
+
+        # kernel_delta: data_ptr first, then tensor-equal as a fallback.
+        if kernel_delta is not None:
+            stored = self.kernel_delta
+            assert stored is not None, (
+                "NeighborCache.kernel_delta not recorded on cache (cache "
+                "was built without a signature); cannot validate against "
+                "op's kernel_delta."
+            )
+            if stored is not kernel_delta and stored.data_ptr() != kernel_delta.data_ptr():
+                ok = (
+                    stored.shape == kernel_delta.shape
+                    and stored.dtype == kernel_delta.dtype
+                    and stored.device == kernel_delta.device
+                    and bool(torch.equal(stored, kernel_delta))
+                )
+                assert ok, "NeighborCache signature mismatch on 'kernel_delta'"
+
 
     # ------------------------------------------------------------------ #
     # Dict-like access for cached tensors
@@ -302,17 +383,21 @@ class NeighborCache:
         return seg_indices, seg_offsets
 
     @staticmethod
-    def _map_to_edges(map: Tensor, mask: Tensor) -> tuple[Tensor, Tensor]:
-        """(rows, V) map → (rows_per_edge, payload_per_edge).
+    def _map_to_edges(map: Tensor, mask: Tensor) -> tuple[Tensor, Tensor, Tensor]:
+        """(rows, V) map → (rows_per_edge, payload_per_edge, kernel_per_edge).
 
         ``rows_per_edge[e]`` is the row of the source ``map`` that edge
         ``e`` lives on; ``payload_per_edge[e]`` is the corresponding
-        ``map`` entry (the other endpoint of the edge).
+        ``map`` entry (the other endpoint of the edge);
+        ``kernel_per_edge[e]`` is the column index (kernel slot) of that
+        entry in the source ``map``.
         """
+        V = map.shape[1]
         mask_pos_flat = mask.view(-1).nonzero(as_tuple=True)[0].to(torch.int32)
-        rows_per_edge = torch.div(mask_pos_flat, map.shape[1], rounding_mode='floor')
+        rows_per_edge = torch.div(mask_pos_flat, V, rounding_mode='floor')
+        kernel_per_edge = mask_pos_flat % V
         payload_per_edge = map.view(-1)[mask_pos_flat]
-        return rows_per_edge, payload_per_edge
+        return rows_per_edge, payload_per_edge, kernel_per_edge
 
     @staticmethod
     def _seg_to_edges(
@@ -367,14 +452,27 @@ class NeighborCache:
         """
         if '_edge_in' in self and '_edge_out' in self:
             return
+        # Both branches recover ``edge_kernel`` from the source map's
+        # column index (``flat_idx % V``). This is canonical because
+        # build paths that omit ``_edge_kernel`` only populate one of
+        # ``_fwd_map`` / ``_bwd_map`` (whichever is the natural output
+        # of that path), so the column index unambiguously labels the
+        # forward kernel slot regardless of which branch we land in
+        # (the ``NeighborCacheT`` key-swap routes ``_fwd_map`` here to
+        # the underlying ``_bwd_map``, which in that case still holds
+        # the original fwd-direction map data).
         if '_fwd_map' in self:
-            self['_edge_out'], self['_edge_in'] = self._map_to_edges(
+            self['_edge_out'], self['_edge_in'], edge_kernel = self._map_to_edges(
                 self['_fwd_map'], self.fwd_mask,
             )
+            if '_edge_kernel' not in self:
+                self['_edge_kernel'] = edge_kernel
         elif '_bwd_map' in self:
-            self['_edge_in'], self['_edge_out'] = self._map_to_edges(
+            self['_edge_in'], self['_edge_out'], edge_kernel = self._map_to_edges(
                 self['_bwd_map'], self.bwd_mask,
             )
+            if '_edge_kernel' not in self:
+                self['_edge_kernel'] = edge_kernel
         elif '_fwd_seg_indices' in self and '_fwd_seg_offsets' in self:
             self['_edge_out'], self['_edge_in'] = self._seg_to_edges(
                 self['_fwd_seg_indices'], self['_fwd_seg_offsets'],
@@ -759,6 +857,27 @@ class NeighborCacheT(NeighborCache):
     def num_kernels(self) -> int | None:
         return self._original.num_kernels
 
+    # Kernel / conv signature — direction-agnostic, pass through.
+    @property
+    def kernel_size(self) -> tuple[int, ...] | None:
+        return self._original.kernel_size
+
+    @property
+    def dilation(self) -> tuple[int, ...] | None:
+        return self._original.dilation
+
+    @property
+    def kernel_delta(self) -> Tensor | None:
+        return self._original.kernel_delta
+
+    @property
+    def stride(self) -> tuple[int, ...] | None:
+        return self._original.stride
+
+    @property
+    def offset(self) -> tuple[int, ...] | None:
+        return self._original.offset
+
     # Transpose inverse: ``T.T`` is the original cache.
     @property
     def T(self) -> "NeighborCache":
@@ -880,8 +999,8 @@ def build_neighbor_cache(
     When ``transpose=True``, the neighbor map is built under the
     *sparse conv-transpose* relation ``coord_out = coord_in * stride + offset
     + delta`` and the function returns a :class:`NeighborCacheT`. In that
-    mode ``input_coords`` / ``input_sparse_shape`` are the conv-transpose's *small*
-    side and ``output_coords`` / ``output_sparse_shape`` are the *large* side.
+    mode ``input_coords`` / ``input_shape`` are the conv-transpose's *small*
+    side and ``output_coords`` / ``output_shape`` are the *large* side.
     ``transpose=True`` is incompatible with ``submanifold=True``.
 
     Args:
@@ -974,6 +1093,28 @@ def build_neighbor_cache(
     assert (kernel_size is None) ^ (kernel_delta is None), \
         "Exactly one of kernel_size / kernel_delta must be provided"
 
+    # Resolve the kernel / conv signature once here so the returned
+    # cache can carry canonicalized tuples (stride=(1,...) default,
+    # offset folded from padding, etc.) for :meth:`NeighborCache.assert_match`.
+    if kernel_size is not None:
+        D_spatial = len(kernel_size)
+        dilation_sig = tuple(dilation) if dilation is not None else (1,) * D_spatial
+    else:
+        D_spatial = int(kernel_delta.shape[1])
+        dilation_sig = None  # not meaningful in kernel_delta mode
+
+    if submanifold:
+        stride_sig = (1,) * D_spatial
+        offset_sig = (0,) * D_spatial
+    else:
+        stride_sig = tuple(stride) if stride is not None else (1,) * D_spatial
+        if kernel_size is not None:
+            offset_sig = _resolve_offset_from_padding(
+                tuple(kernel_size), dilation_sig, padding, offset,
+            )
+        else:
+            offset_sig = tuple(offset) if offset is not None else (0,) * D_spatial
+
     if submanifold:
         # ================ submanifold: output_coords == input_coords ================ #
         assert not transpose, \
@@ -989,7 +1130,7 @@ def build_neighbor_cache(
 
         if kernel_size is not None:
             # ------------- submanifold & kernel_size ------------- #
-            return _build_submanifold_kernel_size(
+            cache = _build_submanifold_kernel_size(
                 input_coords,
                 kernel_size=kernel_size,
                 dilation=dilation,
@@ -997,7 +1138,7 @@ def build_neighbor_cache(
             )
         else:
             # ------------- submanifold & kernel_delta ------------- #
-            return _build_submanifold_kernel_delta(
+            cache = _build_submanifold_kernel_delta(
                 input_coords,
                 kernel_delta=kernel_delta,
                 symmetric=symmetric,
@@ -1008,7 +1149,7 @@ def build_neighbor_cache(
         # ================ strided, auto-derived output_coords ================ #
         if kernel_size is not None:
             # ------------- strided-auto & kernel_size ------------- #
-            return _build_strided_kernel_size_auto(
+            cache = _build_strided_kernel_size_auto(
                 input_coords,
                 kernel_size=kernel_size,
                 dilation=dilation,
@@ -1021,7 +1162,7 @@ def build_neighbor_cache(
             )
         else:
             # ------------- strided-auto & kernel_delta ------------- #
-            return _build_strided_kernel_delta_auto(
+            cache = _build_strided_kernel_delta_auto(
                 input_coords,
                 kernel_delta=kernel_delta,
                 stride=stride,
@@ -1035,7 +1176,7 @@ def build_neighbor_cache(
         # ================ strided, caller-supplied output_coords ================ #
         if kernel_size is not None:
             # ------------- strided-custom & kernel_size ------------- #
-            return _build_strided_kernel_size_custom(
+            cache = _build_strided_kernel_size_custom(
                 input_coords, output_coords,
                 kernel_size=kernel_size,
                 dilation=dilation,
@@ -1048,7 +1189,7 @@ def build_neighbor_cache(
             )
         else:
             # ------------- strided-custom & kernel_delta ------------- #
-            return _build_strided_kernel_delta_custom(
+            cache = _build_strided_kernel_delta_custom(
                 input_coords, output_coords,
                 kernel_delta=kernel_delta,
                 stride=stride,
@@ -1057,6 +1198,17 @@ def build_neighbor_cache(
                 output_sparse_shape=output_sparse_shape,
                 transposed=transpose,
             )
+
+    # Attach the resolved kernel / conv signature onto the *underlying*
+    # NeighborCache (so a :class:`NeighborCacheT` view exposes it via its
+    # pass-through properties).
+    underlying = cache._original if isinstance(cache, NeighborCacheT) else cache
+    underlying.kernel_size  = tuple(kernel_size) if kernel_size is not None else None
+    underlying.dilation     = dilation_sig
+    underlying.kernel_delta = kernel_delta
+    underlying.stride       = stride_sig
+    underlying.offset       = offset_sig
+    return cache
 
 
 # ---------------------------------------------------------------------- #
@@ -1187,7 +1339,7 @@ def _build_submanifold_neighbor_map_kernel_size(
         hashmap_keys, hashmap_vals = init_hashmap(
             shape, int(config.CUDA_HASHMAP_RATIO * input_coords.shape[0]), input_coords.device,
         )
-        neighbor_map = kernels.cuda.hashmap_build_submanifold_conv_neighbour_map_cuda(
+        neighbor_map = kernels.cuda.hashmap_build_submanifold_conv_neighbour_map(
             hashmap_keys, hashmap_vals, input_coords,
             W, H, D,
             kernel_size[0], kernel_size[1], kernel_size[2],
@@ -1334,10 +1486,12 @@ def _build_strided_kernel_size_auto(
             kernel_size, stride, padding, dilation,
             need_bwd=False,
         )
+        num_kernels = math.prod(kernel_size)
         if not transposed:
             return NeighborCache(
                 fwd_map=fwd_nm,
                 bwd_map=bwd_nm,
+                num_kernels=num_kernels,
                 input_coords=input_coords,
                 output_coords=output_coords,
                 input_sparse_shape=input_sparse_shape,

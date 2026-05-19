@@ -3,13 +3,16 @@ import math
 import torch
 import triton
 import triton.language as tl
-from ..utils import get_num_sm
+from ..utils import get_num_sm, autotune_size_bucket
 from ....autotuner import triton_autotune, autotune
 from . import config
 from .... import config as _global_config
 from .sparse_conv_implicit_gemm import (
     sparse_conv_implicit_gemm_kernel,
     sparse_conv_bwd_weight_implicit_gemm_kernel,
+    _bwd_w_bci,
+    _bwd_w_bv,
+    _bwd_w_even,
 )
 
 
@@ -104,12 +107,13 @@ def sparse_conv_implicit_gemm_splitk_kernel(
 
     
 @triton_autotune(
-    configs=config.autotune_config,
-    key=['LOGN', 'LOGM', 'Ci', 'Co', 'V', 'SPLITK', 'allow_tf32'],
+    configs=config.bwd_weight_autotune_config,
+    key=['LOGM', 'Ci', 'Co', 'V', 'SPLITK', 'allow_tf32'],
 )
 @triton.heuristics({
-    'BV': lambda meta: max(1, meta['B2'] // meta['Ci']),
-    'BCi': lambda meta: min(meta['Ci'], meta['B2']),
+    'BCi':  _bwd_w_bci,
+    'BV':   _bwd_w_bv,
+    'EVEN': _bwd_w_even,
 })
 @triton.jit
 def sparse_conv_bwd_weight_implicit_gemm_splitk_kernel(
@@ -118,7 +122,7 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk_kernel(
     neighbor,
     grad_weight,
     # Tensor dimensions
-    M, LOGN, LOGM, Ci, Co, V: tl.constexpr,
+    M, LOGM, Ci, Co, V: tl.constexpr,
     # Meta-parameters
     B1: tl.constexpr,   # Block size for Co dimension
     B2: tl.constexpr,   # Block size for V * Ci dimension
@@ -127,6 +131,7 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk_kernel(
     BCi: tl.constexpr,  # Block size for Ci dimension
     SPLITK: tl.constexpr,  # Split K dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+    EVEN: tl.constexpr, # True iff Ci % BCi == 0 and V % BV == 0 (mask-free fast path)
 ):
     """
     Indice convolution backward to weight kernel using implicit GEMM with split K dimension.
@@ -140,15 +145,18 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk_kernel(
     block_id_co = tl.program_id(axis=0)
     block_id_vci = tl.program_id(axis=1)
     block_id_k = tl.program_id(axis=2)
+    num_ci_blocks = tl.cdiv(Ci, BCi)
+    block_id_v = block_id_vci // num_ci_blocks
+    block_id_ci = block_id_vci % num_ci_blocks
     
     # Create pointers for submatrices of A and B.
     num_k = tl.cdiv(M, BK)  # Number of blocks in K dimension
     k_start = tl.cdiv(num_k * block_id_k, SPLITK)
     k_end = tl.cdiv(num_k * (block_id_k + 1), SPLITK)
-    offset_co = (block_id_co * B1 + tl.arange(0, B1)) % Co                          # (B1,)
-    offset_v = (tl.arange(0, BV) + (block_id_vci // (Ci // BCi)) * BV) % V          # (BV,)
-    offset_ci = (tl.arange(0, BCi) + (block_id_vci % (Ci // BCi)) * BCi) % Ci       # (BCi,)
-    offset_k = tl.arange(0, BK)                                                     # (BK,)
+    offset_co = (block_id_co * B1 + tl.arange(0, B1)) % Co        # (B1,)
+    offset_v = block_id_v * BV + tl.arange(0, BV)                 # (BV,)
+    offset_ci = block_id_ci * BCi + tl.arange(0, BCi)             # (BCi,)
+    offset_k = tl.arange(0, BK)                                   # (BK,)
     neighbor_ptr = neighbor + k_start * BK * V + (offset_k[:, None] * V + offset_v[None, :])            # (BK, BV)
     grad_output_ptr = grad_output + k_start * BK * Co + (offset_k[None, :] * Co + offset_co[:, None])   # (B1, BK)
     
@@ -158,12 +166,20 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk_kernel(
     # Iterate along V*Ci dimension.
     for k in range(k_start, k_end):
         mask = offset_k < M - k * BK
-        # Calculate pointers to input matrix.
-        input_offset_n = tl.load(neighbor_ptr, mask=mask[:, None], other=0xffffffff)            # (BK, BV)
-        input_ptr = input + (input_offset_n[:, :, None].to(tl.int64) * Ci + offset_ci[None, None, :])        # (BK, BV, BCi)
-        # Load the next block of input and weight.
+        if EVEN:
+            neigh_load_mask = mask[:, None]
+        else:
+            v_mask = offset_v < V                                                  # (BV,)
+            neigh_load_mask = mask[:, None] & v_mask[None, :]
+        input_offset_n = tl.load(neighbor_ptr, mask=neigh_load_mask, other=0xffffffff)              # (BK, BV)
+        input_ptr = input + (input_offset_n[:, :, None].to(tl.int64) * Ci + offset_ci[None, None, :])  # (BK, BV, BCi)
         grad_output_block = tl.load(grad_output_ptr, mask=mask[None, :], other=0.0)
-        input_block = tl.load(input_ptr, mask=input_offset_n[:, :, None] != 0xffffffff, other=0.0).reshape(BK, BV * BCi)
+        if EVEN:
+            input_load_mask = input_offset_n[:, :, None] != 0xffffffff
+        else:
+            ci_mask = offset_ci < Ci                                               # (BCi,)
+            input_load_mask = (input_offset_n[:, :, None] != 0xffffffff) & ci_mask[None, None, :]
+        input_block = tl.load(input_ptr, mask=input_load_mask, other=0.0).reshape(BK, BV * BCi)
         # Accumulate along the K dimension.
         accumulator = tl.dot(grad_output_block, input_block, accumulator,
                              input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
@@ -172,10 +188,17 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk_kernel(
         neighbor_ptr += BK * V
                 
     # Write back the block of the output matrix with masks.
-    grad_weight_offset_co = block_id_co * B1 + tl.arange(0, B1)
-    grad_weight_offset_vci = block_id_vci * BV * BCi + tl.arange(0, BV * BCi)
-    grad_weight_ptr = grad_weight + block_id_k * Co * V * Ci + (grad_weight_offset_co[:, None] * V * Ci + grad_weight_offset_vci[None, :])
-    grad_weight_mask = (grad_weight_offset_co[:, None] < Co) & (grad_weight_offset_vci[None, :] < V * Ci)
+    # Column j (= v * BCi + ci) of accumulator maps to grad_weight[k, offset_co, offset_v[v], offset_ci[ci]].
+    gw_offset_co = block_id_co * B1 + tl.arange(0, B1)
+    gw_offset_vci = (offset_v[:, None] * Ci + offset_ci[None, :]).reshape(BV * BCi)
+    grad_weight_ptr = grad_weight + block_id_k * Co * V * Ci + (gw_offset_co[:, None] * V * Ci + gw_offset_vci[None, :])
+    if EVEN:
+        grad_weight_mask = gw_offset_co[:, None] < Co
+    else:
+        v_mask = offset_v < V
+        ci_mask = offset_ci < Ci
+        flat_vci_mask = (v_mask[:, None] & ci_mask[None, :]).reshape(BV * BCi)
+        grad_weight_mask = (gw_offset_co[:, None] < Co) & flat_vci_mask[None, :]
     tl.store(grad_weight_ptr, accumulator, mask=grad_weight_mask)
 
 
@@ -196,7 +219,7 @@ def sparse_conv_fwd_implicit_gemm_splitk_configs(input, weight, bias, neighbor, 
 
 def sparse_conv_fwd_implicit_gemm_splitk_keys(input, weight, bias, neighbor, **kwargs):
     N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
-    return f'(2^{int(math.log2(N))}, 2^{int(math.log2(M))}, {Ci}, {Co}, {V})'
+    return f'(B{autotune_size_bucket(N)}, B{autotune_size_bucket(M)}, {Ci}, {Co}, {V})'
 
 
 @autotune(
@@ -211,14 +234,22 @@ def sparse_conv_fwd_implicit_gemm_splitk(
     SPLITK: int = 1,
     TRANSPOSE_WEIGHT: bool = False,
     FLIP_WEIGHT: bool = False,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
-    assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
+    if TRANSPOSE_WEIGHT:
+        assert input.shape[1] == weight.shape[0], "Incompatible dimensions"
+    else:
+        assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
     assert fwd_neighbor_map.is_contiguous(), "Matrix neighbor must be contiguous"
-    N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    N, M, V = input.shape[0], fwd_neighbor_map.shape[0], weight.shape[1]
+    Ci = input.shape[1]
+    Co = weight.shape[2] if TRANSPOSE_WEIGHT else weight.shape[0]
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
     # Launch the kernel.
     if SPLITK == 1:
         output = torch.empty((M, Co), device=input.device, dtype=input.dtype)
@@ -226,7 +257,7 @@ def sparse_conv_fwd_implicit_gemm_splitk(
         sparse_conv_implicit_gemm_kernel[grid](
             input, weight, bias, fwd_neighbor_map, output,
             M, LOGN, LOGM, Ci, Co, V,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            allow_tf32=allow_tf32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
             FLIP_WEIGHT=FLIP_WEIGHT,
         )
@@ -238,7 +269,7 @@ def sparse_conv_fwd_implicit_gemm_splitk(
             input, weight, bias, fwd_neighbor_map, output,
             M, LOGN, LOGM, Ci, Co, V,
             SPLITK=SPLITK,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            allow_tf32=allow_tf32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
             FLIP_WEIGHT=FLIP_WEIGHT,
         )
@@ -251,6 +282,7 @@ def sparse_conv_bwd_input_implicit_gemm_splitk(
     symmetric: bool,
     fwd_neighbor_map: Optional[torch.Tensor] = None,
     bwd_neighbor_map: Optional[torch.Tensor] = None,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     Backward to input for sparse convolution using split-K implicit GEMM.
@@ -268,10 +300,11 @@ def sparse_conv_bwd_input_implicit_gemm_splitk(
         grad_output, weight, None, neighbor_map,
         TRANSPOSE_WEIGHT=True,
         FLIP_WEIGHT=symmetric,
+        allow_tf32=allow_tf32,
     )
     return grad_input
 
-def sparse_conv_bwd_weight_implicit_gemm_splitk_configs(grad_output, input, neighbor):
+def sparse_conv_bwd_weight_implicit_gemm_splitk_configs(grad_output, input, neighbor, **kwargs):
     Co, V, Ci = grad_output.shape[1], neighbor.shape[1], input.shape[1]
     MAX_NB1 = (Co + 128 - 1) // 128
     MAX_NB2 = (V * Ci + 128 - 1) // 128
@@ -286,9 +319,9 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk_configs(grad_output, input, neig
     return configs
 
 
-def sparse_conv_bwd_weight_implicit_gemm_splitk_keys(grad_output, input, neighbor):
+def sparse_conv_bwd_weight_implicit_gemm_splitk_keys(grad_output, input, neighbor, **kwargs):
     N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], grad_output.shape[1], neighbor.shape[1]
-    return f'(2^{int(math.log2(N))}, 2^{int(math.log2(M))}, {Ci}, {Co}, {V})'
+    return f'(B{autotune_size_bucket(N)}, B{autotune_size_bucket(M)}, {Ci}, {Co}, {V})'
 
 
 @autotune(
@@ -300,33 +333,42 @@ def sparse_conv_bwd_weight_implicit_gemm_splitk(
     input: torch.Tensor,
     fwd_neighbor_map: torch.Tensor,
     SPLITK: int = 1,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
     assert grad_output.is_contiguous(), "Matrix grad_output must be contiguous"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert fwd_neighbor_map.is_contiguous(), "Matrix fwd_neighbor_map must be contiguous"
     
     N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], grad_output.shape[1], fwd_neighbor_map.shape[1]
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    LOGM = autotune_size_bucket(M)
     
     # Launch the kernel.
     if SPLITK == 1:
         grad_weight = torch.empty((Co, V, Ci), device=grad_output.device, dtype=grad_output.dtype)
-        grid = lambda META: (triton.cdiv(Co, META['B1']), triton.cdiv(V * Ci, META['B2']))
+        grid = lambda META: (
+            triton.cdiv(Co, META['B1']),
+            triton.cdiv(V, META['BV']) * triton.cdiv(Ci, META['BCi']),
+        )
         sparse_conv_bwd_weight_implicit_gemm_kernel[grid](
             grad_output, input, fwd_neighbor_map, grad_weight,
-            M, LOGN, LOGM, Ci, Co, V,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            M, LOGM, Ci, Co, V,
+            allow_tf32=allow_tf32,
         )
         return grad_weight
     else:
         grad_weight = torch.empty((SPLITK, Co, V, Ci), device=grad_output.device, dtype=torch.float32)
-        grid = lambda META: (triton.cdiv(Co, META['B1']), triton.cdiv(V * Ci, META['B2']), SPLITK)
+        grid = lambda META: (
+            triton.cdiv(Co, META['B1']),
+            triton.cdiv(V, META['BV']) * triton.cdiv(Ci, META['BCi']),
+            SPLITK,
+        )
         sparse_conv_bwd_weight_implicit_gemm_splitk_kernel[grid](
             grad_output, input, fwd_neighbor_map, grad_weight,
-            M, LOGN, LOGM, Ci, Co, V,
+            M, LOGM, Ci, Co, V,
             SPLITK=SPLITK,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            allow_tf32=allow_tf32,
         )
         return grad_weight.sum(0).to(grad_output.dtype)
     

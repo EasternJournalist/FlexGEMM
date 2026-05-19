@@ -57,6 +57,7 @@ class SubmanifoldConv(nn.Module):
         dilation: tuple[int, ...] | None = None,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         super().__init__()
         kernel_size = tuple(int(k) for k in kernel_size)
@@ -74,6 +75,7 @@ class SubmanifoldConv(nn.Module):
         self.kernel_size = kernel_size
         self.dilation = dilation
         self.algorithm = algorithm
+        self.allow_tf32 = allow_tf32
 
         self.weight = nn.Parameter(
             torch.empty(out_channels, *kernel_size, in_channels)
@@ -99,7 +101,7 @@ class SubmanifoldConv(nn.Module):
         self,
         feats: Tensor,
         coords: Tensor,
-        shape: torch.Size | None = None,
+        shape: torch.Size,
         neighbor_cache: NeighborCache | None = None,
     ) -> tuple[Tensor, NeighborCache]:
         return submanifold_conv(
@@ -107,6 +109,7 @@ class SubmanifoldConv(nn.Module):
             dilation=self.dilation,
             neighbor_cache=neighbor_cache,
             algorithm=self.algorithm,
+            allow_tf32=self.allow_tf32,
         )
 
     def extra_repr(self) -> str:
@@ -118,6 +121,8 @@ class SubmanifoldConv(nn.Module):
             s += ", bias=False"
         if self.algorithm is not None:
             s += f", algorithm={self.algorithm!r}"
+        if self.allow_tf32 is not None:
+            s += f", allow_tf32={self.allow_tf32!r}"
         return s
 
 
@@ -147,10 +152,11 @@ class SubmanifoldConv2d(SubmanifoldConv):
         dilation: int | tuple[int, int] = 1,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 2, "kernel_size")
         dilation = _broadcast_dim_arg(dilation, 2, "dilation")
-        super().__init__(in_channels, out_channels, kernel_size, dilation, bias, algorithm)
+        super().__init__(in_channels, out_channels, kernel_size, dilation, bias, algorithm, allow_tf32)
 
 
 class SubmanifoldConv3d(SubmanifoldConv):
@@ -169,10 +175,11 @@ class SubmanifoldConv3d(SubmanifoldConv):
         dilation: int | tuple[int, int, int] = 1,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 3, "kernel_size")
         dilation = _broadcast_dim_arg(dilation, 3, "dilation")
-        super().__init__(in_channels, out_channels, kernel_size, dilation, bias, algorithm)
+        super().__init__(in_channels, out_channels, kernel_size, dilation, bias, algorithm, allow_tf32)
 
 
 class SubmanifoldConv4d(SubmanifoldConv):
@@ -191,7 +198,8 @@ class SubmanifoldConv4d(SubmanifoldConv):
         dilation: int | tuple[int, int, int, int] = 1,
         bias: bool = True,
         algorithm: _Algo = None,
+        allow_tf32: bool | None = None,
     ) -> None:
         kernel_size = _broadcast_dim_arg(kernel_size, 4, "kernel_size")
         dilation = _broadcast_dim_arg(dilation, 4, "dilation")
-        super().__init__(in_channels, out_channels, kernel_size, dilation, bias, algorithm)
+        super().__init__(in_channels, out_channels, kernel_size, dilation, bias, algorithm, allow_tf32)

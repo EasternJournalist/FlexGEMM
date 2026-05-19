@@ -107,6 +107,9 @@ def sparse_pool(
         neighbor_cache.assert_match(
             input_coords=input_coords,
             output_coords=output_coords,
+            is_transposed=False,
+            kernel_size=kernel_size,
+            stride=stride,
         )
         sparse_out_shape = neighbor_cache.output_sparse_shape
 

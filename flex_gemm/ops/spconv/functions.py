@@ -17,7 +17,14 @@ class SparseConvExplicitGemmFunction(Function):
         neighbor_cache: NeighborCache,
         weight: Tensor,
         bias: Optional[Tensor] = None,
+        allow_tf32: Optional[bool] = None,
     ) -> Tuple[Tensor, NeighborCache]:
+        # ``allow_tf32`` is accepted for API uniformity but has no effect on
+        # this path: the explicit-GEMM variant defers matmuls to
+        # :func:`torch.mm` / :func:`torch.addmm`, which respect the global
+        # ``torch.backends.cuda.matmul.allow_tf32`` switch rather than our
+        # SPCONV_ALLOW_TF32 config.
+        del allow_tf32
         assert input.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
         assert input.shape[-1] == Ci, f"Input channels ({input.shape[-1]}) should match weight channels ({Ci})"
@@ -69,7 +76,7 @@ class SparseConvExplicitGemmFunction(Function):
         else:
             grad_bias = None
 
-        return grad_input, None, grad_weight, grad_bias
+        return grad_input, None, grad_weight, grad_bias, None
 
 
 class SparseConvImplicitGemmFunction(Function):
@@ -80,6 +87,7 @@ class SparseConvImplicitGemmFunction(Function):
         neighbor_cache: NeighborCache,
         weight: Tensor,
         bias: Optional[Tensor] = None,
+        allow_tf32: Optional[bool] = None,
     ) -> Tuple[Tensor, NeighborCache]:
         assert input.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
@@ -89,17 +97,20 @@ class SparseConvImplicitGemmFunction(Function):
             input,
             weight,
             bias,
-            neighbor_cache.fwd_map
+            neighbor_cache.fwd_map,
+            allow_tf32=allow_tf32,
         )
 
         ctx.save_for_backward(input, weight, bias)
         ctx.neighbor_cache = neighbor_cache
+        ctx.allow_tf32 = allow_tf32
         return output, neighbor_cache
 
     @staticmethod
     def backward(ctx, grad_output: Tensor, _):
         input, weight, bias = ctx.saved_tensors
         neighbor_cache: NeighborCache = ctx.neighbor_cache
+        allow_tf32 = ctx.allow_tf32
 
         grad_output = grad_output.contiguous()
         
@@ -110,6 +121,7 @@ class SparseConvImplicitGemmFunction(Function):
                     weight,
                     symmetric=True,
                     fwd_neighbor_map=neighbor_cache.fwd_map,
+                    allow_tf32=allow_tf32,
                 )
             else:
                 grad_input = kernels.triton.sparse_conv_bwd_input_implicit_gemm(
@@ -117,6 +129,7 @@ class SparseConvImplicitGemmFunction(Function):
                     weight,
                     symmetric=False,
                     bwd_neighbor_map=neighbor_cache.bwd_map,
+                    allow_tf32=allow_tf32,
                 )
         else:
             grad_input = None
@@ -125,7 +138,8 @@ class SparseConvImplicitGemmFunction(Function):
             grad_weight = kernels.triton.sparse_conv_bwd_weight_implicit_gemm(
                 grad_output, 
                 input, 
-                neighbor_cache.fwd_map
+                neighbor_cache.fwd_map,
+                allow_tf32=allow_tf32,
             )
         else:
             grad_weight = None
@@ -135,7 +149,7 @@ class SparseConvImplicitGemmFunction(Function):
         else:
             grad_bias = None
 
-        return grad_input, None, grad_weight, grad_bias
+        return grad_input, None, grad_weight, grad_bias, None
 
 
 class SparseConvImplicitGemmSplitKFunction(Function):
@@ -146,6 +160,7 @@ class SparseConvImplicitGemmSplitKFunction(Function):
         neighbor_cache: NeighborCache,
         weight: Tensor,
         bias: Optional[Tensor] = None,
+        allow_tf32: Optional[bool] = None,
     ) -> Tuple[Tensor, NeighborCache]:
         assert feats.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
@@ -155,17 +170,20 @@ class SparseConvImplicitGemmSplitKFunction(Function):
             feats,
             weight,
             bias,
-            neighbor_cache.fwd_map
+            neighbor_cache.fwd_map,
+            allow_tf32=allow_tf32,
         )
 
         ctx.save_for_backward(feats, weight, bias)
         ctx.neighbor_cache = neighbor_cache
+        ctx.allow_tf32 = allow_tf32
         return output, neighbor_cache
 
     @staticmethod
     def backward(ctx, grad_output: Tensor, _):
         input, weight, bias = ctx.saved_tensors
         neighbor_cache: NeighborCache = ctx.neighbor_cache
+        allow_tf32 = ctx.allow_tf32
 
         grad_output = grad_output.contiguous()
         if input.requires_grad:
@@ -175,6 +193,7 @@ class SparseConvImplicitGemmSplitKFunction(Function):
                     weight,
                     symmetric=True,
                     fwd_neighbor_map=neighbor_cache.fwd_map,
+                    allow_tf32=allow_tf32,
                 )
             else:
                 grad_input = kernels.triton.sparse_conv_bwd_input_implicit_gemm_splitk(
@@ -182,6 +201,7 @@ class SparseConvImplicitGemmSplitKFunction(Function):
                     weight,
                     symmetric=False,
                     bwd_neighbor_map=neighbor_cache.bwd_map,
+                    allow_tf32=allow_tf32,
                 )
         else:
             grad_input = None
@@ -190,7 +210,8 @@ class SparseConvImplicitGemmSplitKFunction(Function):
             grad_weight = kernels.triton.sparse_conv_bwd_weight_implicit_gemm_splitk(
                 grad_output,
                 input,
-                neighbor_cache.fwd_map
+                neighbor_cache.fwd_map,
+                allow_tf32=allow_tf32,
             )
         else:
             grad_weight = None
@@ -200,7 +221,7 @@ class SparseConvImplicitGemmSplitKFunction(Function):
         else:
             grad_bias = None
 
-        return grad_input, None, grad_weight, grad_bias
+        return grad_input, None, grad_weight, grad_bias, None
 
 
 class SparseConvMaskedImplicitGemmFunction(Function):
@@ -211,6 +232,7 @@ class SparseConvMaskedImplicitGemmFunction(Function):
         neighbor_cache: NeighborCache,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        allow_tf32: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, NeighborCache]:
         assert input.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
@@ -224,16 +246,19 @@ class SparseConvMaskedImplicitGemmFunction(Function):
             neighbor_cache.fwd_sorted_idx,
             neighbor_cache.fwd_valid_kernel_callback,
             neighbor_cache.fwd_valid_kernel_seg_callback,
+            allow_tf32=allow_tf32,
         )
 
         ctx.save_for_backward(input, weight, bias)
         ctx.neighbor_cache = neighbor_cache
+        ctx.allow_tf32 = allow_tf32
         return output, neighbor_cache
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, _):
         input, weight, bias = ctx.saved_tensors
         neighbor_cache: NeighborCache = ctx.neighbor_cache
+        allow_tf32 = ctx.allow_tf32
 
         grad_output = grad_output.contiguous()
         if input.requires_grad:
@@ -246,6 +271,7 @@ class SparseConvMaskedImplicitGemmFunction(Function):
                     fwd_sorted_idx=neighbor_cache.fwd_sorted_idx,
                     fwd_valid_kernel=neighbor_cache.fwd_valid_kernel_callback,
                     fwd_valid_kernel_seg=neighbor_cache.fwd_valid_kernel_seg_callback,
+                    allow_tf32=allow_tf32,
                 )
             else:
                 grad_input = kernels.triton.sparse_conv_bwd_input_masked_implicit_gemm(
@@ -256,6 +282,7 @@ class SparseConvMaskedImplicitGemmFunction(Function):
                     bwd_sorted_idx=neighbor_cache.bwd_sorted_idx,
                     bwd_valid_kernel=neighbor_cache.bwd_valid_kernel_callback,
                     bwd_valid_kernel_seg=neighbor_cache.bwd_valid_kernel_seg_callback,
+                    allow_tf32=allow_tf32,
                 )
         else:
             grad_input = None
@@ -267,6 +294,7 @@ class SparseConvMaskedImplicitGemmFunction(Function):
                 neighbor_cache.fwd_valid_signal_i,
                 neighbor_cache.fwd_valid_signal_o,
                 neighbor_cache.fwd_valid_signal_seg,
+                allow_tf32=allow_tf32,
             )
         else:
             grad_weight = None
@@ -276,7 +304,7 @@ class SparseConvMaskedImplicitGemmFunction(Function):
         else:
             grad_bias = None
 
-        return grad_input, None, grad_weight, grad_bias
+        return grad_input, None, grad_weight, grad_bias, None
 
 
 class SparseConvMaskedImplicitGemmSplitKFunction(Function):
@@ -287,6 +315,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
         neighbor_cache: NeighborCache,
         weight: torch.Tensor,
         bias: Optional[torch.Tensor] = None,
+        allow_tf32: Optional[bool] = None,
     ) -> Tuple[torch.Tensor, NeighborCache]:
         assert input.is_contiguous(), "Input features should be contiguous"
         Co, V, Ci = weight.shape
@@ -300,16 +329,19 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
             neighbor_cache.fwd_sorted_idx,
             neighbor_cache.fwd_valid_kernel_callback,
             neighbor_cache.fwd_valid_kernel_seg_callback,
+            allow_tf32=allow_tf32,
         )
 
         ctx.save_for_backward(input, weight, bias)
         ctx.neighbor_cache = neighbor_cache
+        ctx.allow_tf32 = allow_tf32
         return output, neighbor_cache
 
     @staticmethod
     def backward(ctx, grad_output: torch.Tensor, _):
         input, weight, bias = ctx.saved_tensors
         neighbor_cache: NeighborCache = ctx.neighbor_cache
+        allow_tf32 = ctx.allow_tf32
 
         grad_output = grad_output.contiguous()
         if input.requires_grad:
@@ -322,6 +354,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
                     fwd_sorted_idx=neighbor_cache.fwd_sorted_idx,
                     fwd_valid_kernel=neighbor_cache.fwd_valid_kernel_callback,
                     fwd_valid_kernel_seg=neighbor_cache.fwd_valid_kernel_seg_callback,
+                    allow_tf32=allow_tf32,
                 )
             else:
                 grad_input = kernels.triton.sparse_conv_bwd_input_masked_implicit_gemm_splitk(
@@ -332,6 +365,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
                     bwd_sorted_idx=neighbor_cache.bwd_sorted_idx,
                     bwd_valid_kernel=neighbor_cache.bwd_valid_kernel_callback,
                     bwd_valid_kernel_seg=neighbor_cache.bwd_valid_kernel_seg_callback,
+                    allow_tf32=allow_tf32,
                 )
         else:
             grad_input = None
@@ -343,6 +377,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
                 neighbor_cache.fwd_valid_signal_i,
                 neighbor_cache.fwd_valid_signal_o,
                 neighbor_cache.fwd_valid_signal_seg,
+                allow_tf32=allow_tf32,
             )
         else:
             grad_weight = None
@@ -352,7 +387,7 @@ class SparseConvMaskedImplicitGemmSplitKFunction(Function):
         else:
             grad_bias = None
             
-        return grad_input, None, grad_weight, grad_bias
+        return grad_input, None, grad_weight, grad_bias, None
 
 
 def _select_function(algorithm: Literal["explicit_gemm", "implicit_gemm", "implicit_gemm_splitk", "masked_implicit_gemm", "masked_implicit_gemm_splitk"] | None = None) -> Type[Function]:

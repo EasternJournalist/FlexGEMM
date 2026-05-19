@@ -98,6 +98,8 @@ def sparse_pixel_unshuffle(
             input_coords=coords,
             output_coords=output_coords,
             is_transposed=False,
+            kernel_size=downscale_factor,
+            stride=downscale_factor,
         )
     output_coords = neighbor_cache.output_coords
     sparse_out_shape = neighbor_cache.output_sparse_shape

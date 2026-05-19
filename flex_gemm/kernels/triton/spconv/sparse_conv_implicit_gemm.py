@@ -4,8 +4,32 @@ import torch
 import triton
 import triton.language as tl
 from ....autotuner import triton_autotune
+from ..utils import autotune_size_bucket
 from . import config
 from .... import config as _global_config
+
+
+def _largest_pow2_le(n: int) -> int:
+    """Largest power-of-two ``\u2264 n`` (\u2265 1)."""
+    return 1 if n < 2 else 1 << (int(n).bit_length() - 1)
+
+
+def _bwd_w_bci(meta) -> int:
+    Ci = meta['Ci']
+    cap = _largest_pow2_le(min(Ci, meta['B2']))
+    # If Ci is just over the chosen BCi, the tail block wastes most of its lanes.
+    # Drop one pow2 level when the tail covers <50% of a block.
+    if Ci > cap and (Ci % cap) != 0 and (Ci % cap) * 2 < cap:
+        cap = max(cap // 2, 1)
+    return cap
+
+
+def _bwd_w_bv(meta) -> int:
+    return _largest_pow2_le(max(1, meta['B2'] // _bwd_w_bci(meta)))
+
+
+def _bwd_w_even(meta) -> bool:
+    return (meta['Ci'] % _bwd_w_bci(meta) == 0) and (meta['V'] % _bwd_w_bv(meta) == 0)
 
 
 
@@ -95,12 +119,13 @@ def sparse_conv_implicit_gemm_kernel(
     
     
 @triton_autotune(
-    configs=config.autotune_config,
-    key=['LOGN', 'LOGM', 'Ci', 'Co', 'V', 'allow_tf32'],
+    configs=config.bwd_weight_autotune_config,
+    key=['LOGM', 'Ci', 'Co', 'V', 'allow_tf32'],
 )
 @triton.heuristics({
-    'BV': lambda meta: max(1, meta['B2'] // meta['Ci']),
-    'BCi': lambda meta: min(meta['Ci'], meta['B2']),
+    'BCi':  _bwd_w_bci,
+    'BV':   _bwd_w_bv,
+    'EVEN': _bwd_w_even,
 })
 @triton.jit
 def sparse_conv_bwd_weight_implicit_gemm_kernel(
@@ -109,7 +134,7 @@ def sparse_conv_bwd_weight_implicit_gemm_kernel(
     neighbor,
     grad_weight,
     # Tensor dimensions
-    M: int, LOGN: int, LOGM: int, Ci: int, Co: int, 
+    M: int, LOGM: int, Ci: int, Co: int,
     V: tl.constexpr,
     # Meta-parameters
     B1: tl.constexpr,   # Block size for Co dimension
@@ -118,6 +143,7 @@ def sparse_conv_bwd_weight_implicit_gemm_kernel(
     BV: tl.constexpr,   # Block size for V dimension
     BCi: tl.constexpr,  # Block size for Ci dimension
     allow_tf32: tl.constexpr,  # Allow TF32 precision for matmuls
+    EVEN: tl.constexpr, # True iff Ci % BCi == 0 and V % BV == 0 (mask-free fast path)
 ):
     """
     Indice convolution backward to weight kernel using implicit GEMM.
@@ -130,13 +156,16 @@ def sparse_conv_bwd_weight_implicit_gemm_kernel(
     """
     block_id_co = tl.program_id(axis=0)
     block_id_vci = tl.program_id(axis=1)
+    num_ci_blocks = tl.cdiv(Ci, BCi)
+    block_id_v = block_id_vci // num_ci_blocks
+    block_id_ci = block_id_vci % num_ci_blocks
     
     # Create pointers for submatrices of A and B.
     num_k = tl.cdiv(M, BK)  # Number of blocks in K dimension
-    offset_co = (block_id_co * B1 + tl.arange(0, B1)) % Co                          # (B1,)
-    offset_v = (tl.arange(0, BV) + (block_id_vci // (Ci // BCi)) * BV) % V          # (BV,)
-    offset_ci = (tl.arange(0, BCi) + (block_id_vci % (Ci // BCi)) * BCi) % Ci       # (BCi,)
-    offset_k = tl.arange(0, BK)                                                     # (BK,)
+    offset_co = (block_id_co * B1 + tl.arange(0, B1)) % Co        # (B1,)
+    offset_v = block_id_v * BV + tl.arange(0, BV)                 # (BV,)
+    offset_ci = block_id_ci * BCi + tl.arange(0, BCi)             # (BCi,)
+    offset_k = tl.arange(0, BK)                                   # (BK,)
     neighbor_ptr = neighbor + (offset_k[:, None] * V + offset_v[None, :])           # (BK, BV)
     grad_output_ptr = grad_output + (offset_k[None, :] * Co + offset_co[:, None])   # (B1, BK)
     
@@ -146,12 +175,20 @@ def sparse_conv_bwd_weight_implicit_gemm_kernel(
     # Iterate along V*Ci dimension.
     for k in range(num_k):
         mask = offset_k < M - k * BK
-        # Calculate pointers to input matrix.
-        input_offset_n = tl.load(neighbor_ptr, mask=mask[:, None], other=0xffffffff)            # (BK, BV)
-        input_ptr = input + (input_offset_n[:, :, None].to(tl.int64) * Ci + offset_ci[None, None, :])        # (BK, BV, BCi)
-        # Load the next block of input and weight.
+        if EVEN:
+            neigh_load_mask = mask[:, None]
+        else:
+            v_mask = offset_v < V                                                  # (BV,)
+            neigh_load_mask = mask[:, None] & v_mask[None, :]
+        input_offset_n = tl.load(neighbor_ptr, mask=neigh_load_mask, other=0xffffffff)              # (BK, BV)
+        input_ptr = input + (input_offset_n[:, :, None].to(tl.int64) * Ci + offset_ci[None, None, :])  # (BK, BV, BCi)
         grad_output_block = tl.load(grad_output_ptr, mask=mask[None, :], other=0.0)
-        input_block = tl.load(input_ptr, mask=input_offset_n[:, :, None] != 0xffffffff, other=0.0).reshape(BK, BV * BCi)
+        if EVEN:
+            input_load_mask = input_offset_n[:, :, None] != 0xffffffff
+        else:
+            ci_mask = offset_ci < Ci                                               # (BCi,)
+            input_load_mask = (input_offset_n[:, :, None] != 0xffffffff) & ci_mask[None, None, :]
+        input_block = tl.load(input_ptr, mask=input_load_mask, other=0.0).reshape(BK, BV * BCi)
         # Accumulate along the K dimension.
         accumulator = tl.dot(grad_output_block, input_block, accumulator, input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
         # Advance pointers.
@@ -160,10 +197,17 @@ def sparse_conv_bwd_weight_implicit_gemm_kernel(
     c = accumulator.to(grad_output.type.element_ty)
                 
     # Write back the block of the output matrix with masks.
-    grad_weight_offset_co = block_id_co * B1 + tl.arange(0, B1)
-    grad_weight_offset_vci = block_id_vci * BV * BCi + tl.arange(0, BV * BCi)
-    grad_weight_ptr = grad_weight + (grad_weight_offset_co[:, None] * V * Ci + grad_weight_offset_vci[None, :])
-    grad_weight_mask = (grad_weight_offset_co[:, None] < Co) & (grad_weight_offset_vci[None, :] < V * Ci)
+    # Column j (= v * BCi + ci) of c maps to grad_weight[offset_co, offset_v[v], offset_ci[ci]].
+    gw_offset_co = block_id_co * B1 + tl.arange(0, B1)
+    gw_offset_vci = (offset_v[:, None] * Ci + offset_ci[None, :]).reshape(BV * BCi)
+    grad_weight_ptr = grad_weight + (gw_offset_co[:, None] * V * Ci + gw_offset_vci[None, :])
+    if EVEN:
+        grad_weight_mask = gw_offset_co[:, None] < Co
+    else:
+        v_mask = offset_v < V
+        ci_mask = offset_ci < Ci
+        flat_vci_mask = (v_mask[:, None] & ci_mask[None, :]).reshape(BV * BCi)
+        grad_weight_mask = (gw_offset_co[:, None] < Co) & flat_vci_mask[None, :]
     tl.store(grad_weight_ptr, c, mask=grad_weight_mask)
 
 
@@ -172,14 +216,17 @@ def sparse_conv_fwd_implicit_gemm(
     weight: torch.Tensor,
     bias: torch.Tensor,
     fwd_neighbor_map: torch.Tensor,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
     assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
     assert fwd_neighbor_map.is_contiguous(), "Matrix fwd_neighbor_map must be contiguous"
     N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
     # Allocate output matrix output.
     output = torch.empty((M, Co), device=input.device, dtype=input.dtype)
     # Launch the kernel.
@@ -187,7 +234,7 @@ def sparse_conv_fwd_implicit_gemm(
     sparse_conv_implicit_gemm_kernel[grid](
         input, weight, bias, fwd_neighbor_map, output,
         M, LOGN, LOGM, Ci, Co, V,
-        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+        allow_tf32=allow_tf32,
     )
     return output
     
@@ -199,6 +246,7 @@ def sparse_conv_bwd_input_implicit_gemm(
     symmetric: bool,
     fwd_neighbor_map: Optional[torch.Tensor] = None,
     bwd_neighbor_map: Optional[torch.Tensor] = None,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     Backward to input for sparse convolution using implicit GEMM.
@@ -208,6 +256,8 @@ def sparse_conv_bwd_input_implicit_gemm(
     ``fwd_neighbor_map`` and the weight matrix is internally flipped along the V
     dimension, so the forward cache is reused. Otherwise, pass ``bwd_neighbor_map``.
     """
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
     if symmetric:
         assert fwd_neighbor_map is not None and bwd_neighbor_map is None, \
             "symmetric=True requires fwd_neighbor_map and forbids bwd_neighbor_map"
@@ -223,8 +273,8 @@ def sparse_conv_bwd_input_implicit_gemm(
     Co, V, Ci = weight.shape
     M = grad_output.shape[0]
     N = neighbor_map.shape[0]
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
 
     grad_input = torch.empty((N, Ci), device=grad_output.device, dtype=grad_output.dtype)
     grid = lambda META: (triton.cdiv(Ci, META['B2']) * triton.cdiv(N, META['B1']),)
@@ -232,7 +282,7 @@ def sparse_conv_bwd_input_implicit_gemm(
     sparse_conv_implicit_gemm_kernel[grid](
         grad_output, weight, None, neighbor_map, grad_input,
         N, LOGM, LOGN, Co, Ci, V,
-        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+        allow_tf32=allow_tf32,
         TRANSPOSE_WEIGHT=True,
         FLIP_WEIGHT=symmetric,
     )
@@ -243,7 +293,10 @@ def sparse_conv_bwd_weight_implicit_gemm(
     grad_output: torch.Tensor,
     input: torch.Tensor,
     fwd_neighbor_map: torch.Tensor,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
     assert grad_output.is_contiguous(), "Matrix grad_output must be contiguous"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert fwd_neighbor_map.is_contiguous(), "Matrix fwd_neighbor_map must be contiguous"
@@ -252,17 +305,18 @@ def sparse_conv_bwd_weight_implicit_gemm(
     Ci = input.shape[1]
     V = fwd_neighbor_map.shape[1]
     M = grad_output.shape[0]
-    N = input.shape[0]
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    LOGM = autotune_size_bucket(M)
     # Allocate output matrix output.
     grad_weight = torch.empty((Co, V, Ci), device=grad_output.device, dtype=grad_output.dtype)
     # Launch the kernel.
-    grid = lambda META: (triton.cdiv(Co, META['B1']), triton.cdiv(V * Ci, META['BV'] * META['BCi']))
+    grid = lambda META: (
+        triton.cdiv(Co, META['B1']),
+        triton.cdiv(V, META['BV']) * triton.cdiv(Ci, META['BCi']),
+    )
     sparse_conv_bwd_weight_implicit_gemm_kernel[grid](
         grad_output, input, fwd_neighbor_map, grad_weight,
-        M, LOGN, LOGM, Ci, Co, V,
-        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+        M, LOGM, Ci, Co, V,
+        allow_tf32=allow_tf32,
     )
     return grad_weight
 

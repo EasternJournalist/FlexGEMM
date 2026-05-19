@@ -36,6 +36,7 @@ def sparse_conv(
     output_shape: torch.Size | None = None,
     neighbor_cache: NeighborCache | None = None,
     algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
 ) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
     """Strided / general sparse convolution with a dense ``(kernel_size, dilation)`` kernel.
 
@@ -56,6 +57,9 @@ def sparse_conv(
         neighbor_cache: if provided, must be consistent with the call (verified via
             :meth:`NeighborCache.assert_match`).
         algorithm: index-GEMM algorithm variant.
+        allow_tf32: per-call override of ``config.SPCONV_ALLOW_TF32``. ``None``
+            (default) uses the global config. No effect on the
+            ``explicit_gemm`` path (which uses torch matmuls).
 
     Returns:
         (output_feats, output_coords, output_shape, neighbor_cache).
@@ -78,6 +82,7 @@ def sparse_conv(
     output_shape: torch.Size | None = None,
     neighbor_cache: NeighborCache | None = None,
     algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
 ) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
     """Strided / general sparse convolution with an arbitrary ``kernel_delta`` kernel.
 
@@ -117,6 +122,7 @@ def sparse_conv(
     output_shape: torch.Size | None = None,
     neighbor_cache: NeighborCache | None = None,
     algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
 ) -> Tuple[Tensor, Tensor, torch.Size, NeighborCache]:
     """Dispatch on (kernel parameterization). See the two overloads above."""
     assert coords.is_contiguous(), "Coords should be contiguous"
@@ -131,8 +137,9 @@ def sparse_conv(
 
     # When a neighbor_cache is supplied, ``input_shape`` / ``output_shape`` /
     # ``output_coords`` are filled in from it. Kernel topology (kernel_size,
-    # stride, dilation, ...) is *not* stored on the cache — the caller must
-    # supply it on every call.
+    # stride, dilation, offset, ...) is recorded on the cache by
+    # :func:`build_neighbor_cache` and re-validated against the op's args
+    # via :meth:`NeighborCache.assert_match` further below.
     if neighbor_cache is not None:
         if output_coords is None:
             output_coords = neighbor_cache.output_coords
@@ -169,6 +176,10 @@ def sparse_conv(
             neighbor_cache.assert_match(
                 input_coords=coords,
                 output_coords=output_coords,
+                is_transposed=False,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                stride=stride,
             )
         weight_v = weight.flatten(1, -2)
     else:
@@ -204,7 +215,7 @@ def sparse_conv(
 
     SparseConvFunc = _select_function(algorithm)
     output_feats, neighbor_cache = SparseConvFunc.apply(
-        feats, neighbor_cache, weight_v, bias,
+        feats, neighbor_cache, weight_v, bias, allow_tf32,
     )
     # Reassemble the full channel-last output shape: sparse prefix from the
     # cache + C_out tail from the output features.
@@ -229,7 +240,7 @@ def sparse_conv(
 def _sparse_conv_nd(
     D, feats, coords, shape, weight, bias,
     kernel_delta, stride, dilation, padding, offset,
-    output_coords, output_shape, neighbor_cache, algorithm,
+    output_coords, output_shape, neighbor_cache, algorithm, allow_tf32,
 ):
     stride   = _broadcast_dim_arg(stride,   D, "stride")
     dilation = _broadcast_dim_arg(dilation, D, "dilation")
@@ -241,6 +252,7 @@ def _sparse_conv_nd(
         stride=stride, dilation=dilation, padding=padding, offset=offset,
         output_coords=output_coords, output_shape=output_shape,
         neighbor_cache=neighbor_cache, algorithm=algorithm,
+        allow_tf32=allow_tf32,
     )
 
 
@@ -295,11 +307,12 @@ def sparse_conv2d(
     feats, coords, shape, weight, bias, *,
     kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
     output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+    allow_tf32=None,
 ):
     return _sparse_conv_nd(
         2, feats, coords, shape, weight, bias,
         kernel_delta, stride, dilation, padding, offset,
-        output_coords, output_shape, neighbor_cache, algorithm,
+        output_coords, output_shape, neighbor_cache, algorithm, allow_tf32,
     )
 
 
@@ -354,11 +367,12 @@ def sparse_conv3d(
     feats, coords, shape, weight, bias, *,
     kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
     output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+    allow_tf32=None,
 ):
     return _sparse_conv_nd(
         3, feats, coords, shape, weight, bias,
         kernel_delta, stride, dilation, padding, offset,
-        output_coords, output_shape, neighbor_cache, algorithm,
+        output_coords, output_shape, neighbor_cache, algorithm, allow_tf32,
     )
 
 
@@ -413,9 +427,10 @@ def sparse_conv4d(
     feats, coords, shape, weight, bias, *,
     kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
     output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+    allow_tf32=None,
 ):
     return _sparse_conv_nd(
         4, feats, coords, shape, weight, bias,
         kernel_delta, stride, dilation, padding, offset,
-        output_coords, output_shape, neighbor_cache, algorithm,
+        output_coords, output_shape, neighbor_cache, algorithm, allow_tf32,
     )

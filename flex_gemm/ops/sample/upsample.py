@@ -133,6 +133,8 @@ def sparse_upsample(
     # The cache's edge tables themselves are discarded — interpolation
     # happens against the dense grid-sample kernels below.
     # ------------------------------------------------------------------
+    sparse_dim = coords.shape[1]
+    sparse_in_shape = split_sparse_shape(shape, sparse_dim)
     if neighbor_cache is None:
         # ``padding=0`` is required (not just default) so the cache's
         # centered-kernel offset resolves to ``(r-1)//2``, making the
@@ -140,8 +142,6 @@ def sparse_upsample(
         # span exactly ``c_in*r + {0, .., r-1}`` and tile the high-res
         # grid without gaps. Omitting it leaves offset=0, which clips
         # the low / high boundary coords.
-        sparse_dim = coords.shape[1]
-        sparse_in_shape  = split_sparse_shape(shape,        sparse_dim)
         sparse_out_shape = split_sparse_shape(output_shape, sparse_dim)
         neighbor_cache = build_neighbor_cache(
             coords, output_coords,
@@ -158,6 +158,8 @@ def sparse_upsample(
             input_coords=coords,
             output_coords=output_coords,
             is_transposed=True,
+            kernel_size=scale_factor,
+            stride=scale_factor,
         )
     output_coords = neighbor_cache.output_coords
     sparse_out_shape = neighbor_cache.output_sparse_shape
@@ -189,7 +191,6 @@ def sparse_upsample(
         #     grid = output_coords.float() * grid_mul + grid_add
         # Batch lanes use scale=1, offset=0 (pass-through); 
         # spatial lanes encode the chosen align_corners formula.
-        sparse_dim = coords.shape[1]
         B = sparse_dim - D_spatial
         spatial_in = sparse_in_shape[-D_spatial:]
         if align_corners:

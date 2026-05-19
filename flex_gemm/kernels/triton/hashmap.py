@@ -6,6 +6,8 @@ from torch import Tensor
 
 import triton
 import triton.language as tl
+from .utils import index_set_arange_, pad_to_size_along_dim
+
 
 __all__ = [
     'hashmap_build',
@@ -16,29 +18,6 @@ __all__ = [
 
 HASHMAP_LOAD_FACTOR = 0.3
 
-
-def pad_to_size_along_dim(x: Tensor, dim: int | tuple[int, ...], size: int | tuple[int, ...], value: Number = 0., side: Literal['left', 'right'] = 'right') -> Tensor:
-    "Pad the specified dimension of the tensor to the next power of two with zeros."
-    if isinstance(dim, int):
-        dim = (dim,)
-    if isinstance(size, int):
-        size = (size,)
-    if len(dim) == 1 and len(size) > 1:
-        size = size * len(dim)
-    if len(dim) > 1 and len(size) == 1:
-        size = size * len(dim)
-    assert len(dim) == len(size), f"dim and size must have the same length. Got {len(dim)} and {len(size)} respectively."
-    
-    pad_size = [0] * x.dim()
-    for d, s in zip(dim, size):
-        pad_size[d] = max(0, s - x.shape[d])
-    if any(p > 0 for p in pad_size):
-        x = torch.nn.functional.pad(
-            x, 
-            tuple(itertools.chain.from_iterable((0, p) if side == 'right' else (p, 0) for p in reversed(pad_size))), 
-            value=value
-        )
-    return x
 
 @triton.jit
 def _reduce_all(x, axis=None):
@@ -52,13 +31,37 @@ def _reduce_any(x, axis=None):
 @triton.jit
 def _vec_load(ptr: tl.pointer_type, mask: tl.tensor, D: tl.constexpr) -> tl.tensor:
     "Load a vector key from memory given a pointer."
-    vec = tl.load(tl.expand_dims(ptr, -1) + tl.arange(0, D), mask=tl.expand_dims(mask, -1), other=0)
+    # Hint that the per-row inner D-element load is contiguous and aligned,
+    # so Triton can emit a single wide LDG (e.g. LDG.128 for D=4 int32) per
+    # (m,v) lane instead of D scalar LDG.32 ops.
+    inner = tl.max_contiguous(tl.multiple_of(tl.arange(0, D), D), D)
+    vec = tl.load(tl.expand_dims(ptr, -1) + inner, mask=tl.expand_dims(mask, -1), other=0)
     return vec
 
 
 @triton.jit
 def _vec_hash_32bit(vec: tl.tensor, D: tl.constexpr) -> tl.tensor:
-    # Per-index multipliers and a single accumulator keep mixing strong with fewer ops.
+    if D == 1:
+        # scalar hash
+        h = tl.reshape(vec, vec.shape[:-1]).to(tl.uint32)
+        h ^= h >> 16
+        h *= 0x7FEB352D
+        h ^= h >> 15
+        h *= 0x846CA68B
+        h ^= h >> 16
+        return h.to(tl.int32)
+
+    if D == 2:
+        # pack to int64 hash
+        h64 = tl.sum(vec.to(tl.uint32).to(tl.uint64) << (tl.arange(0, 2).to(tl.uint64) * 32), axis=-1)
+        h64 ^= h64 >> 33
+        h64 *= 0xFF51AFD7ED558CCD
+        h64 ^= h64 >> 33
+        h64 *= 0xC4CEB9FE1A85EC53
+        h64 ^= h64 >> 33
+        return (h64 ^ (h64 >> 32)).to(tl.int32)
+    
+    # Vectorized hash
     idx = tl.arange(0, D)
     seed = idx.to(tl.uint32) + 0x9E3779B9
     seed = (seed ^ (seed >> 16)) * 0x7FEB352D
@@ -79,6 +82,24 @@ def _vec_hash_32bit(vec: tl.tensor, D: tl.constexpr) -> tl.tensor:
     h *= 0x846CA68B
     h ^= h >> 16
     return h.to(tl.int32)
+
+
+@triton.jit
+def _scalar_hash_32bit(v: tl.tensor) -> tl.tensor:
+    """Murmur-like mixer for a single 32-bit key.
+
+    Used by the ``D_32 == 1`` fast path in the build/lookup/unique kernels, where
+    the caller has serialized a multi-dim coordinate into a single int32 (e.g.
+    ``neighbor_map`` collapses a 4D coordinate by ``shape``). Avoids the vector
+    seed-array & reduce-sum overhead of ``_vec_hash_32bit``.
+    """
+    v = v.to(tl.uint32)
+    v ^= v >> 16
+    v *= 0x7FEB352D
+    v ^= v >> 15
+    v *= 0x846CA68B
+    v ^= v >> 16
+    return v.to(tl.int32)
 
 
 @triton.jit
@@ -132,8 +153,12 @@ def _hashmap_build_kernel_32bit(
     # Compute hash and stored value: upper bits are the tag, lower bits
     # are the key's index. (index must be < hashmap_size, which the host
     # ensures by sizing the table for load factor 0.3.)
-    key_vec = _vec_load(keys_ptr_32 + idx * D_32, mask=mask, D=D_32)
-    hash_val = _vec_hash_32bit(key_vec, D=D_32)
+    if D_32 == 1:
+        key = tl.load(keys_ptr_32 + idx, mask=mask, other=0)
+        hash_val = _scalar_hash_32bit(key)
+    else:
+        key_vec = _vec_load(keys_ptr_32 + idx * D_32, mask=mask, D=D_32)
+        hash_val = _vec_hash_32bit(key_vec, D=D_32)
     store_val = (hash_val & TAG_BIT_MASK) | idx
 
     # Linear-probe insertion loop. Inactive lanes feed an expected value
@@ -177,11 +202,16 @@ def _hashmap_lookup_inline_32bit(
     SLOT_BIT_MASK = tl.cast(hashmap_size - 1, tl.int32)
     TAG_BIT_MASK = (~SLOT_BIT_MASK) & 0x7FFF_FFFF
 
-    hash_val = _vec_hash_32bit(query_vec_32, D=D_32)
+    if D_32 == 1:
+        query = tl.reshape(query_vec_32, *query_vec_32.shape[:-1])
+        hash_val = _scalar_hash_32bit(query)
+    else:
+        query = query_vec_32
+        hash_val = _vec_hash_32bit(query_vec_32, D=D_32)
     query_tag = hash_val & TAG_BIT_MASK
 
-    is_active = tl.broadcast_to(mask, query_vec_32.shape[:-1])
-    found_idx = tl.full(query_vec_32.shape[:-1], -1, tl.int32)
+    is_active = tl.broadcast_to(mask, hash_val.shape)
+    found_idx = tl.full(hash_val.shape, -1, tl.int32)
 
     # Probing loop. The N-probe bound below is enough to guarantee that an
     # existing key is found; if the map is full and the key is absent we
@@ -201,9 +231,13 @@ def _hashmap_lookup_inline_32bit(
         stored_tag = stored_val & TAG_BIT_MASK
         # First compare tags
         is_match = is_active & (stored_tag == query_tag)
-        # Then compare full keys
-        key_vec = _vec_load(keys_ptr_32 + stored_idx * D_32, mask=is_match, D=D_32)
-        is_match &= _reduce_all(key_vec == query_vec_32, axis=-1)
+        # Then load and compare full keys
+        if D_32 == 1:
+            stored_key = tl.load(keys_ptr_32 + stored_idx, mask=is_match, other=0)
+            is_match &= (stored_key == query)
+        else:
+            key_vec = _vec_load(keys_ptr_32 + stored_idx * D_32, mask=is_match, D=D_32)
+            is_match &= _reduce_all(key_vec == query, axis=-1)
 
         # Update found indices
         success = is_match & is_active
@@ -284,8 +318,13 @@ def _hashmap_unique_kernel_32bit(
     TAG_BIT_MASK = (~SLOT_BIT_MASK) & 0x7FFF_FFFF
 
     # Compute hash and per-lane stored value.
-    key_vec = _vec_load(keys_ptr_32 + idx * D_32, mask=mask, D=D_32)
-    hash_val = _vec_hash_32bit(key_vec, D=D_32)
+    if D_32 == 1:
+        # Scalar fast path -- mirrors the build/lookup kernels.
+        key_vec = tl.load(keys_ptr_32 + idx, mask=mask, other=0)
+        hash_val = _scalar_hash_32bit(key_vec)
+    else:
+        key_vec = _vec_load(keys_ptr_32 + idx * D_32, mask=mask, D=D_32)
+        hash_val = _vec_hash_32bit(key_vec, D=D_32)
     my_tag = hash_val & TAG_BIT_MASK
     store_val = my_tag | idx
 
@@ -308,17 +347,18 @@ def _hashmap_unique_kernel_32bit(
         prev_tag = prev & TAG_BIT_MASK
         prev_idx = prev & SLOT_BIT_MASK
         tag_match = active & (prev_tag == my_tag)
-        existing_key = _vec_load(keys_ptr_32 + prev_idx * D_32, mask=tag_match, D=D_32)
-        full_match = tag_match & _reduce_all(existing_key == key_vec, axis=-1)
+        if D_32 == 1:
+            existing_key = tl.load(keys_ptr_32 + prev_idx, mask=tag_match, other=0)
+            full_match = tag_match & (existing_key == key_vec)
+        else:
+            existing_key = _vec_load(keys_ptr_32 + prev_idx * D_32, mask=tag_match, D=D_32)
+            full_match = tag_match & _reduce_all(existing_key == key_vec, axis=-1)
         found_idx = tl.where(full_match, prev_idx, found_idx)
         active &= ~full_match
 
         # Linear-probe advance. Unconditional ``+ 1`` is fine: settled lanes
         # will just do a no-op CAS on the next slot.
         target_slot = (target_slot + 1) & SLOT_BIT_MASK
-        # Bound iteration count to avoid an infinite spin if the caller
-        # mis-sized the table; ``hashmap_unique`` sizes for load factor 0.3
-        # so this guard is purely defensive.
         probes += 1
 
     # Sanity check: every key must have either claimed a slot or matched an
@@ -542,7 +582,7 @@ def hashmap_unique(
         D=D_32,
         BLOCK_SIZE=BLOCK_SIZE,
     )
-
+    
     unique_indices = is_canonical.nonzero(as_tuple=True)[0].to(torch.int32)
     num_uniques = unique_indices.shape[0]
     unique_keys = keys[unique_indices]

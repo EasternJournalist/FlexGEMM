@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 from ....autotuner import triton_autotune
+from ..utils import autotune_size_bucket
 from . import config
 
 
@@ -187,7 +188,7 @@ def index_weighted_sum_fwd(
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
     assert indices.shape == weight.shape, "Indices and weight must have the same shape"
     N, M, C, V = input.shape[0], indices.shape[0], input.shape[1], weight.shape[1]
-    LOGN = int(math.log2(N))
+    LOGN = autotune_size_bucket(N)
     # Allocate output matrix output.
     output = torch.empty((M, C), device=input.device, dtype=input.dtype)
     weight_sum = torch.empty((M,), device=input.device, dtype=torch.float32)
@@ -227,7 +228,7 @@ def index_weighted_sum_bwd_input(
         # Pass a tiny placeholder when not normalizing — the kernel won't read it.
         weight_sum = torch.empty(0, device=grad_output.device, dtype=torch.float32)
     M, C, V = indices.shape[0], grad_output.shape[-1], weight.shape[1]
-    LOGN = int(math.log2(N))
+    LOGN = autotune_size_bucket(N)
     # Allocate output matrix output.
     grad_input = torch.zeros((N, C), device=grad_output.device, dtype=grad_output.dtype)
     # Launch the kernel.

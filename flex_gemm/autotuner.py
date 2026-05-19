@@ -82,6 +82,13 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
         )
         self._cache_key = _get_function_cache_key(fn)
         self._call_count = 0
+        # Per-tuning-key timing metadata: {key: {"winner_ms": float,
+        # "runner_ups": [{"config": str, "ms": float, "slowdown_pct": float}, ...]}}
+        # Used for offline analysis of pruning safety (how close are the
+        # runner-ups to the winner). Persisted alongside `self.cache` but in
+        # a sibling namespace so the existing on-disk format stays
+        # backward-compatible.
+        self.timings_meta: Dict[str, dict] = {}
         _register_autotuner(self)
 
     def run(self, *args, **kwargs):
@@ -117,6 +124,7 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
                     bench_end = time.time()
                     self.bench_time = bench_end - bench_start
                     self.cache[key] = builtins.min(timings, key=timings.get)
+                    self.timings_meta[key] = _summarize_timings(timings, self.cache[key])
                     full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                     self.pre_hook(full_nargs, reset_only=True)
                     self.configs_timings = timings
@@ -280,6 +288,7 @@ class PersistentCacheAutoTuner:
         self.verbose = verbose or os.getenv('FLEX_GEMM_AUTOTUNER_VERBOSE', '0') == '1'
         self.kernel_arg_names = inspect.getfullargspec(kernel).args
         self.cache = {}
+        self.timings_meta: Dict[str, dict] = {}
         self._cache_key = _get_function_cache_key(kernel)
         self._call_count = 0
         _register_autotuner(self)
@@ -321,7 +330,7 @@ class PersistentCacheAutoTuner:
                 if self.verbose:
                     print(f"Running autotuning for {self.kernel.__name__} with key {key}")
                     print(f"Configs: {configs}")
-                best_config = self._benchmark(args, kwargs, configs)
+                best_config = self._benchmark(args, kwargs, configs, key=key)
                 if self.verbose:
                     print(f"Best config for {self.kernel.__name__} with key {key}: {best_config}")
                 self.cache[key] = best_config
@@ -333,10 +342,11 @@ class PersistentCacheAutoTuner:
         # Run the kernel with the best config
         return self.kernel(*args, **kwargs, **chosen_config)
     
-    def _benchmark(self, args, kwargs, configs):
+    def _benchmark(self, args, kwargs, configs, key=None):
         best_time = float('inf')
         best_config = None
-        
+        timings: Dict = {}
+
         if len(configs) == 1:
             best_config = configs[0]
         else:
@@ -352,11 +362,18 @@ class PersistentCacheAutoTuner:
                 elapsed = (time.time() - start) / self.runs
                 if self.verbose:
                     print(f"Config {config}: {elapsed} seconds")
+                # Cast tuple/list configs to a hashable key for the timings dict.
+                cfg_key = tuple(sorted(config.items())) if isinstance(config, dict) else config
+                timings[cfg_key] = elapsed * 1000.0  # ms
                 # Update the best config if the execution time is better
                 if elapsed < best_time:
                     best_time = elapsed
                     best_config = config
-        
+            if key is not None and timings:
+                # Find the winner's hashable key.
+                win_key = tuple(sorted(best_config.items())) if isinstance(best_config, dict) else best_config
+                self.timings_meta[key] = _summarize_timings(timings, win_key)
+
         return best_config
     
 
@@ -397,6 +414,58 @@ def walk_package(package_name, fn):
 
 _AUTOTUNE_REGISTRY = {}
 _PENDING_AUTOTUNE_CACHE = None
+
+# Sibling namespace suffix appended to a kernel's cache_key when persisting
+# per-tuning-key timing metadata (winner ms + top runner-ups). Kept separate
+# from the primary config cache so the existing on-disk format keeps loading
+# unchanged for older readers.
+_META_KEY_SUFFIX = "::meta"
+# How many runner-ups to record per tuning key (after the winner).
+_META_RUNNER_UPS = 2
+
+
+def _bench_value_to_ms(v):
+    """Normalize the value returned by ``Autotuner._bench`` to a float (ms).
+    Some Triton versions return a tuple (e.g. quantiles); take the first."""
+    if isinstance(v, (tuple, list)):
+        return float(v[0])
+    return float(v)
+
+
+def _config_signature(config):
+    """Stable, JSON-safe string identifying a triton.Config for cache
+    introspection."""
+    try:
+        return str(config)
+    except Exception:
+        return repr(config)
+
+
+def _summarize_timings(timings, winner):
+    """Build a JSON-safe summary of the top configs from a ``{config: ms}``
+    timings dict, anchored on ``winner``."""
+    items = sorted(
+        ((cfg, _bench_value_to_ms(v)) for cfg, v in timings.items()),
+        key=lambda x: x[1],
+    )
+    if not items:
+        return {"winner_ms": None, "runner_ups": []}
+    winner_ms = _bench_value_to_ms(timings[winner])
+    runner_ups = []
+    skipped_winner = False
+    for cfg, ms in items:
+        if not skipped_winner and (cfg is winner or cfg == winner):
+            skipped_winner = True
+            continue
+        slowdown = (ms - winner_ms) / winner_ms * 100.0 if winner_ms > 0 else float("inf")
+        runner_ups.append({
+            "config": _config_signature(cfg),
+            "ms": ms,
+            "slowdown_pct": slowdown,
+        })
+        if len(runner_ups) >= _META_RUNNER_UPS:
+            break
+    return {"winner_ms": winner_ms, "runner_ups": runner_ups}
 
 
 def _unwrap_to_user_fn(fn):
@@ -463,15 +532,19 @@ def _apply_cache_to_tuner(tuner, cache, device_name):
     cache_key = getattr(tuner, "_cache_key", None)
     if cache_key is None:
         return
-    if cache_key not in cache.get(device_name, {}):
-        return
-    cached_value = cache[device_name][cache_key]
-    if isinstance(tuner, PersistentCacheAutoTuner):
-        tuner.cache = cached_value
-    elif isinstance(tuner, TritonPersistentCacheAutotuner):
-        for k, v in cached_value.items():
-            tuner.cache[k] = triton.runtime.Config(None)
-            tuner.cache[k].__dict__.update(v)
+    device_cache = cache.get(device_name, {})
+    if cache_key in device_cache:
+        cached_value = device_cache[cache_key]
+        if isinstance(tuner, PersistentCacheAutoTuner):
+            tuner.cache = cached_value
+        elif isinstance(tuner, TritonPersistentCacheAutotuner):
+            for k, v in cached_value.items():
+                tuner.cache[k] = triton.runtime.Config(None)
+                tuner.cache[k].__dict__.update(v)
+    # Restore sibling meta (optional; absence is fine for legacy caches).
+    meta_value = device_cache.get(cache_key + _META_KEY_SUFFIX)
+    if meta_value and hasattr(tuner, "timings_meta"):
+        tuner.timings_meta.update(meta_value)
 
 
 def _register_autotuner(tuner):
@@ -497,6 +570,9 @@ def get_autotune_cache():
             cache[device_name][cache_key] = tuner.cache
         elif isinstance(tuner, TritonPersistentCacheAutotuner):
             cache[device_name][cache_key] = {k: v.__dict__ for k, v in tuner.cache.items()}
+        meta = getattr(tuner, "timings_meta", None)
+        if meta:
+            cache[device_name][cache_key + _META_KEY_SUFFIX] = dict(meta)
 
     return cache
 

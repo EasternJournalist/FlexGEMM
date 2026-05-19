@@ -60,10 +60,11 @@ class SubmanifoldPool(nn.Module):
         self,
         feats: Tensor,
         coords: Tensor,
+        shape: torch.Size,
         neighbor_cache: NeighborCache | None = None,
     ) -> tuple[Tensor, NeighborCache]:
         return submanifold_pool(
-            feats, coords, self.kernel_size, self.reduce, neighbor_cache,
+            feats, coords, shape, self.kernel_size, self.reduce, neighbor_cache,
         )
 
     def extra_repr(self) -> str:

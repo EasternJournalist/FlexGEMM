@@ -3,7 +3,7 @@ import math
 import torch
 import triton
 import triton.language as tl
-from ..utils import get_num_sm
+from ..utils import get_num_sm, autotune_size_bucket
 from ....autotuner import triton_autotune, autotune
 from . import config
 from .... import config as _global_config
@@ -217,7 +217,7 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk_configs(input, weight, bias, nei
 
 def sparse_conv_fwd_masked_implicit_gemm_splitk_keys(input, weight, bias, neighbor, sorted_idx, valid_kernel, valid_kernel_seg, **kwargs):
     N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
-    return f'(2^{int(math.log2(N))}, 2^{int(math.log2(M))}, {Ci}, {Co}, {V})'
+    return f'(B{autotune_size_bucket(N)}, B{autotune_size_bucket(M)}, {Ci}, {Co}, {V})'
 
 
 @autotune(
@@ -235,14 +235,22 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk(
     SPLITK: int = 1,
     TRANSPOSE_WEIGHT: bool = False,
     FLIP_WEIGHT: bool = False,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
-    assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
+    if TRANSPOSE_WEIGHT:
+        assert input.shape[1] == weight.shape[0], "Incompatible dimensions"
+    else:
+        assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
     assert fwd_neighbor_map.is_contiguous(), "Matrix neighbor must be contiguous"
-    N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    N, M, V = input.shape[0], fwd_neighbor_map.shape[0], weight.shape[1]
+    Ci = input.shape[1]
+    Co = weight.shape[2] if TRANSPOSE_WEIGHT else weight.shape[0]
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
     # Launch the kernel.
     if SPLITK == 1:
         output = torch.empty((M, Co), device=input.device, dtype=input.dtype)
@@ -252,7 +260,7 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk(
             M, LOGN, LOGM, Ci, Co, V,
             valid_kernel=fwd_valid_kernel,
             valid_kernel_seg=fwd_valid_kernel_seg,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            allow_tf32=allow_tf32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
             FLIP_WEIGHT=FLIP_WEIGHT,
         )
@@ -266,7 +274,7 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk(
             valid_kernel=fwd_valid_kernel,
             valid_kernel_seg=fwd_valid_kernel_seg,
             SPLITK=SPLITK,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            allow_tf32=allow_tf32,
             TRANSPOSE_WEIGHT=TRANSPOSE_WEIGHT,
             FLIP_WEIGHT=FLIP_WEIGHT,
         )
@@ -290,7 +298,7 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk_configs(grad_output, inpu
 
 def sparse_conv_bwd_weight_masked_implicit_gemm_splitk_keys(grad_output, input, valid_signal_i, valid_signal_o, valid_signal_seg, **kwargs):
     N, M, Ci, Co, V = input.shape[0], grad_output.shape[0], input.shape[1], grad_output.shape[1], valid_signal_seg.shape[0] - 1
-    return f'(2^{int(math.log2(N))}, 2^{int(math.log2(M))}, {Ci}, {Co}, {V})'
+    return f'(B{autotune_size_bucket(N)}, B{autotune_size_bucket(M)}, {Ci}, {Co}, {V})'
 
 
 @autotune(
@@ -304,10 +312,13 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
     fwd_valid_signal_o: torch.Tensor,
     fwd_valid_signal_seg: torch.Tensor,
     SPLITK: int = 1,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
     N, M, Ci, Co, V = input.shape[0], grad_output.shape[0], input.shape[1], grad_output.shape[1], fwd_valid_signal_seg.shape[0] - 1
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
     
     # Launch the kernel.
     if SPLITK == 1:
@@ -320,7 +331,7 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
             fwd_valid_signal_seg,
             grad_weight,
             M, LOGN, LOGM, Ci, Co, V,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            allow_tf32=allow_tf32,
         )
         return grad_weight
     else:
@@ -334,7 +345,7 @@ def sparse_conv_bwd_weight_masked_implicit_gemm_splitk(
             grad_weight,
             M, LOGN, LOGM, Ci, Co, V,
             SPLITK=SPLITK,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            allow_tf32=allow_tf32,
         )
         return grad_weight.sum(0).to(input.dtype)
     
@@ -352,6 +363,7 @@ def sparse_conv_bwd_input_masked_implicit_gemm_splitk(
     bwd_sorted_idx: Optional[torch.Tensor] = None,
     bwd_valid_kernel: Optional[Callable[[int], torch.Tensor]] = None,
     bwd_valid_kernel_seg: Optional[Callable[[int], torch.Tensor]] = None,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     Backward to input for sparse convolution using split-K masked implicit GEMM.
@@ -380,6 +392,7 @@ def sparse_conv_bwd_input_masked_implicit_gemm_splitk(
             grad_output, weight, None, neighbor_map,
             TRANSPOSE_WEIGHT=True,
             FLIP_WEIGHT=symmetric,
+            allow_tf32=allow_tf32,
         )
     else:
         grad_input = sparse_conv_fwd_masked_implicit_gemm_splitk(
@@ -387,5 +400,6 @@ def sparse_conv_bwd_input_masked_implicit_gemm_splitk(
             valid_kernel_cb, valid_kernel_seg_cb,
             TRANSPOSE_WEIGHT=True,
             FLIP_WEIGHT=symmetric,
+            allow_tf32=allow_tf32,
         )
     return grad_input

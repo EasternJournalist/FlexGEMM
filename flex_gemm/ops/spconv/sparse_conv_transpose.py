@@ -132,6 +132,7 @@ def sparse_conv_transpose(
     output_shape: torch.Size | None = None,
     neighbor_cache: NeighborCacheT | None = None,
     algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
 ) -> Tuple[Tensor, Tensor, torch.Size, NeighborCacheT]:
     """Dispatch on (kernel parameterization). See the two overloads above."""
     assert coords.is_contiguous(), "Coords should be contiguous"
@@ -142,8 +143,9 @@ def sparse_conv_transpose(
     sparse_out_shape = split_sparse_shape(output_shape, sparse_dim)
 
     # When a neighbor_cache is supplied, ``input_shape`` / ``output_shape`` /
-    # ``output_coords`` are filled in from it. Kernel topology is *not*
-    # stored on the cache — the caller must supply it on every call.
+    # ``output_coords`` are filled in from it. Kernel topology is recorded
+    # on the cache by :func:`build_neighbor_cache` and re-validated against
+    # the op's args via :meth:`NeighborCache.assert_match` further below.
     if neighbor_cache is not None:
         assert neighbor_cache.is_transposed, (
             "sparse_conv_transpose requires a NeighborCacheT (got a forward "
@@ -187,6 +189,9 @@ def sparse_conv_transpose(
                 input_coords=coords,
                 output_coords=output_coords,
                 is_transposed=True,
+                kernel_size=kernel_size,
+                dilation=dilation,
+                stride=stride,
             )
         weight_v = weight.flatten(1, -2)
     else:
@@ -224,12 +229,15 @@ def sparse_conv_transpose(
                 input_coords=coords,
                 output_coords=output_coords,
                 is_transposed=True,
+                kernel_delta=kernel_delta,
+                stride=stride,
+                offset=offset,
             )
         weight_v = weight
 
     SparseConvFunc = _select_function(algorithm)
     output_feats, neighbor_cache = SparseConvFunc.apply(
-        feats, neighbor_cache, weight_v, bias,
+        feats, neighbor_cache, weight_v, bias, allow_tf32,
     )
     # Reassemble full channel-last output shape: sparse prefix from cache
     # + C_out from output features.
@@ -254,7 +262,7 @@ def sparse_conv_transpose(
 def _sparse_conv_transpose_nd(
     D, feats, coords, shape, weight, bias,
     kernel_delta, stride, dilation, padding, offset,
-    output_coords, output_shape, neighbor_cache, algorithm,
+    output_coords, output_shape, neighbor_cache, algorithm, allow_tf32,
 ):
     stride   = _broadcast_dim_arg(stride,   D, "stride")
     dilation = _broadcast_dim_arg(dilation, D, "dilation")
@@ -266,6 +274,7 @@ def _sparse_conv_transpose_nd(
         stride=stride, dilation=dilation, padding=padding, offset=offset,
         output_coords=output_coords, output_shape=output_shape,
         neighbor_cache=neighbor_cache, algorithm=algorithm,
+        allow_tf32=allow_tf32,
     )
 
 
@@ -316,11 +325,12 @@ def sparse_conv_transpose2d(
     feats, coords, shape, weight, bias, *,
     kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
     output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+    allow_tf32=None,
 ):
     return _sparse_conv_transpose_nd(
         2, feats, coords, shape, weight, bias,
         kernel_delta, stride, dilation, padding, offset,
-        output_coords, output_shape, neighbor_cache, algorithm,
+        output_coords, output_shape, neighbor_cache, algorithm, allow_tf32,
     )
 
 
@@ -371,11 +381,12 @@ def sparse_conv_transpose3d(
     feats, coords, shape, weight, bias, *,
     kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
     output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+    allow_tf32=None,
 ):
     return _sparse_conv_transpose_nd(
         3, feats, coords, shape, weight, bias,
         kernel_delta, stride, dilation, padding, offset,
-        output_coords, output_shape, neighbor_cache, algorithm,
+        output_coords, output_shape, neighbor_cache, algorithm, allow_tf32,
     )
 
 
@@ -420,9 +431,10 @@ def sparse_conv_transpose4d(
     feats, coords, shape, weight, bias, *,
     kernel_delta=None, stride=None, dilation=None, padding=None, offset=None,
     output_coords=None, output_shape=None, neighbor_cache=None, algorithm=None,
+    allow_tf32=None,
 ):
     return _sparse_conv_transpose_nd(
         4, feats, coords, shape, weight, bias,
         kernel_delta, stride, dilation, padding, offset,
-        output_coords, output_shape, neighbor_cache, algorithm,
+        output_coords, output_shape, neighbor_cache, algorithm, allow_tf32,
     )

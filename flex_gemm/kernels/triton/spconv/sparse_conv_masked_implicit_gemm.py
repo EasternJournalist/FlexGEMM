@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 from ....autotuner import triton_autotune
+from ..utils import autotune_size_bucket
 from . import config
 from .... import config as _global_config
 from .sparse_conv_implicit_gemm import sparse_conv_implicit_gemm_kernel
@@ -196,14 +197,17 @@ def sparse_conv_fwd_masked_implicit_gemm(
     fwd_sorted_idx: torch.Tensor,
     fwd_valid_kernel: Callable[[int], torch.Tensor],
     fwd_valid_kernel_seg: Callable[[int], torch.Tensor],
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
     assert input.shape[1] == weight.shape[2], "Incompatible dimensions"
     assert input.is_contiguous(), "Matrix input must be contiguous"
     assert weight.is_contiguous(), "Matrix weight must be contiguous"
     assert fwd_neighbor_map.is_contiguous(), "Matrix neighbor must be contiguous"
     N, M, Ci, Co, V = input.shape[0], fwd_neighbor_map.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
     # Allocate output matrix output.
     output = torch.empty((M, Co), device=input.device, dtype=input.dtype)
     # Launch the kernel.
@@ -213,7 +217,7 @@ def sparse_conv_fwd_masked_implicit_gemm(
         M, LOGN, LOGM, Ci, Co, V,
         valid_kernel=fwd_valid_kernel,
         valid_kernel_seg=fwd_valid_kernel_seg,
-        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+        allow_tf32=allow_tf32,
     )
     return output
 
@@ -231,6 +235,7 @@ def sparse_conv_bwd_input_masked_implicit_gemm(
     bwd_sorted_idx: Optional[torch.Tensor] = None,
     bwd_valid_kernel: Optional[Callable[[int], torch.Tensor]] = None,
     bwd_valid_kernel_seg: Optional[Callable[[int], torch.Tensor]] = None,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
     """
     Backward to input for sparse convolution using masked implicit GEMM.
@@ -239,6 +244,8 @@ def sparse_conv_bwd_input_masked_implicit_gemm(
     ``fwd_*`` cache; the weight matrix is internally flipped along the V dimension
     so the forward cache is reused. Otherwise, pass the ``bwd_*`` cache.
     """
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
     if symmetric:
         assert fwd_neighbor_map is not None, "symmetric=True requires fwd_neighbor_map"
         assert bwd_neighbor_map is None and bwd_sorted_idx is None \
@@ -267,18 +274,18 @@ def sparse_conv_bwd_input_masked_implicit_gemm(
     if sorted_idx is None:
         sparse_conv_implicit_gemm_kernel[grid](
             grad_output, weight, None, neighbor_map, grad_input,
-            N, int(math.log2(M)), int(math.log2(N)), Co, Ci, V,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            N, autotune_size_bucket(M), autotune_size_bucket(N), Co, Ci, V,
+            allow_tf32=allow_tf32,
             TRANSPOSE_WEIGHT=True,
             FLIP_WEIGHT=symmetric,
         )
     else:
         sparse_conv_masked_implicit_gemm_kernel[grid](
             grad_output, weight, None, neighbor_map, sorted_idx, grad_input,
-            N, int(math.log2(M)), int(math.log2(N)), Co, Ci, V,
+            N, autotune_size_bucket(M), autotune_size_bucket(N), Co, Ci, V,
             valid_kernel=valid_kernel_cb,
             valid_kernel_seg=valid_kernel_seg_cb,
-            allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+            allow_tf32=allow_tf32,
             TRANSPOSE_WEIGHT=True,
             FLIP_WEIGHT=symmetric,
         )
@@ -291,14 +298,17 @@ def sparse_conv_bwd_weight_masked_implicit_gemm(
     fwd_valid_signal_i: torch.Tensor,
     fwd_valid_signal_o: torch.Tensor,
     fwd_valid_signal_seg: torch.Tensor,
+    allow_tf32: Optional[bool] = None,
 ) -> torch.Tensor:
+    if allow_tf32 is None:
+        allow_tf32 = _global_config.SPCONV_ALLOW_TF32
     Co = grad_output.shape[1]
     Ci = input.shape[1]
     V = fwd_valid_signal_seg.shape[0] - 1
     M = grad_output.shape[0]
     N = input.shape[0]
-    LOGN = int(math.log2(N))
-    LOGM = int(math.log2(M))
+    LOGN = autotune_size_bucket(N)
+    LOGM = autotune_size_bucket(M)
     
     grad_weight = torch.empty((Co, V, Ci), device=grad_output.device, dtype=grad_output.dtype)
     grid = lambda META: (triton.cdiv(Co, META['B1']) * triton.cdiv(Ci, META['B2']) * V,)
@@ -309,6 +319,6 @@ def sparse_conv_bwd_weight_masked_implicit_gemm(
         fwd_valid_signal_seg,
         grad_weight,
         M, LOGN, LOGM, Ci, Co, V,
-        allow_tf32=_global_config.SPCONV_ALLOW_TF32,
+        allow_tf32=allow_tf32,
     )
     return grad_weight

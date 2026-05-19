@@ -11,8 +11,8 @@ from ..hashmap import (
     hashmap_build, 
     _hashmap_lookup_inline_32bit, 
     _vec_load, 
-    pad_to_size_along_dim, 
 )
+from ..utils import pad_to_size_along_dim
 
 
 __all__ = [
@@ -22,7 +22,7 @@ __all__ = [
 ]
 
 
-
+# ================ helper inline functions ========================
 @triton.jit
 def _hashmap_find_store_neighbor_map_inline(
     hashmap_ptr: tl.pointer_type,
@@ -88,7 +88,24 @@ def _hashmap_prepare_offs_masks_inline(
     return offs_M, mask_M, offs_V, mask_V
 
 
-# ===== Arbitrary neighbor offsets ======
+
+@triton.jit
+def _make_conv_delta_inline(
+    idx: tl.tensor,
+    kernel_size_vec: tl.tensor,
+    kernel_dilation_vec: tl.tensor,
+    dtype=tl.int32
+) -> tl.tensor:
+    idx = idx.to(dtype)
+    kernel_size_vec = kernel_size_vec.to(dtype)
+    kernel_dilation_vec = kernel_dilation_vec.to(dtype)
+
+    kernel_stride_vec = tl.cumprod(kernel_size_vec, 0, reverse=True) // kernel_size_vec
+    delta = ((idx[:, None] // kernel_stride_vec) % kernel_size_vec - ((kernel_size_vec - 1) >> 1)) * kernel_dilation_vec
+    return delta
+
+
+# ===== Arbitrary kernel delta ======
 @triton.jit
 def _hashmap_build_neighbor_map_from_kernel_delta_kernel(
     hashmap_ptr: tl.tensor,
@@ -147,23 +164,6 @@ def _make_4d_vec_inline(x0, x1, x2, x3, dtype=tl.int32) -> tl.tensor:
     vec = tl.where(idx == 2, x2, vec)
     vec = tl.where(idx == 3, x3, vec)
     return vec
-
-
-@triton.jit
-def _make_conv_delta_4d_inline(
-    idx: tl.tensor,
-    K0, K1, K2, K3, 
-    KD0, KD1, KD2, KD3,
-    dtype=tl.int32
-) -> tl.tensor:
-    kernel_size_vec = _make_4d_vec_inline(K0, K1, K2, K3, dtype=dtype)
-    kernel_dilation_vec = _make_4d_vec_inline(KD0, KD1, KD2, KD3, dtype=dtype)
-    kernel_stride_vec = _make_4d_vec_inline(K1 * K2 * K3, K2 * K3, K3, 1, dtype=dtype)
-
-    idx = idx.to(dtype)
-    delta_vec = ((idx[:, None] // kernel_stride_vec) % kernel_size_vec - (kernel_size_vec - 1) // 2) * kernel_dilation_vec
-
-    return delta_vec
 
 
 @triton.jit
@@ -229,21 +229,7 @@ def _hashmap_build_neighbor_map_kernel_size_dilation_4d_triton_kernel(
     )
 
 
-@triton.jit
-def _make_conv_delta_inline(
-    idx: tl.tensor,
-    kernel_size_vec: tl.tensor,
-    kernel_dilation_vec: tl.tensor,
-    dtype=tl.int32
-) -> tl.tensor:
-    idx = idx.to(dtype)
-    kernel_size_vec = kernel_size_vec.to(dtype)
-    kernel_dilation_vec = kernel_dilation_vec.to(dtype)
-
-    kernel_stride_vec = tl.cumprod(kernel_size_vec, 0, reverse=True) // kernel_size_vec
-    delta = ((idx[:, None] // kernel_stride_vec) % kernel_size_vec - ((kernel_size_vec - 1) >> 1)) * kernel_dilation_vec
-    return delta
-
+# =========== ND ===========
 
 @triton.jit
 def _hashmap_build_neighbor_map_kernel_size_dilation_triton_kernel(
@@ -369,7 +355,7 @@ def build_neighbor_map_from_kernel_size_dilation(
     offset_D = tuple(offset) + (0,) * (D - orig_D)
     V = math.prod(kernel_size_D)
 
-    # Build hashmap for input coords if not provided
+    # Build hashmap for input coords if not provided.
     if hashmap is None:
         hashmap = hashmap_build(input_coords)
     
@@ -397,7 +383,7 @@ def build_neighbor_map_from_kernel_size_dilation(
         BLOCK_M = max(1, 256 // BLOCK_V)
         grid = (triton.cdiv(M, BLOCK_M), triton.cdiv(V, BLOCK_V))
     
-    if D == 4 and all(k <= 5 for k in kernel_size_D):
+    if D == 4:
         _hashmap_build_neighbor_map_kernel_size_dilation_4d_triton_kernel[grid](
             hashmap_ptr=hashmap,
             hashmap_size=hashmap.shape[0],

@@ -25,13 +25,14 @@ _Algo = Literal[
 def submanifold_conv(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
     dilation: tuple[int, ...] | None = None,
     neighbor_cache: NeighborCache | None = None,
     algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
 ) -> tuple[Tensor, NeighborCache]:
     """Submanifold convolution with a dense ``(kernel_size, dilation)`` kernel.
 
@@ -41,9 +42,7 @@ def submanifold_conv(
     Args:
         feats (Tensor): ``(N, Ci)`` input features.
         coords (Tensor): ``(N, B + Ds)`` input coordinates.
-        shape (Optional[torch.Size]): input dense shape in channel-last layout
-            ``(*batch_dims, S1, ..., SDs, C)``; only consulted by the CUDA
-            extension's hashmap path (which uses the sparse prefix only).
+        shape (torch.Size): input dense shape in channel-last layout ``(*batch_dims, S1, ..., SDs, C)``
         weight (Tensor): ``(Co, K1, ..., KDs, Ci)`` convolution weights.
         bias (Optional[Tensor]): [Co] bias.
         dilation: tuple of length Ds. Defaults to all-1.
@@ -61,7 +60,7 @@ def submanifold_conv(
 def submanifold_conv(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
@@ -69,6 +68,7 @@ def submanifold_conv(
     symmetric: bool | None = None,
     neighbor_cache: NeighborCache | None = None,
     algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
 ) -> tuple[Tensor, NeighborCache]:
     """Submanifold convolution with an arbitrary ``kernel_delta`` kernel.
 
@@ -77,8 +77,7 @@ def submanifold_conv(
     Args:
         feats (Tensor): ``(N, Ci)`` input features.
         coords (Tensor): ``(N, B + Ds)`` input coordinates.
-        shape (Optional[torch.Size]): unused on the kernel_delta path; kept for
-            signature parity with the kernel_size overload.
+        shape (torch.Size): input dense shape in channel-last layout ``(*batch_dims, S1, ..., SDs, C)``
         weight (Tensor): ``(Co, V, Ci)`` convolution weights.
         bias (Optional[Tensor]): [Co] bias.
         kernel_delta (Tensor): ``(V, Ds)`` kernel offsets.
@@ -96,7 +95,7 @@ def submanifold_conv(
 def submanifold_conv(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
@@ -105,6 +104,7 @@ def submanifold_conv(
     symmetric: bool | None = None,
     neighbor_cache: NeighborCache | None = None,
     algorithm: _Algo = None,
+    allow_tf32: bool | None = None,
 ) -> tuple[Tensor, NeighborCache]:
     """Dispatch on (kernel parameterization). See the two overloads above."""
     # Channel-last: cache only stores the sparse prefix of ``shape``.
@@ -129,6 +129,9 @@ def submanifold_conv(
             neighbor_cache.assert_match(
                 input_coords=coords,
                 output_coords=coords,
+                is_transposed=False,
+                kernel_size=kernel_size,
+                dilation=dilation,
             )
         weight_v = weight.flatten(1, -2)
     else:
@@ -155,7 +158,7 @@ def submanifold_conv(
 
     SparseConvFunc = _select_function(algorithm)
     output_feats, neighbor_cache = SparseConvFunc.apply(
-        feats, neighbor_cache, weight_v, bias,
+        feats, neighbor_cache, weight_v, bias, allow_tf32,
     )
     return output_feats, neighbor_cache
 
@@ -176,13 +179,14 @@ def submanifold_conv(
 
 def _submanifold_conv_nd(
     D: int, feats, coords, shape, weight, bias,
-    dilation, kernel_delta, symmetric, neighbor_cache, algorithm,
+    dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
 ):
     dilation = _broadcast_dim_arg(dilation, D, "dilation")
     return submanifold_conv(
         feats, coords, shape, weight, bias,
         dilation=dilation, kernel_delta=kernel_delta, symmetric=symmetric,
         neighbor_cache=neighbor_cache, algorithm=algorithm,
+        allow_tf32=allow_tf32,
     )
 
 
@@ -191,7 +195,7 @@ def _submanifold_conv_nd(
 def submanifold_conv2d(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
@@ -210,7 +214,7 @@ def submanifold_conv2d(
 def submanifold_conv2d(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
@@ -228,11 +232,11 @@ def submanifold_conv2d(
 def submanifold_conv2d(
     feats, coords, shape, weight, bias=None, *,
     dilation=None, kernel_delta=None, symmetric=None,
-    neighbor_cache=None, algorithm=None,
+    neighbor_cache=None, algorithm=None, allow_tf32=None,
 ):
     return _submanifold_conv_nd(
         2, feats, coords, shape, weight, bias,
-        dilation, kernel_delta, symmetric, neighbor_cache, algorithm,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
     )
 
 
@@ -241,7 +245,7 @@ def submanifold_conv2d(
 def submanifold_conv3d(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
@@ -260,7 +264,7 @@ def submanifold_conv3d(
 def submanifold_conv3d(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
@@ -278,11 +282,11 @@ def submanifold_conv3d(
 def submanifold_conv3d(
     feats, coords, shape, weight, bias=None, *,
     dilation=None, kernel_delta=None, symmetric=None,
-    neighbor_cache=None, algorithm=None,
+    neighbor_cache=None, algorithm=None, allow_tf32=None,
 ):
     return _submanifold_conv_nd(
         3, feats, coords, shape, weight, bias,
-        dilation, kernel_delta, symmetric, neighbor_cache, algorithm,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
     )
 
 
@@ -291,7 +295,7 @@ def submanifold_conv3d(
 def submanifold_conv4d(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
@@ -310,7 +314,7 @@ def submanifold_conv4d(
 def submanifold_conv4d(
     feats: Tensor,
     coords: Tensor,
-    shape: torch.Size | None,
+    shape: torch.Size,
     weight: Tensor,
     bias: Tensor | None = None,
     *,
@@ -328,9 +332,9 @@ def submanifold_conv4d(
 def submanifold_conv4d(
     feats, coords, shape, weight, bias=None, *,
     dilation=None, kernel_delta=None, symmetric=None,
-    neighbor_cache=None, algorithm=None,
+    neighbor_cache=None, algorithm=None, allow_tf32=None,
 ):
     return _submanifold_conv_nd(
         4, feats, coords, shape, weight, bias,
-        dilation, kernel_delta, symmetric, neighbor_cache, algorithm,
+        dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
     )
