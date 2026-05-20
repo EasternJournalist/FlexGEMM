@@ -103,13 +103,16 @@ def sparse_conv_implicit_gemm_kernel(
         weight_block = tl.load(weight_ptr, mask=k_mask[:, None], other=0.0)
         # Accumulate along the K dimension.
         accumulator = tl.dot(input_block, weight_block, accumulator, input_precision='tf32' if allow_tf32 else 'ieee')                  # (B1, B2)
-    c = accumulator.to(input.type.element_ty)
-            
-    # add bias
+
+    # Add bias on the fp32 accumulator (before down-casting) so that bias
+    # contributes at full precision even under fp16 / bf16 AMP.
     if HAS_BIAS:
-        bias_block = tl.load(bias + offset_co)
-        c += bias_block[None, :]
-                
+        co_mask = block_id_co * B2 + tl.arange(0, B2) < Co
+        bias_block = tl.load(bias + offset_co, mask=co_mask, other=0.0)
+        accumulator += bias_block[None, :]
+
+    c = accumulator.to(input.type.element_ty)
+
     # Write back the block of the output matrix with masks.
     out_offset_m = block_id_m * B1 + tl.arange(0, B1)
     out_offset_co = block_id_co * B2 + tl.arange(0, B2)

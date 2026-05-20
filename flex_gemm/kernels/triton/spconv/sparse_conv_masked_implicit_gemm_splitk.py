@@ -107,7 +107,8 @@ def sparse_conv_fwd_masked_implicit_gemm_splitk_kernel(
     # add bias
     if HAS_BIAS:
         if block_id_k == 0:
-            bias_block = tl.load(bias + offset_co)
+            co_mask = block_id_co * B2 + tl.arange(0, B2) < Co
+            bias_block = tl.load(bias + offset_co, mask=co_mask, other=0.0)
             accumulator += bias_block[None, :]
                 
     # Write back the block of the output matrix with masks.

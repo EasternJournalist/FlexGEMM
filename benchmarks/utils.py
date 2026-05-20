@@ -12,7 +12,7 @@ from typing import Callable, Iterable, Sequence
 import torch
 
 
-def time_cuda_ms(fn: Callable[[], object], warmup: int = 20, iters: int = 100) -> float:
+def time_cuda_ms(fn: Callable[[], object], warmup: int = 4, iters: int = 10) -> float:
     """Average GPU time per call in milliseconds (CUDA events)."""
     for _ in range(warmup):
         fn()

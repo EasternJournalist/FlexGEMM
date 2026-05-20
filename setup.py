@@ -96,8 +96,11 @@ setup(
 
 # copy cache to tmp dir
 os.makedirs(os.path.expanduser("~/.flex_gemm"), exist_ok=True)
-shutil.copyfile(
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotune_cache.json"),
-    os.path.expanduser('~/.flex_gemm/autotune_cache.json'),
-)
+src_cache_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "autotune_cache.json")
+if os.path.exists(src_cache_path):
+    shutil.copyfile(
+        src_cache_path,
+        os.path.expanduser('~/.flex_gemm/autotune_cache.json'),
+    )
+
 

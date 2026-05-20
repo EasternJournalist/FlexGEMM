@@ -17,6 +17,9 @@ autotune_config = get_autotune_config(
             triton.Config({'B1': 128, 'B2': 256, 'BK': 64}, num_stages=3, num_warps=8),
             triton.Config({'B1': 64,  'B2': 128, 'BK': 32}, num_stages=4, num_warps=4),
             triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=5, num_warps=2),
+            # ieee-fp32 safe fallback (small tiles, num_stages=2). Picked only
+            # when larger tiles OOR (e.g. input_precision='ieee' fp32 path).
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=2, num_warps=4),
         ],
         'hip': [
             triton.Config({'B1': 128, 'B2': 128, 'BK': 32, 'waves_per_eu': 2}, num_warps=8, num_stages=2),
@@ -40,6 +43,9 @@ autotune_config = get_autotune_config(
             triton.Config({'B1': 128, 'B2': 256, 'BK': 64}, num_stages=4, num_warps=8),
             triton.Config({'B1': 64,  'B2': 128, 'BK': 32}, num_stages=4, num_warps=2),
             triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=4, num_warps=2),
+            # ieee-fp32 safe fallback (small tiles, num_stages=2). Picked only
+            # when larger tiles OOR (e.g. input_precision='ieee' fp32 path).
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=2, num_warps=4),
         ],
         'H100': [
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64},  num_stages=5, num_warps=4),
@@ -48,6 +54,9 @@ autotune_config = get_autotune_config(
             triton.Config({'B1': 128, 'B2': 256, 'BK': 64},  num_stages=5, num_warps=8),
             triton.Config({'B1': 256, 'B2': 64,  'BK': 64},  num_stages=5, num_warps=4),
             triton.Config({'B1': 128, 'B2': 128, 'BK': 32},  num_stages=5, num_warps=4),
+            # ieee-fp32 safe fallback (small tiles, num_stages=2). Picked only
+            # when larger tiles OOR (e.g. input_precision='ieee' fp32 path).
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=2, num_warps=4),
         ],
         'MI300X': [
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64, 'waves_per_eu': 2}, num_stages=2, num_warps=8),
@@ -80,6 +89,9 @@ bwd_weight_autotune_config = get_autotune_config(
             triton.Config({'B1': 128, 'B2': 64,  'BK': 128}, num_stages=4, num_warps=4),
             triton.Config({'B1': 64,  'B2': 128, 'BK': 128}, num_stages=4, num_warps=2),
             triton.Config({'B1': 64,  'B2': 64,  'BK': 128}, num_stages=5, num_warps=2),
+            # ieee-fp32 safe fallback (small tiles, num_stages=2). Picked only
+            # when larger tiles OOR (e.g. input_precision='ieee' fp32 path).
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 32},  num_stages=2, num_warps=4),
         ],
         'hip': [
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64, 'waves_per_eu': 2}, num_warps=8, num_stages=2),
@@ -101,6 +113,9 @@ bwd_weight_autotune_config = get_autotune_config(
             triton.Config({'B1': 256, 'B2': 128, 'BK': 128}, num_stages=3, num_warps=8),
             triton.Config({'B1': 128, 'B2': 64,  'BK': 128}, num_stages=4, num_warps=2),
             triton.Config({'B1': 64,  'B2': 128, 'BK': 128}, num_stages=4, num_warps=2),
+            # ieee-fp32 safe fallback (small tiles, num_stages=2). Picked only
+            # when larger tiles OOR (e.g. input_precision='ieee' fp32 path).
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 32},  num_stages=2, num_warps=4),
         ],
         'H100': [
             triton.Config({'B1': 128, 'B2': 128, 'BK': 128}, num_stages=5, num_warps=8),

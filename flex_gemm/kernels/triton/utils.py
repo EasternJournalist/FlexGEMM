@@ -30,7 +30,7 @@ def autotune_size_bucket(n: int) -> int:
     """
     if n <= 1:
         return 0
-    return (int(n).bit_length() - 1) // 2
+    return min(max((int(n).bit_length() - 1) // 2, 4), 8)
     
 
 def get_autotune_config(

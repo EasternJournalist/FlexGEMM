@@ -6,6 +6,7 @@ import importlib
 import pkgutil
 import torch
 import triton
+import triton.testing
 import time
 import inspect
 import functools
@@ -14,25 +15,32 @@ from filelock import FileLock
 from . import config as pkg_config
 
 
-def _resolve_autotune_mode():
-    """Return the active autotune mode: 'adaptive' | 'always' | 'never'.
-
-    Honors the legacy boolean ``USE_AUTOTUNE_RUNTIME`` attribute for backward
-    compatibility (tests still mutate it at runtime).
-    """
-    if not getattr(pkg_config, 'USE_AUTOTUNE_RUNTIME', True):
-        return 'never'
-    mode = getattr(pkg_config, 'AUTOTUNE_MODE', 'adaptive')
-    if mode not in ('adaptive', 'always', 'never'):
-        raise ValueError(f"Unknown AUTOTUNE_MODE: {mode!r}")
-    return mode
-
-
-def _adaptive_threshold():
-    return int(getattr(pkg_config, 'AUTOTUNE_ADAPTIVE_THRESHOLD', 1000))
-
-
 _ADAPTIVE_NOTIFIED = set()
+
+
+# Compact aliases for torch dtypes used in autotune cache keys / on-disk JSON.
+# Keep STABLE: changing any existing entry invalidates previously persisted
+# cache keys for that dtype. Add new dtypes; do not rename old ones.
+_DTYPE_SHORT = {
+    "torch.float16":  "f16",
+    "torch.bfloat16": "bf16",
+    "torch.float32":  "f32",
+    "torch.float64":  "f64",
+    "torch.int8":     "i8",
+    "torch.int16":    "i16",
+    "torch.int32":    "i32",
+    "torch.int64":    "i64",
+    "torch.uint8":    "u8",
+    "torch.uint16":   "u16",
+    "torch.uint32":   "u32",
+    "torch.uint64":   "u64",
+    "torch.bool":     "b",
+}
+
+
+def _short_dtype(dtype) -> str:
+    s = str(dtype)
+    return _DTYPE_SHORT.get(s, s)
 
 
 def _notify_adaptive_tune(kernel_name):
@@ -42,7 +50,7 @@ def _notify_adaptive_tune(kernel_name):
     import sys
     print(
         f"FlexGEMM: autotune started for {kernel_name} after "
-        f"{_adaptive_threshold()} calls, this may take a while...",
+        f"{pkg_config.AUTOTUNE_ADAPTIVE_THRESHOLD} calls with the same key, this may take a while...",
         file=sys.stderr,
         flush=True,
     )
@@ -81,18 +89,19 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
             do_bench,
         )
         self._cache_key = _get_function_cache_key(fn)
-        self._call_count = 0
-        # Per-tuning-key timing metadata: {key: {"winner_ms": float,
-        # "runner_ups": [{"config": str, "ms": float, "slowdown_pct": float}, ...]}}
+        # Per-tuning-key call counts; adaptive mode triggers tuning once a
+        # specific key has been observed `pkg_config.AUTOTUNE_ADAPTIVE_THRESHOLD` times.
+        self._key_call_counts: Dict[str, int] = {}
+        # Per-tuning-key timing metadata: {key: [{"config": str, "ms": float}, ...]}
+        # Sorted ascending by ms; first entry is the autotune winner.
         # Used for offline analysis of pruning safety (how close are the
         # runner-ups to the winner). Persisted alongside `self.cache` but in
         # a sibling namespace so the existing on-disk format stays
         # backward-compatible.
-        self.timings_meta: Dict[str, dict] = {}
+        self.timings_meta: Dict[str, list] = {}
         _register_autotuner(self)
 
     def run(self, *args, **kwargs):
-        self._call_count += 1
         self.nargs = dict(zip(self.arg_names, args))
         used_cached_result = True
         if len(self.configs) > 1:
@@ -101,13 +110,18 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
             key = [_args[key] for key in self.keys if key in _args]
             for _, arg in _args.items():
                 if hasattr(arg, "dtype"):
-                    key.append(str(arg.dtype))
+                    key.append(_short_dtype(arg.dtype))
             key = str(tuple(key))
             if key not in self.cache:
-                mode = _resolve_autotune_mode()
+                mode = pkg_config.AUTOTUNE_MODE
+                # Track per-key call count for adaptive mode. Only count
+                # cache misses; once tuned, the key is in `self.cache` and
+                # we never come back here.
+                key_count = self._key_call_counts.get(key, 0) + 1
+                self._key_call_counts[key] = key_count
                 do_tune = (
                     mode == 'always'
-                    or (mode == 'adaptive' and self._call_count >= _adaptive_threshold())
+                    or (mode == 'adaptive' and key_count >= pkg_config.AUTOTUNE_ADAPTIVE_THRESHOLD)
                 )
                 if not do_tune:
                     # Fall back to the first config without benchmarking and
@@ -123,8 +137,32 @@ class TritonPersistentCacheAutotuner(triton.runtime.Autotuner):
                     timings = {config: self._bench(*args, config=config, **kwargs) for config in pruned_configs}
                     bench_end = time.time()
                     self.bench_time = bench_end - bench_start
-                    self.cache[key] = builtins.min(timings, key=timings.get)
-                    self.timings_meta[key] = _summarize_timings(timings, self.cache[key])
+                    # Drop configs that failed to compile / run (Triton's
+                    # Autotuner._bench swallows OutOfResources / PTXASError
+                    # and returns inf-valued timings instead of raising). If
+                    # any config worked, pick the best of those; if every
+                    # config failed, surface a clear error pointing the user
+                    # at the config list rather than letting the silently
+                    # picked first config OOR at the actual call site.
+                    working = {
+                        cfg: t for cfg, t in timings.items()
+                            if _bench_value_to_ms(t) != float('inf')
+                    }
+                    if not working:
+                        failed = [_config_signature(c) for c in pruned_configs]
+                        raise RuntimeError(
+                            f"Autotune for {self.base_fn.__name__} key={key} found "
+                            f"no viable config: all {len(failed)} candidates exceeded "
+                            f"GPU resources (shared memory / registers). This typically "
+                            f"means the configured tile sizes are too large for the "
+                            f"current dtype / precision (e.g. `input_precision='ieee'` "
+                            f"on fp32 uses ~2x the registers vs TF32). Add a smaller "
+                            f"fallback config (smaller B1/B2/BK or num_stages=2) to "
+                            f"the kernel's autotune list. Failed configs: {failed}"
+                        )
+                    self.cache[key] = builtins.min(working, key=working.get)
+                    if pkg_config.AUTOTUNE_STORE_META:
+                        self.timings_meta[key] = _summarize_timings(timings)
                     full_nargs = {**self.nargs, **kwargs, **self.cache[key].all_kwargs()}
                     self.pre_hook(full_nargs, reset_only=True)
                     self.configs_timings = timings
@@ -258,8 +296,8 @@ class PersistentCacheAutoTuner:
         key=None,
         config_fn=None,
         key_fn=None,
-        warmup=3,
-        runs=10,
+        warmup_ms: float = 25.0,
+        rep_ms: float = 100.0,
         verbose=False,
     ):
         """
@@ -272,8 +310,8 @@ class PersistentCacheAutoTuner:
             config_fn: A function that takes in the input arguments and returns configs to be used for autotuning.
             key_fn: A function that takes in the input arguments and returns the key used to cache the tuning results.
                     Once the key changes, the autotuning will be rerun.
-            warmup: The number of warmup runs to discard before measuring the execution time.
-            runs: The number of runs to measure the execution time.
+            warmup_ms: target warmup time **in milliseconds** (passed to ``triton.testing.do_bench``).
+            rep_ms: target benchmarking time **in milliseconds** (passed to ``triton.testing.do_bench``).
             verbose: Whether to print the autotuning results.
         """
         assert config_fn or configs, "Either configs or config_fn must be provided"
@@ -283,14 +321,16 @@ class PersistentCacheAutoTuner:
         self.key = key
         self.config_fn = config_fn
         self.key_fn = key_fn
-        self.warmup = warmup
-        self.runs = runs
+        self.warmup_ms = warmup_ms
+        self.rep_ms = rep_ms
         self.verbose = verbose or os.getenv('FLEX_GEMM_AUTOTUNER_VERBOSE', '0') == '1'
         self.kernel_arg_names = inspect.getfullargspec(kernel).args
         self.cache = {}
-        self.timings_meta: Dict[str, dict] = {}
+        self.timings_meta: Dict[str, list] = {}
         self._cache_key = _get_function_cache_key(kernel)
-        self._call_count = 0
+        # Per-tuning-key call counts; adaptive mode triggers tuning once a
+        # specific key has been observed `pkg_config.AUTOTUNE_ADAPTIVE_THRESHOLD` times.
+        self._key_call_counts: Dict[str, int] = {}
         _register_autotuner(self)
         
     def _args_to_kwargs(self, args, kwargs):
@@ -301,7 +341,6 @@ class PersistentCacheAutoTuner:
         return arg_dict
     
     def __call__(self, *args, **kwargs):
-        self._call_count += 1
         arg_dict = self._args_to_kwargs(args, kwargs)
         
         # Determine key
@@ -312,10 +351,13 @@ class PersistentCacheAutoTuner:
         used_cached_result = True
         chosen_config = self.cache.get(key)
         if chosen_config is None:
-            mode = _resolve_autotune_mode()
+            mode = pkg_config.AUTOTUNE_MODE
+            # Track per-key call count for adaptive mode (cache misses only).
+            key_count = self._key_call_counts.get(key, 0) + 1
+            self._key_call_counts[key] = key_count
             do_tune = (
                 mode == 'always'
-                or (mode == 'adaptive' and self._call_count >= _adaptive_threshold())
+                or (mode == 'adaptive' and key_count >= pkg_config.AUTOTUNE_ADAPTIVE_THRESHOLD)
             )
             configs = self.configs if self.configs else self.config_fn(*args, **kwargs)
             if not configs:
@@ -348,31 +390,31 @@ class PersistentCacheAutoTuner:
         timings: Dict = {}
 
         if len(configs) == 1:
-            best_config = configs[0]
-        else:
-            for config in configs:
-                # Run the kernel and measure execution time
-                for _ in range(self.warmup):
-                    self.kernel(*args, **kwargs, **config)
-                torch.cuda.synchronize()
-                start = time.time()
-                for _ in range(self.runs):
-                    self.kernel(*args, **kwargs, **config)
-                torch.cuda.synchronize()
-                elapsed = (time.time() - start) / self.runs
+            return configs[0]
+
+        for config in configs:
+            fn = lambda c=config: self.kernel(*args, **kwargs, **c)
+            try:
+                ms = triton.testing.do_bench(
+                    fn,
+                    warmup=self.warmup_ms,
+                    rep=self.rep_ms,
+                    return_mode='min',
+                )
+            except Exception as e:
                 if self.verbose:
-                    print(f"Config {config}: {elapsed} seconds")
-                # Cast tuple/list configs to a hashable key for the timings dict.
-                cfg_key = tuple(sorted(config.items())) if isinstance(config, dict) else config
-                timings[cfg_key] = elapsed * 1000.0  # ms
-                # Update the best config if the execution time is better
-                if elapsed < best_time:
-                    best_time = elapsed
-                    best_config = config
-            if key is not None and timings:
-                # Find the winner's hashable key.
-                win_key = tuple(sorted(best_config.items())) if isinstance(best_config, dict) else best_config
-                self.timings_meta[key] = _summarize_timings(timings, win_key)
+                    print(f"Config {config}: failed ({e})")
+                ms = float('inf')
+            if self.verbose:
+                print(f"Config {config}: {ms:.4f} ms")
+            cfg_key = tuple(sorted(config.items())) if isinstance(config, dict) else config
+            timings[cfg_key] = ms
+            if ms < best_time:
+                best_time = ms
+                best_config = config
+
+        if key is not None and timings and pkg_config.AUTOTUNE_STORE_META:
+            self.timings_meta[key] = _summarize_timings(timings)
 
         return best_config
     
@@ -382,13 +424,13 @@ def autotune(
     key=None,
     config_fn=None,
     key_fn=None,
-    warmup=3,
-    runs=10,
+    warmup_ms: float = 25.0,
+    rep_ms: float = 100.0,
     verbose=False
 ):
     def decorator(kernel):
         return functools.wraps(kernel)(
-            PersistentCacheAutoTuner(kernel, configs, key, config_fn, key_fn, warmup, runs, verbose)
+            PersistentCacheAutoTuner(kernel, configs, key, config_fn, key_fn, warmup_ms, rep_ms, verbose)
         )
     return decorator
 
@@ -420,8 +462,8 @@ _PENDING_AUTOTUNE_CACHE = None
 # from the primary config cache so the existing on-disk format keeps loading
 # unchanged for older readers.
 _META_KEY_SUFFIX = "::meta"
-# How many runner-ups to record per tuning key (after the winner).
-_META_RUNNER_UPS = 2
+# How many top configs to record per tuning key (winner + runner-ups).
+_META_TOP_K = 3
 
 
 def _bench_value_to_ms(v):
@@ -441,31 +483,14 @@ def _config_signature(config):
         return repr(config)
 
 
-def _summarize_timings(timings, winner):
-    """Build a JSON-safe summary of the top configs from a ``{config: ms}``
-    timings dict, anchored on ``winner``."""
+def _summarize_timings(timings, top_k: int = _META_TOP_K) -> list:
+    """Return the top ``top_k`` configs from a ``{config: ms}`` timings dict,
+    sorted ascending by ms. The first element is the autotune winner."""
     items = sorted(
         ((cfg, _bench_value_to_ms(v)) for cfg, v in timings.items()),
         key=lambda x: x[1],
-    )
-    if not items:
-        return {"winner_ms": None, "runner_ups": []}
-    winner_ms = _bench_value_to_ms(timings[winner])
-    runner_ups = []
-    skipped_winner = False
-    for cfg, ms in items:
-        if not skipped_winner and (cfg is winner or cfg == winner):
-            skipped_winner = True
-            continue
-        slowdown = (ms - winner_ms) / winner_ms * 100.0 if winner_ms > 0 else float("inf")
-        runner_ups.append({
-            "config": _config_signature(cfg),
-            "ms": ms,
-            "slowdown_pct": slowdown,
-        })
-        if len(runner_ups) >= _META_RUNNER_UPS:
-            break
-    return {"winner_ms": winner_ms, "runner_ups": runner_ups}
+    )[:top_k]
+    return [{"config": _config_signature(cfg), "ms": round(ms, 3)} for cfg, ms in items]
 
 
 def _unwrap_to_user_fn(fn):
@@ -570,9 +595,10 @@ def get_autotune_cache():
             cache[device_name][cache_key] = tuner.cache
         elif isinstance(tuner, TritonPersistentCacheAutotuner):
             cache[device_name][cache_key] = {k: v.__dict__ for k, v in tuner.cache.items()}
-        meta = getattr(tuner, "timings_meta", None)
-        if meta:
-            cache[device_name][cache_key + _META_KEY_SUFFIX] = dict(meta)
+        if pkg_config.AUTOTUNE_STORE_META:
+            meta = getattr(tuner, "timings_meta", None)
+            if meta:
+                cache[device_name][cache_key + _META_KEY_SUFFIX] = dict(meta)
 
     return cache
 
@@ -592,7 +618,7 @@ def save_autotune_cache(path=None):
 
         tmp_path = path + ".tmp"
         with open(tmp_path, 'w') as f:
-            json.dump(cache, f, indent=4)
+            json.dump(cache, f, indent=2, sort_keys=True)
             f.flush()
             os.fsync(f.fileno())
         os.replace(tmp_path, path)

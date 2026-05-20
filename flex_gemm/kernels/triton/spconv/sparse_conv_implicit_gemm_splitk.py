@@ -95,7 +95,8 @@ def sparse_conv_implicit_gemm_splitk_kernel(
     # add bias
     if HAS_BIAS:
         if block_id_k == 0:
-            bias_block = tl.load(bias + offset_co)
+            co_mask = block_id_co * B2 + tl.arange(0, B2) < Co
+            bias_block = tl.load(bias + offset_co, mask=co_mask, other=0.0)
             accumulator += bias_block[None, :]
                 
     # Write back the block of the output matrix with masks.
@@ -219,7 +220,7 @@ def sparse_conv_fwd_implicit_gemm_splitk_configs(input, weight, bias, neighbor, 
 
 def sparse_conv_fwd_implicit_gemm_splitk_keys(input, weight, bias, neighbor, **kwargs):
     N, M, Ci, Co, V = input.shape[0], neighbor.shape[0], input.shape[1], weight.shape[0], weight.shape[1]
-    return f'(B{autotune_size_bucket(N)}, B{autotune_size_bucket(M)}, {Ci}, {Co}, {V})'
+    return f'({autotune_size_bucket(N)}, {autotune_size_bucket(M)}, {Ci}, {Co}, {V})'
 
 
 @autotune(
