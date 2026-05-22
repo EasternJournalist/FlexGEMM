@@ -28,9 +28,7 @@ AUTOTUNE_ADAPTIVE_THRESHOLD = 100
 AUTOTUNE_STORE_META = os.environ.get('FLEX_GEMM_AUTOTUNE_STORE_META', '0') == '1'
 """Whether to record per-key timing metadata (top-K runner-up configs and
 their measured ms) alongside the autotune cache. Useful for offline pruning
-analysis (see ``scripts/analyze_logn_sensitivity.py`` and
-``scripts/compare_logn_pair.py``) but bloats ``autotune_cache.json``
-significantly. Off by default."""
+analysis but bloats ``autotune_cache.json`` significantly. Off by default."""
 
 AUTOTUNE_CACHE_PATH = os.environ.get(
     'FLEX_GEMM_AUTOTUNE_CACHE_PATH',
@@ -80,6 +78,6 @@ CUDA_SERIALIZATION_MODE: Literal["bxyz", "z_order", "hilbert"] = "bxyz"
 into a hashmap key."""
 
 SPCONV_ALLOW_TF32: bool = True
-"""Whether the Triton sparse-conv matmul kernels are allowed to use TF32
-input precision (``tl.dot(..., input_precision='tf32')``). Set to ``False``
-to force IEEE single-precision accumulation."""
+"""Whether the Triton sparse-conv matmul kernels are allowed to use TF32 precision 
+for much faster performance on Ampere and later GPUs.
+Set to ``False`` to force IEEE single-precision accumulation."""

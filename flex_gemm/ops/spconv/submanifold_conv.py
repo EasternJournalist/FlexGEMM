@@ -1,6 +1,7 @@
 import torch
 from torch import Tensor
 from typing import *
+import warnings
 
 from ..neighbor_cache import NeighborCache, build_neighbor_cache
 from ..utils import _broadcast_dim_arg, split_sparse_shape
@@ -12,6 +13,8 @@ __all__ = [
     'submanifold_conv2d',
     'submanifold_conv3d',
     'submanifold_conv4d',
+    # deprecated aliases
+    'sparse_submanifold_conv3d',
 ]
 
 
@@ -337,4 +340,40 @@ def submanifold_conv4d(
     return _submanifold_conv_nd(
         4, feats, coords, shape, weight, bias,
         dilation, kernel_delta, symmetric, neighbor_cache, algorithm, allow_tf32,
+    )
+
+
+@overload
+def sparse_submanifold_conv3d(
+    feats: Tensor,
+    coords: Tensor,
+    shape: torch.Size,
+    weight: Tensor,
+    bias: Tensor | None = None,
+    neighbor_cache: NeighborCache | None = None,
+    dilation: int | tuple[int, int, int] | None = None,
+    algorithm: _Algo = None,
+) -> tuple[Tensor, NeighborCache]:
+    """(deprecated)
+    v1.0 compatible 3-D spatial alias of :func:`submanifold_conv` (kernel_size mode).
+
+    ``dilation`` may be a scalar ``int`` (broadcast to length 3) or a
+    length-3 tuple. ``coords.shape[1]`` may exceed 3; the leading columns are
+    batch dims. All other args/semantics match :func:`submanifold_conv`.
+    """
+    ...
+def sparse_submanifold_conv3d(
+    feats, coords, shape, weight, bias=None, neighbor_cache=None,
+    dilation=None, algorithm=None, allow_tf32=None,
+):
+    warnings.warn(
+        "sparse_submanifold_conv3d will be deprecated in a future version. " \
+        "Use submanifold_conv3d or submanifold_conv instead.", 
+        DeprecationWarning, 
+        stacklevel=2
+    )
+    return _submanifold_conv_nd(
+        3, feats, coords, shape, weight, bias,
+        dilation=dilation, kernel_delta=None, symmetric=None, 
+        neighbor_cache=neighbor_cache, algorithm=algorithm, allow_tf32=allow_tf32, 
     )
