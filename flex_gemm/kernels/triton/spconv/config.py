@@ -48,8 +48,11 @@ autotune_config = get_autotune_config(
             triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=2, num_warps=4),
         ],
         'H100': [
+            # SMEM budget on H100 = 227 KB. For masked variants the empirical
+            # cost is ~(num_stages-1) * 2 * BK * (B1+B2) bytes; configs with
+            # BK=128 and num_stages=5 OOR and get pruned at autotune time.
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64},  num_stages=5, num_warps=4),
-            triton.Config({'B1': 128, 'B2': 128, 'BK': 128}, num_stages=5, num_warps=8),
+            triton.Config({'B1': 128, 'B2': 128, 'BK': 128}, num_stages=2, num_warps=8),
             triton.Config({'B1': 256, 'B2': 128, 'BK': 64},  num_stages=5, num_warps=8),
             triton.Config({'B1': 128, 'B2': 256, 'BK': 64},  num_stages=5, num_warps=8),
             triton.Config({'B1': 256, 'B2': 64,  'BK': 64},  num_stages=5, num_warps=4),
@@ -118,13 +121,23 @@ bwd_weight_autotune_config = get_autotune_config(
             triton.Config({'B1': 64,  'B2': 64,  'BK': 32},  num_stages=2, num_warps=4),
         ],
         'H100': [
-            triton.Config({'B1': 128, 'B2': 128, 'BK': 128}, num_stages=5, num_warps=8),
+            # SMEM budget on H100 = 227 KB. For masked bwd_weight the empirical
+            # cost is ~(num_stages+1) * 2 * BK * (B1+B2) bytes (4 stages more
+            # than fwd due to indirect-gather pipelining). Configs that OOR for
+            # the masked variant are pruned here; large BK is preserved via
+            # lower num_stages so K-reduction still has a fast path.
+            triton.Config({'B1': 128, 'B2': 128, 'BK': 128}, num_stages=2, num_warps=8),
+            triton.Config({'B1': 128, 'B2': 64,  'BK': 128}, num_stages=3, num_warps=4),
+            triton.Config({'B1': 64,  'B2': 128, 'BK': 128}, num_stages=3, num_warps=4),
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 128}, num_stages=4, num_warps=2),
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64},  num_stages=5, num_warps=4),
-            triton.Config({'B1': 128, 'B2': 256, 'BK': 128}, num_stages=5, num_warps=8),
-            triton.Config({'B1': 128, 'B2': 256, 'BK': 64},  num_stages=5, num_warps=8),
-            triton.Config({'B1': 256, 'B2': 128, 'BK': 128}, num_stages=5, num_warps=8),
-            triton.Config({'B1': 128, 'B2': 64,  'BK': 128}, num_stages=5, num_warps=4),
-            triton.Config({'B1': 64,  'B2': 128, 'BK': 128}, num_stages=5, num_warps=4),
+            triton.Config({'B1': 128, 'B2': 128, 'BK': 64},  num_stages=4, num_warps=8),
+            triton.Config({'B1': 128, 'B2': 256, 'BK': 64},  num_stages=3, num_warps=8),
+            triton.Config({'B1': 256, 'B2': 128, 'BK': 64},  num_stages=3, num_warps=8),
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 64},  num_stages=4, num_warps=2),
+            # ieee-fp32 safe fallback (small tiles, num_stages=2). Picked only
+            # when larger tiles OOR (e.g. input_precision='ieee' fp32 path).
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 32},  num_stages=2, num_warps=4),
         ],
         'MI300X': [
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64,  'waves_per_eu': 2}, num_stages=2, num_warps=8),
