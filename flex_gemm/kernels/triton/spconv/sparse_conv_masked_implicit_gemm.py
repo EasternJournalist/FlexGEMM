@@ -114,7 +114,7 @@ def sparse_conv_masked_implicit_gemm_kernel(
     
 
 @triton_autotune(
-    configs=config.autotune_config,
+    configs=config.bwd_weight_autotune_config,
     key=['LOGN', 'LOGM', 'Ci', 'Co', 'V', 'allow_tf32'],
 )
 @triton.jit

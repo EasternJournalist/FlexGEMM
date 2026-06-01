@@ -48,15 +48,26 @@ autotune_config = get_autotune_config(
             triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=2, num_warps=4),
         ],
         'H100': [
+            # SMEM budget on H100 = 227 KB. For the masked variant cost is
+            # ~max(num_stages, 3) * 2 * BK * (B1+B2) bytes (Triton uses a
+            # double-buffered epilogue at stages=2, so stages=2 occupies the
+            # same SMEM as stages=3). BK=128 with B1+B2 >= 256 exceeds the
+            # budget at any num_stages we tested, so it is omitted.
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64},  num_stages=5, num_warps=4),
-            triton.Config({'B1': 128, 'B2': 128, 'BK': 128}, num_stages=5, num_warps=8),
             triton.Config({'B1': 256, 'B2': 128, 'BK': 64},  num_stages=5, num_warps=8),
             triton.Config({'B1': 128, 'B2': 256, 'BK': 64},  num_stages=5, num_warps=8),
             triton.Config({'B1': 256, 'B2': 64,  'BK': 64},  num_stages=5, num_warps=4),
             triton.Config({'B1': 128, 'B2': 128, 'BK': 32},  num_stages=5, num_warps=4),
+            # Small-tile / high-occupancy entries for small-N shapes. Aligns
+            # with v1's empirical H100 winners (B1*B2 <= 64*64 num_warps=2),
+            # which let multiple CTAs co-reside per SM and hide indirect-load
+            # latency on shapes where the cost is gather-bound, not FMA-bound.
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 64},  num_stages=4, num_warps=2),
+            triton.Config({'B1': 32,  'B2': 64,  'BK': 32},  num_stages=5, num_warps=2),
+            triton.Config({'B1': 64,  'B2': 32,  'BK': 32},  num_stages=5, num_warps=2),
             # ieee-fp32 safe fallback (small tiles, num_stages=2). Picked only
             # when larger tiles OOR (e.g. input_precision='ieee' fp32 path).
-            triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=2, num_warps=4),
+            # triton.Config({'B1': 64,  'B2': 64,  'BK': 32}, num_stages=2, num_warps=4),
         ],
         'MI300X': [
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64, 'waves_per_eu': 2}, num_stages=2, num_warps=8),
@@ -118,13 +129,29 @@ bwd_weight_autotune_config = get_autotune_config(
             triton.Config({'B1': 64,  'B2': 64,  'BK': 32},  num_stages=2, num_warps=4),
         ],
         'H100': [
-            triton.Config({'B1': 128, 'B2': 128, 'BK': 128}, num_stages=5, num_warps=8),
+            # SMEM budget on H100 = 227 KB. For masked bwd_weight the cost is
+            # ~(num_stages+1) * 2 * BK * (B1+B2) bytes for stages>=3, and
+            # behaves like stages=3 fwd (4 * 2 * BK * (B1+B2)) at stages=2.
+            # Main working set: BK=64 stages=5 (192 KB on 128x128) wins on
+            # the production token shapes.
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64},  num_stages=5, num_warps=4),
-            triton.Config({'B1': 128, 'B2': 256, 'BK': 128}, num_stages=5, num_warps=8),
-            triton.Config({'B1': 128, 'B2': 256, 'BK': 64},  num_stages=5, num_warps=8),
-            triton.Config({'B1': 256, 'B2': 128, 'BK': 128}, num_stages=5, num_warps=8),
-            triton.Config({'B1': 128, 'B2': 64,  'BK': 128}, num_stages=5, num_warps=4),
-            triton.Config({'B1': 64,  'B2': 128, 'BK': 128}, num_stages=5, num_warps=4),
+            triton.Config({'B1': 128, 'B2': 128, 'BK': 64},  num_stages=4, num_warps=8),
+            triton.Config({'B1': 128, 'B2': 256, 'BK': 64},  num_stages=3, num_warps=8),
+            triton.Config({'B1': 256, 'B2': 128, 'BK': 64},  num_stages=3, num_warps=8),
+            # BK=128 fallbacks: kept for hypothetical large-N dense shapes;
+            # most production shapes prefer BK=64 stages=5 over these.
+            triton.Config({'B1': 128, 'B2': 64,  'BK': 128}, num_stages=3, num_warps=4),
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 128}, num_stages=4, num_warps=2),
+            # Small-tile / high-occupancy entries: critical for the K-tile
+            # heuristic to find an occupancy-bound winner on small-token
+            # shapes (v1's measured H100 best was B1*B2 <= 64*64 num_warps=2).
+            triton.Config({'B1': 64,  'B2': 64,  'BK': 64},  num_stages=4, num_warps=2),
+            triton.Config({'B1': 32,  'B2': 64,  'BK': 64},  num_stages=5, num_warps=2),
+            triton.Config({'B1': 64,  'B2': 32,  'BK': 64},  num_stages=5, num_warps=2),
+            triton.Config({'B1': 32,  'B2': 64,  'BK': 32},  num_stages=5, num_warps=2),
+            # ieee-fp32 safe fallback (small tiles, num_stages=2). Picked only
+            # when larger tiles OOR (e.g. input_precision='ieee' fp32 path).
+            # triton.Config({'B1': 64,  'B2': 64,  'BK': 32},  num_stages=2, num_warps=4),
         ],
         'MI300X': [
             triton.Config({'B1': 128, 'B2': 128, 'BK': 64,  'waves_per_eu': 2}, num_stages=2, num_warps=8),
